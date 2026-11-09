@@ -1,4 +1,5 @@
 #pragma once
+#include "stillflow/application/profile.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <opencv2/core.hpp>
 namespace stillflow {

@@ -6,8 +6,8 @@ target_include_directories(stillflow_domain PUBLIC $<BUILD_INTERFACE:${CMAKE_CUR
                                                    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(stillflow_domain PRIVATE $<BUILD_INTERFACE:Eigen3::Eigen>)
 
-add_library(stillflow_application STATIC application/src/stabilize.cpp application/src/image.cpp
-                                         application/src/rendering.cpp)
+add_library(stillflow_application STATIC application/src/stabilize.cpp application/src/options.cpp
+                                         application/src/image.cpp application/src/rendering.cpp)
 add_library(StillFlow::application ALIAS stillflow_application)
 set_target_properties(stillflow_application PROPERTIES EXPORT_NAME application POSITION_INDEPENDENT_CODE ON)
 target_compile_features(stillflow_application PUBLIC cxx_std_20)
@@ -27,6 +27,10 @@ install(
 install(DIRECTORY domain/include/ application/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(STILLFLOW_BUILD_ADAPTERS)
+    add_library(stillflow_interop INTERFACE)
+    add_library(StillFlow::interop ALIAS stillflow_interop)
+    target_include_directories(stillflow_interop INTERFACE interop/include)
+    target_link_libraries(stillflow_interop INTERFACE StillFlow::domain)
     add_subdirectory(adapters)
     add_subdirectory(backends)
 endif()

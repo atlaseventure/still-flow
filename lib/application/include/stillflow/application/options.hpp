@@ -16,4 +16,7 @@ struct Options : StabilizationSettings {
     bool audio = true;
     bool overwrite = false;
 };
+// Resolve derived paths and validate the use-case request before invoking services.
+Options resolve_options(Options options);
+std::filesystem::path frames_report_path(const Options& options);
 } // namespace stillflow

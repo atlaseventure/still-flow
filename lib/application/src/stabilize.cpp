@@ -2,6 +2,7 @@
 #include "pipeline.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -13,26 +14,6 @@ namespace {
 // Frames buffered between stages. Small depths keep memory bounded while
 // letting decode, rendering and each encoder run concurrently.
 constexpr size_t frame_queue_depth = 4;
-
-void validate_options(const Options& o) {
-    auto range = [](double value, double low, double high, const char* name) {
-        if (!std::isfinite(value) || value < low || value > high)
-            throw std::invalid_argument(std::string(name) + " is out of range");
-    };
-    range(o.analysis_width, 160, 4096, "analysis_width");
-    range(o.features, 96, 10000, "features");
-    range(o.bands, 4, 32, "bands");
-    range(o.threads, 1, 64, "threads");
-    range(o.crf, 0, 51, "crf");
-    range(o.smooth_seconds, 0, 10, "smooth_seconds");
-    range(o.rs_seconds, 0, 10, "rs_seconds");
-    range(o.rs_strength, 0, 1, "rs_strength");
-    range(o.crop, 0, 0.25, "crop");
-    if (o.scan_axis != "auto" && o.scan_axis != "x" && o.scan_axis != "y")
-        throw std::invalid_argument("scan_axis must be auto, x or y");
-    if (o.decoder.empty() || o.encoder.empty())
-        throw std::invalid_argument("decoder and encoder must be named; use auto for adapter selection");
-}
 
 using AudioPackets = std::vector<std::shared_ptr<const AudioPacket>>;
 
@@ -218,14 +199,14 @@ void write_stream(Channel<EncodeItem>& queue, VideoWriter& writer, ImageProcessi
 } // namespace
 
 RunSummary stabilize(const Options& request, Services services) {
-    auto options = request;
-    if (options.report.empty())
-        options.report = options.output.string() + ".profile.json";
-    validate_options(options);
+    const auto options = resolve_options(request);
     const auto start = Clock::now();
-    auto frames_path = options.report;
-    frames_path.replace_extension(".frames.csv");
-    services.outputs.validate(options, frames_path);
+    const auto frames_path = frames_report_path(options);
+    const std::array outputs{options.output, options.compare, options.report, frames_path};
+    services.outputs.validate(options.input, outputs, options.overwrite);
+    services.media.validate_output(options.output);
+    if (!options.compare.empty())
+        services.media.validate_output(options.compare);
     services.runtime.configure(options.threads);
     Profile profile;
     PendingRenderer pending(services.renderers, options.backend, services.progress);
@@ -240,7 +221,11 @@ RunSummary stabilize(const Options& request, Services services) {
     // Actual PTS differences, rather than nominal FPS, define frame durations for VFR files.
     for (size_t i = 0; i + 1 < frames.size(); ++i)
         analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
-    auto warps = plan_warps(frames, analysis_size, options, horizontal, profile);
+    std::vector<Warp> warps;
+    {
+        ScopeTimer timer(profile, "plan.optimize");
+        warps = plan_warps(frames, analysis_size, options, horizontal);
+    }
     const auto analysis_ms = milliseconds(start);
     auto& renderer = pending.get(profile);
     auto output = services.outputs.stage(options.output);
@@ -255,11 +240,12 @@ RunSummary stabilize(const Options& request, Services services) {
         auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         const Size size(info.width, info.height);
         const CodecRequest encoder{options.encoder, gpu};
-        auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, options, encoder);
+        const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
+        auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, encoding, encoder);
         std::unique_ptr<VideoWriter> compare_writer;
         if (comparison)
             compare_writer = services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps,
-                                                   *reader, origin, options, encoder);
+                                                   *reader, origin, encoding, encoder);
         Channel<DecodedItem> decoded(frame_queue_depth);
         Channel<EncodeItem> encode(frame_queue_depth), compare(frame_queue_depth);
         Profile decode_profile, encode_profile, compare_profile;
@@ -336,8 +322,8 @@ RunSummary stabilize(const Options& request, Services services) {
     auto report_file = services.outputs.stage(options.report);
     auto csv_file = services.outputs.stage(frames_path);
     services.outputs.write_report(report_file->temporary(), csv_file->temporary(),
-                                  {options, info, analysis_size, horizontal, frames, warps, profile, renderer.report(),
-                                   std::move(codecs), summary, analysis_ms});
+                                  {options, frames_path, info, analysis_size, horizontal, frames, warps, profile,
+                                   renderer.report(), std::move(codecs), summary, analysis_ms});
     output->publish();
     if (comparison)
         comparison->publish();

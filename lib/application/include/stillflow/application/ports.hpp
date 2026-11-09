@@ -1,6 +1,7 @@
 #pragma once
 #include "stillflow/application/report.hpp"
 #include <functional>
+#include <span>
 
 namespace stillflow {
 // Threading: stabilize() runs decoding, motion estimation, rendering and each
@@ -29,13 +30,15 @@ class VideoWriter {
 class MediaFactory {
   public:
     virtual ~MediaFactory() = default;
+    // Check adapter-specific output constraints before decoding starts.
+    virtual void validate_output(const std::filesystem::path& path) const = 0;
     virtual std::unique_ptr<VideoReader> reader(const std::filesystem::path& path, int threads,
                                                 const CodecRequest& decoder) = 0;
     // The source reader must outlive all writers created from it. Writers run on
     // their own threads while the reader keeps decoding.
     virtual std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double fps,
-                                                VideoReader& source, int64_t origin_us, const Options& options,
-                                                const CodecRequest& encoder) = 0;
+                                                VideoReader& source, int64_t origin_us,
+                                                const EncodingSettings& settings, const CodecRequest& encoder) = 0;
 };
 class MotionAnalyzer {
   public:
@@ -58,7 +61,8 @@ class OutputFile {
 class OutputStorage {
   public:
     virtual ~OutputStorage() = default;
-    virtual void validate(const Options& options, const std::filesystem::path& frames_path) = 0;
+    virtual void validate(const std::filesystem::path& input, std::span<const std::filesystem::path> outputs,
+                          bool overwrite) = 0;
     virtual std::unique_ptr<OutputFile> stage(const std::filesystem::path& target) = 0;
     virtual void write_report(const std::filesystem::path& json, const std::filesystem::path& csv,
                               const RunReport& report) = 0;

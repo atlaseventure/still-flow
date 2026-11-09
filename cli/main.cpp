@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 
@@ -97,14 +98,10 @@ double number(const std::string& text, const std::string& option) {
         throw std::runtime_error("Invalid number for " + option);
     return result;
 }
-double bounded(const std::string& text, const std::string& option, double low, double high) {
+int integer(const std::string& text, const std::string& option) {
     const double value = number(text, option);
-    if (value < low || value > high)
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
         throw std::runtime_error(option + " is out of range");
-    return value;
-}
-int integer(const std::string& text, const std::string& option, int low, int high) {
-    const double value = bounded(text, option, low, high);
     if (std::floor(value) != value)
         throw std::runtime_error(option + " requires an integer");
     return static_cast<int>(value);
@@ -149,23 +146,23 @@ int main(int argc, char** argv) {
             else if (option == "--report")
                 o.report = value;
             else if (option == "--analysis-width")
-                o.analysis_width = integer(value, option, 160, 4096);
+                o.analysis_width = integer(value, option);
             else if (option == "--features")
-                o.features = integer(value, option, 96, 10000);
+                o.features = integer(value, option);
             else if (option == "--bands")
-                o.bands = integer(value, option, 4, 32);
+                o.bands = integer(value, option);
             else if (option == "--threads")
-                o.threads = integer(value, option, 1, 64);
+                o.threads = integer(value, option);
             else if (option == "--crf")
-                o.crf = integer(value, option, 0, 51);
+                o.crf = integer(value, option);
             else if (option == "--smooth")
-                o.smooth_seconds = bounded(value, option, 0, 10);
+                o.smooth_seconds = number(value, option);
             else if (option == "--rs-smooth")
-                o.rs_seconds = bounded(value, option, 0, 10);
+                o.rs_seconds = number(value, option);
             else if (option == "--rs-strength")
-                o.rs_strength = bounded(value, option, 0, 1);
+                o.rs_strength = number(value, option);
             else if (option == "--crop")
-                o.crop = bounded(value, option, 0, 0.25);
+                o.crop = number(value, option);
             else if (option == "--preset")
                 o.preset = value;
             else if (option == "--decoder") {
@@ -182,8 +179,6 @@ int main(int argc, char** argv) {
                 o.backend = value;
                 backend_selected = true;
             } else if (option == "--scan-axis") {
-                if (value != "auto" && value != "x" && value != "y")
-                    throw std::runtime_error("--scan-axis must be auto, x or y");
                 o.scan_axis = value;
             } else if (option == "--rs") {
                 if (value != "on" && value != "off")
@@ -192,8 +187,7 @@ int main(int argc, char** argv) {
             } else
                 throw std::runtime_error("Unknown option: " + option);
         }
-        if (o.report.empty())
-            o.report = o.output.string() + ".profile.json";
+        o = stillflow::resolve_options(std::move(o));
         auto media = stillflow::make_media_factory();
         auto images = stillflow::make_image_processing();
 #ifdef STILLFLOW_CLI_CUDA

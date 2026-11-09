@@ -1,5 +1,6 @@
 #pragma once
 #include "stillflow/application/image.hpp"
+#include "stillflow/application/profile.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <functional>
 #include <map>

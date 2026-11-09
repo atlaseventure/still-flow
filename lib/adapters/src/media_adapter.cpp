@@ -78,9 +78,9 @@ class FfmpegReader final : public VideoReader {
 class FfmpegWriter final : public VideoWriter {
   public:
     FfmpegWriter(const std::filesystem::path& path, Size size, double fps, VideoReader& source, int64_t origin,
-                 const Options& options, const CodecRequest& encoder, HardwareDevices& devices)
+                 const EncodingSettings& settings, const CodecRequest& encoder, HardwareDevices& devices)
         : writer_(path, {size.width, size.height}, fps, dynamic_cast<FfmpegReader&>(source).reader.context(), origin,
-                  options.threads, options.crf, options.preset, options.audio, encoder, devices) {}
+                  settings.threads, settings.crf, settings.preset, settings.audio, encoder, devices) {}
     void video(const Image& input, int64_t pts, int64_t duration) override {
         if (!input)
             throw std::invalid_argument("Missing video frame");
@@ -107,13 +107,19 @@ class FfmpegWriter final : public VideoWriter {
 };
 class FfmpegMedia final : public MediaFactory {
   public:
+    void validate_output(const std::filesystem::path& path) const override {
+        if (path.extension() != ".mp4" && path.extension() != ".mkv")
+            throw std::invalid_argument("Output must use .mp4 or .mkv");
+    }
     std::unique_ptr<VideoReader> reader(const std::filesystem::path& path, int threads,
                                         const CodecRequest& decoder) override {
         return std::make_unique<FfmpegReader>(path, threads, decoder, devices_);
     }
     std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double fps, VideoReader& source,
-                                        int64_t origin, const Options& options, const CodecRequest& encoder) override {
-        return std::make_unique<FfmpegWriter>(path, size, fps, source, origin, options, encoder, devices_);
+                                        int64_t origin, const EncodingSettings& settings,
+                                        const CodecRequest& encoder) override {
+        validate_output(path);
+        return std::make_unique<FfmpegWriter>(path, size, fps, source, origin, settings, encoder, devices_);
     }
 
   private:

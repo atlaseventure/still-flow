@@ -1,7 +1,7 @@
 #pragma once
 
-#include "stillflow/application/cuda_image.hpp"
 #include "stillflow/application/media.hpp"
+#include "stillflow/interop/cuda_image.hpp"
 #include <filesystem>
 #include <functional>
 #include <memory>

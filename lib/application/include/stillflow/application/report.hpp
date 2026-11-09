@@ -1,8 +1,8 @@
 #pragma once
 #include "stillflow/application/media.hpp"
 #include "stillflow/application/options.hpp"
+#include "stillflow/application/profile.hpp"
 #include "stillflow/application/rendering.hpp"
-#include "stillflow/domain/profile.hpp"
 #include "stillflow/domain/types.hpp"
 
 namespace stillflow {
@@ -16,6 +16,7 @@ struct RunSummary {
 };
 struct RunReport {
     const Options& options;
+    std::filesystem::path frames_path;
     const VideoInfo& info;
     Size analysis_size;
     bool horizontal;

@@ -36,21 +36,17 @@ class LocalOutputFile final : public OutputFile {
     fs::path target_, temporary_;
 };
 
-void validate_paths(const Options& o, const fs::path& frames_path) {
-    if (!fs::is_regular_file(o.input))
+void validate_paths(const fs::path& input, std::span<const fs::path> outputs, bool overwrite) {
+    if (!fs::is_regular_file(input))
         throw std::runtime_error("Input must be a readable local video file");
-    std::set<fs::path> used{fs::weakly_canonical(o.input)};
-    for (const auto& path : {o.output, o.compare, o.report, frames_path}) {
+    std::set<fs::path> used{fs::weakly_canonical(input)};
+    for (const auto& path : outputs) {
         if (path.empty())
             continue;
         if (!used.insert(fs::weakly_canonical(path)).second)
             throw std::runtime_error("Input, output, comparison and report paths must be distinct");
-        if (fs::exists(path) && (!o.overwrite || !fs::is_regular_file(path)))
+        if (fs::exists(path) && (!overwrite || !fs::is_regular_file(path)))
             throw std::runtime_error("Output exists: " + path.string() + " (use --overwrite to replace files)");
-    }
-    for (const auto& path : {o.output, o.compare}) {
-        if (!path.empty() && path.extension() != ".mp4" && path.extension() != ".mkv")
-            throw std::runtime_error("Output must use .mp4 or .mkv");
     }
 }
 
@@ -121,8 +117,8 @@ nlohmann::json codecs_json(const std::vector<std::pair<std::string, CodecReport>
 }
 class LocalOutputStorage final : public OutputStorage {
   public:
-    void validate(const Options& options, const fs::path& frames_path) override {
-        validate_paths(options, frames_path);
+    void validate(const fs::path& input, std::span<const fs::path> outputs, bool overwrite) override {
+        validate_paths(input, outputs, overwrite);
     }
     std::unique_ptr<OutputFile> stage(const fs::path& path) override { return std::make_unique<LocalOutputFile>(path); }
     void write_report(const fs::path& json_path, const fs::path& csv_path, const RunReport& data) override {
@@ -133,8 +129,7 @@ class LocalOutputStorage final : public OutputStorage {
         const auto analysis_size = data.analysis_size;
         const bool horizontal = data.horizontal;
         const double total_ms = data.summary.wall_ms, analysis_ms = data.analysis_ms;
-        auto frames_path = options.report;
-        frames_path.replace_extension(".frames.csv");
+        const auto& frames_path = data.frames_path;
         const double duration = frames.back().seconds + frames.back().duration;
         const auto resets = std::count_if(frames.begin(), frames.end(), [](const auto& f) { return f.motion.reset; });
         const auto limited =

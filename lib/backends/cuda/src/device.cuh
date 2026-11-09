@@ -1,6 +1,6 @@
 #pragma once
-#include "stillflow/application/cuda_image.hpp"
 #include "stillflow/application/rendering.hpp"
+#include "stillflow/interop/cuda_image.hpp"
 
 #include <cuda_runtime.h>
 #include <optional>

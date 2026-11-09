@@ -111,8 +111,7 @@ bool fits(const Warp& warp, Size size, double crop, bool horizontal, double stre
 } // namespace
 
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, const StabilizationSettings& options,
-                             bool horizontal, Profile& profile) {
-    ScopeTimer timer(profile, "plan.optimize");
+                             bool horizontal) {
     std::vector<Warp> output(frames.size());
     const Point center((size.width - 1) * 0.5, (size.height - 1) * 0.5);
     for (size_t first = 0; first < frames.size();) {

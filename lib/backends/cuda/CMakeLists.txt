@@ -7,5 +7,8 @@ set_target_properties(
                CUDA_STANDARD_REQUIRED ON
                CUDA_RUNTIME_LIBRARY Static)
 target_include_directories(stillflow_backend_cuda PUBLIC include)
-target_link_libraries(stillflow_backend_cuda PUBLIC StillFlow::application)
+target_link_libraries(
+    stillflow_backend_cuda
+    PUBLIC StillFlow::application
+    PRIVATE StillFlow::interop)
 target_compile_definitions(stillflow_backend_cuda PRIVATE STILLFLOW_CUDA_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")
