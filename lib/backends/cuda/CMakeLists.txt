@@ -1,0 +1,7 @@
+add_library(stillflow_backend_cuda STATIC src/renderer.cu)
+add_library(StillFlow::backend_cuda ALIAS stillflow_backend_cuda)
+set_target_properties(stillflow_backend_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
+target_include_directories(stillflow_backend_cuda PUBLIC include)
+target_link_libraries(stillflow_backend_cuda PUBLIC StillFlow::application)
+target_compile_definitions(stillflow_backend_cuda PRIVATE STILLFLOW_CUDA_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")

@@ -30,18 +30,10 @@ public:
     virtual ~MotionAnalyzer() = default;
     virtual Motion estimate(const Image& previous, const Image& current, Profile& profile) = 0;
 };
-class Renderer {
-public:
-    virtual ~Renderer() = default;
-    virtual Image render(const Image& input, Warp& warp, Size analysis_size,
-        double crop, bool horizontal, Profile& profile) = 0;
-    virtual AccelerationReport report() const = 0;
-};
 class ImageProcessing {
 public:
     virtual ~ImageProcessing() = default;
     virtual std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) = 0;
-    virtual std::unique_ptr<Renderer> renderer(const std::string& mode) = 0;
     virtual Image gray_proxy(const Image& image, Size size) = 0;
     virtual Image comparison(const Image& input, const Image& stabilized) = 0;
 };
@@ -68,7 +60,7 @@ public:
 class Progress {
 public:
     virtual ~Progress() = default;
-    virtual void backend(const AccelerationReport& report) = 0;
+    virtual void backend(const RenderingReport& report) = 0;
     virtual void analyzing(const VideoInfo& info, Size analysis_size, bool horizontal) = 0;
     virtual void analyzed(size_t frames, bool complete) = 0;
     virtual void rendered(size_t frames, size_t total, bool complete) = 0;
@@ -76,6 +68,7 @@ public:
 struct Services {
     MediaFactory& media;
     ImageProcessing& images;
+    RendererFactory& renderers;
     OutputStorage& outputs;
     Runtime& runtime;
     Progress& progress;

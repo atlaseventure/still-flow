@@ -1,5 +1,9 @@
 add_executable(stillflow main.cpp)
-target_link_libraries(stillflow PRIVATE StillFlow::adapters)
+target_link_libraries(stillflow PRIVATE StillFlow::adapters StillFlow::backend_cpu)
+if(TARGET StillFlow::backend_cuda)
+    target_link_libraries(stillflow PRIVATE StillFlow::backend_cuda)
+    target_compile_definitions(stillflow PRIVATE STILLFLOW_CLI_CUDA)
+endif()
 target_compile_options(stillflow PRIVATE
     $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)

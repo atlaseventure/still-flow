@@ -26,7 +26,7 @@ endforeach()
 target_link_options(stillflow_ffmpeg INTERFACE ${FFMPEG_STATIC_LDFLAGS_OTHER})
 
 add_library(stillflow_media STATIC src/media.cpp src/media_adapter.cpp)
-add_library(stillflow_images STATIC src/motion.cpp src/maps.cpp src/renderer.cpp src/image_processing.cpp)
+add_library(stillflow_images STATIC src/motion.cpp src/image_processing.cpp)
 add_library(stillflow_host STATIC src/output_storage.cpp src/runtime.cpp)
 add_library(StillFlow::media ALIAS stillflow_media)
 add_library(StillFlow::images ALIAS stillflow_images)
@@ -47,11 +47,3 @@ target_compile_definitions(stillflow_host PRIVATE STILLFLOW_VERSION="${PROJECT_V
 add_library(stillflow_adapters INTERFACE)
 add_library(StillFlow::adapters ALIAS stillflow_adapters)
 target_link_libraries(stillflow_adapters INTERFACE stillflow_media stillflow_images stillflow_host)
-if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
-    target_sources(stillflow_images PRIVATE src/renderer_cuda.cu)
-    target_compile_definitions(stillflow_images PRIVATE STILLFLOW_HAVE_CUDA
-        STILLFLOW_CUDA_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")
-    target_compile_definitions(stillflow_host PRIVATE STILLFLOW_CUDA_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")
-    set_target_properties(stillflow_images PROPERTIES CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
-endif()

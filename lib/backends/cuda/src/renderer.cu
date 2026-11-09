@@ -1,13 +1,13 @@
-#include "renderer.hpp"
+#include "stillflow/backends/cuda.hpp"
 
 #include <cuda_runtime.h>
-#include <stdexcept>
+#include <cstring>
 
 namespace stillflow {
 namespace {
 void check(cudaError_t result, const char* operation) {
     if (result != cudaSuccess)
-        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(result));
+        throw BackendError(std::string(operation) + ": " + cudaGetErrorString(result));
 }
 
 template<class T, bool pinned = false> class Buffer {
@@ -94,20 +94,24 @@ __global__ void render_kernel(const unsigned char* input, unsigned char* output,
         atomicAdd(invalid_count, static_cast<unsigned int>(invalid_in_block));
 }
 
-class CudaRenderer final : public GpuRenderer {
+class CudaBackend final : public RenderBackend {
 public:
-    explicit CudaRenderer(std::string name) : name_(std::move(name)) { invalid_.reserve(1); }
-    ~CudaRenderer() override { cudaStreamSynchronize(stream_.value); }
-    std::string device() const override { return name_; }
-    void upload(const cv::Mat& input) override {
-        if (input.type() != CV_8UC3) throw std::runtime_error("CUDA renderer requires BGR8 input");
-        size_ = input.size();
-        const size_t bytes = input.total() * 3;
+    explicit CudaBackend(std::string name) : name_(std::move(name)) { invalid_.reserve(1); }
+    ~CudaBackend() override { cudaStreamSynchronize(stream_.value); }
+    BackendInfo info() const override {
+        return {"cuda", name_, {{PixelFormat::bgr8}, {"host"}}, {{"compiler", STILLFLOW_CUDA_VERSION}}};
+    }
+    void upload(const Image& input) override {
+        const auto mapping = map_host_image(input);
+        if (mapping.format != PixelFormat::bgr8) throw BackendError("CUDA rendering requires BGR8 input");
+        size_ = mapping.size;
+        const size_t stride = static_cast<size_t>(size_.width) * 3;
+        const size_t bytes = stride * size_.height;
         input_.reserve(bytes);
         output_.reserve(bytes);
         staging_.reserve(bytes);
-        cv::Mat host(size_, CV_8UC3, staging_.data());
-        input.copyTo(host);
+        for (int y = 0; y < size_.height; ++y)
+            std::memcpy(staging_.data() + y * stride, mapping.bytes.data() + y * mapping.row_stride, stride);
         check(cudaMemcpyAsync(input_.data(), staging_.data(), bytes,
             cudaMemcpyHostToDevice, stream_.value), "Upload CUDA frame");
     }
@@ -131,16 +135,17 @@ public:
         check(cudaStreamSynchronize(stream_.value), "Complete CUDA warp");
         return static_cast<double>(invalid) / (static_cast<double>(size_.width) * size_.height);
     }
-    void download(cv::Mat& output) override {
-        output.create(size_, CV_8UC3);
-        check(cudaMemcpyAsync(staging_.data(), output_.data(), output.total() * 3,
+    Image download() override {
+        const size_t bytes = static_cast<size_t>(size_.width) * size_.height * 3;
+        check(cudaMemcpyAsync(staging_.data(), output_.data(), bytes,
             cudaMemcpyDeviceToHost, stream_.value), "Download CUDA frame");
         check(cudaStreamSynchronize(stream_.value), "Complete CUDA download");
-        cv::Mat(size_, CV_8UC3, staging_.data()).copyTo(output);
+        std::vector<uint8_t> pixels(staging_.data(), staging_.data() + bytes);
+        return make_host_image(size_, PixelFormat::bgr8, std::move(pixels));
     }
 private:
     std::string name_;
-    cv::Size size_;
+    Size size_;
     Stream stream_;
     Buffer<unsigned char> input_, output_;
     // Reuse one pinned host buffer after each synchronized upload/warp/download.
@@ -149,13 +154,13 @@ private:
 };
 }
 
-std::unique_ptr<GpuRenderer> make_cuda_renderer() {
+std::unique_ptr<RenderBackend> make_cuda_backend() {
     int count = 0;
     check(cudaGetDeviceCount(&count), "Detect CUDA device");
-    if (count == 0) throw std::runtime_error("No CUDA device available");
+    if (count == 0) throw BackendError("No CUDA device available");
     check(cudaSetDevice(0), "Select CUDA device");
     cudaDeviceProp properties{};
     check(cudaGetDeviceProperties(&properties, 0), "Read CUDA device");
-    return std::make_unique<CudaRenderer>(properties.name);
+    return std::make_unique<CudaBackend>(properties.name);
 }
 } // namespace stillflow

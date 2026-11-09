@@ -19,7 +19,7 @@ The build detects the CUDA Toolkit automatically; GPU execution requires a compa
 
 ## Library integration
 
-The core follows Clean Architecture: domain algorithms and application use cases depend on ports for media, images, outputs and runtime services. The CLI assembles desktop adapters; Android and embedded hosts can supply their own adapters.
+The core follows Clean Architecture: domain algorithms and application use cases depend on ports for media, images, rendering, outputs and runtime services. The CLI assembles desktop adapters; Android and embedded hosts can supply their own adapters.
 
 Build and install the core with an installed Eigen package:
 
@@ -31,6 +31,8 @@ cmake --install build-lib --prefix /path/to/sdk
 ```
 
 For cross-compilation, pass the target platform's `CMAKE_TOOLCHAIN_FILE`. Consumers import `find_package(StillFlow CONFIG REQUIRED)`, link `StillFlow::application`, implement the application ports and call `stillflow::stabilize`. The core requires a C++20 standard library with filesystem and exception support.
+
+To add a rendering backend, implement `RenderBackend`, register it with `make_renderer_factory` and inject `Services::renderers`. Registration order determines automatic selection and fallback; explicit selection fails on backend errors. Images are exchanged through read mappings or native handles with lifetime ownership.
 
 ## Synthetic footage
 
@@ -50,7 +52,7 @@ Process a video and generate a side-by-side comparison:
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
 
-CUDA is selected automatically, with CPU fallback when unavailable or if execution fails. `--gpu off` forces CPU rendering; `--gpu cuda` requires CUDA and exits on failure. Reports record the actual backend, device, frame counts, and fallback reason; GPU timings include transfers and synchronization. Motion estimation, trajectory optimization, and video codecs run on the CPU.
+CUDA is selected automatically, with CPU fallback when unavailable or if execution fails. `--backend cpu` forces CPU rendering; `--backend cuda` requires CUDA and exits on failure. Reports record each backend's device, capabilities, frame counts and failure reasons; rendering timings include transfers and synchronization. Motion estimation, trajectory optimization, and video codecs run on the CPU.
 
 Compare scanline correction with the same crop. `--rs off` keeps the same motion estimation and disables scanline compensation. Omit the comparison video when benchmarking:
 

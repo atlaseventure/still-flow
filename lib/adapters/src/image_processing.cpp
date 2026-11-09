@@ -1,7 +1,6 @@
 #include "stillflow/adapters/backends.hpp"
 #include "image.hpp"
 #include "motion.hpp"
-#include "renderer.hpp"
 #include <opencv2/imgproc.hpp>
 
 namespace stillflow {
@@ -10,34 +9,22 @@ class OpenCvMotionAnalyzer final : public MotionAnalyzer {
 public:
     OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal) : estimator_(settings, horizontal) {}
     Motion estimate(const Image& previous, const Image& current, Profile& profile) override {
-        return estimator_.estimate(pixels(previous), pixels(current), profile);
+        auto before = read_pixels(previous), after = read_pixels(current);
+        return estimator_.estimate(before.pixels, after.pixels, profile);
     }
 private:
     MotionEstimator estimator_;
-};
-class OpenCvRenderer final : public Renderer {
-public:
-    explicit OpenCvRenderer(const std::string& mode) : renderer_(mode) {}
-    Image render(const Image& input, Warp& warp, Size size, double crop, bool horizontal, Profile& profile) override {
-        cv::Mat output;
-        renderer_.render(pixels(input), output, warp, size, crop, horizontal, profile);
-        return image(std::move(output));
-    }
-    AccelerationReport report() const override { return renderer_.report(); }
-private:
-    FrameRenderer renderer_;
 };
 class OpenCvProcessing final : public ImageProcessing {
 public:
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
         return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal);
     }
-    std::unique_ptr<Renderer> renderer(const std::string& mode) override {
-        return std::make_unique<OpenCvRenderer>(mode);
-    }
     Image gray_proxy(const Image& input, Size size) override {
         cv::Mat gray, small;
-        cv::cvtColor(pixels(input), gray, cv::COLOR_BGR2GRAY);
+        auto view = read_pixels(input);
+        if (view.mapping.format != PixelFormat::bgr8) throw std::invalid_argument("Preprocessing requires BGR8 input");
+        cv::cvtColor(view.pixels, gray, cv::COLOR_BGR2GRAY);
         const cv::Size target(size.width, size.height);
         if (gray.size() == target) return image(std::move(gray));
         cv::resize(gray, small, target, 0, 0, cv::INTER_AREA);
@@ -46,7 +33,8 @@ public:
     Image comparison(const Image& input, const Image& stabilized) override {
         if (!font_) font_ = std::make_unique<cv::FontFace>("sans");
         cv::Mat combined;
-        cv::hconcat(pixels(input), pixels(stabilized), combined);
+        auto before = read_pixels(input), after = read_pixels(stabilized);
+        cv::hconcat(before.pixels, after.pixels, combined);
         cv::putText(combined, "INPUT", {20, 35}, {255, 255, 255}, *font_, 24, 600);
         cv::putText(combined, "STABILIZED", {input->size().width + 20, 35}, {255, 255, 255}, *font_, 24, 600);
         return image(std::move(combined));

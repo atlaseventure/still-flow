@@ -1,5 +1,9 @@
 #include "stillflow/application/stabilize.hpp"
 #include "stillflow/adapters/backends.hpp"
+#include "stillflow/backends/cpu.hpp"
+#ifdef STILLFLOW_CLI_CUDA
+#include "stillflow/backends/cuda.hpp"
+#endif
 
 #include <iomanip>
 #include <cmath>
@@ -11,9 +15,11 @@
 namespace {
 class ConsoleProgress final : public stillflow::Progress {
 public:
-    void backend(const stillflow::AccelerationReport& report) override {
-        std::cerr << "Render backend: " << (report.device.empty() ? "CPU" : "CUDA (" + report.device + ")");
-        if (!report.fallback_reason.empty()) std::cerr << " (" << report.fallback_reason << ')';
+    void backend(const stillflow::RenderingReport& report) override {
+        std::cerr << "Render backend: " << report.backend;
+        if (!report.backends.empty()) std::cerr << " (" << report.backends.back().info.device << ')';
+        for (const auto& failure : report.failures)
+            std::cerr << "; " << failure.backend << ": " << failure.reason;
         std::cerr << '\n';
     }
     void analyzing(const stillflow::VideoInfo& info, stillflow::Size size, bool horizontal) override {
@@ -47,7 +53,7 @@ Usage: stillflow INPUT OUTPUT [options]
   --rs-strength N         Scanline correction gain, 0..1 (default 1)
   --crop FRACTION         Fixed crop on EACH edge, 0..0.25 (default 0.08)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
-  --gpu auto|cuda|off      Rendering backend (default auto)
+  --backend auto|NAME     Rendering backend (default auto)
   --crf N                 H.264 quality, 0..51 (default 18)
   --preset NAME           x264 encoding preset (default fast)
   --no-audio              Omit audio instead of stream copying
@@ -93,6 +99,7 @@ int main(int argc, char** argv) {
         if (argc < 3) throw std::runtime_error("Expected INPUT and OUTPUT; see --help");
         stillflow::Options o;
         o.input = argv[1]; o.output = argv[2];
+        bool backend_selected = false;
         for (int i = 3; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--no-audio") { o.audio = false; continue; }
@@ -112,10 +119,11 @@ int main(int argc, char** argv) {
             else if (option == "--rs-strength") o.rs_strength = bounded(value, option, 0, 1);
             else if (option == "--crop") o.crop = bounded(value, option, 0, 0.25);
             else if (option == "--preset") o.preset = value;
-            else if (option == "--gpu") {
-                if (value != "auto" && value != "cuda" && value != "off")
-                    throw std::runtime_error("--gpu must be auto, cuda or off");
-                o.gpu = value;
+            else if (option == "--backend") {
+                if (backend_selected && o.backend != value)
+                    throw std::runtime_error("Conflicting rendering backend selections");
+                o.backend = value;
+                backend_selected = true;
             }
             else if (option == "--scan-axis") {
                 if (value != "auto" && value != "x" && value != "y")
@@ -129,10 +137,16 @@ int main(int argc, char** argv) {
         if (o.report.empty()) o.report = o.output.string() + ".profile.json";
         auto media = stillflow::make_media_factory();
         auto images = stillflow::make_image_processing();
+        std::vector<stillflow::BackendProvider> providers;
+#ifdef STILLFLOW_CLI_CUDA
+        providers.push_back({"cuda", stillflow::make_cuda_backend});
+#endif
+        providers.push_back({"cpu", stillflow::make_cpu_backend});
+        auto renderers = stillflow::make_renderer_factory(std::move(providers));
         auto outputs = stillflow::make_output_storage();
         auto runtime = stillflow::make_runtime();
         ConsoleProgress progress;
-        const auto result = stillflow::stabilize(o, {*media, *images, *outputs, *runtime, progress});
+        const auto result = stillflow::stabilize(o, {*media, *images, *renderers, *outputs, *runtime, progress});
         std::cout << std::fixed << std::setprecision(2) << result.frames << " frames, " << result.wall_ms / 1000
                   << " s, " << result.frames * 1000.0 / result.wall_ms << " end-to-end fps, "
                   << result.resources.peak_rss_mib << " MiB peak RSS\nReport: " << o.report << '\n';

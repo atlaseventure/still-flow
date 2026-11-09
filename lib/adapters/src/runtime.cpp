@@ -26,9 +26,6 @@ public:
 std::unique_ptr<Runtime> make_runtime() { return std::make_unique<HostRuntime>(); }
 std::string build_description() {
     return "stillflow " STILLFLOW_VERSION " (C++20, OpenCV " CV_VERSION
-#ifdef STILLFLOW_CUDA_VERSION
-        ", CUDA " STILLFLOW_CUDA_VERSION
-#endif
         ")";
 }
 } // namespace stillflow

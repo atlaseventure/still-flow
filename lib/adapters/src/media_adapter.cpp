@@ -36,7 +36,11 @@ public:
         int64_t origin, const Options& options)
         : writer_(path, {size.width, size.height}, fps, dynamic_cast<FfmpegReader&>(source).reader.context(),
             origin, options.threads, options.crf, options.preset, options.audio) {}
-    void video(const Image& input, int64_t pts, int64_t duration) override { writer_.video(pixels(input), pts, duration); }
+    void video(const Image& input, int64_t pts, int64_t duration) override {
+        auto view = read_pixels(input);
+        if (view.mapping.format != PixelFormat::bgr8) throw std::invalid_argument("Video writer requires BGR8 input");
+        writer_.video(view.pixels, pts, duration);
+    }
     void audio(const AudioPacket& packet) override { writer_.audio(dynamic_cast<const FfmpegAudioPacket&>(packet).packet); }
     void finish() override { writer_.finish(); }
 private:

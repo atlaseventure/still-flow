@@ -10,6 +10,4 @@ private:
     StabilizationSettings options_;
     bool horizontal_;
 };
-void build_maps(const Warp& warp, Size analysis_size, cv::Size output_size,
-    double crop, bool horizontal_scan, cv::Mat& map_x, cv::Mat& map_y);
 } // namespace stillflow

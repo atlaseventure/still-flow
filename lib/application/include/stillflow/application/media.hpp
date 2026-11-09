@@ -1,5 +1,5 @@
 #pragma once
-#include "stillflow/domain/geometry.hpp"
+#include "stillflow/application/image.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -12,13 +12,6 @@ struct VideoInfo {
     std::string codec;
     bool horizontal_scan = false;
 };
-// Pixel storage belongs to the image adapter and stays alive across frame reads.
-class ImageData {
-public:
-    virtual ~ImageData() = default;
-    virtual Size size() const = 0;
-};
-using Image = std::shared_ptr<const ImageData>;
 struct VideoFrame {
     Image bgr;
     int64_t pts_us = 0, duration_us = 0;

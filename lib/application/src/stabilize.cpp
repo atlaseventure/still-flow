@@ -35,7 +35,7 @@ RunSummary stabilize(const Options& request, Services services) {
     services.runtime.configure(options.threads);
     Profile profile;
     const auto backend_start = Clock::now();
-    auto renderer = services.images.renderer(options.gpu);
+    auto renderer = services.renderers.create(options.backend);
     profile.add("render.backend_init", milliseconds(backend_start));
     services.progress.backend(renderer->report());
     VideoInfo info;

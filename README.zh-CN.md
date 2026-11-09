@@ -19,7 +19,7 @@ cmake --build build
 
 ## 库集成
 
-核心库按 Clean Architecture 分为领域算法与应用用例，通过接口接入媒体、图像、输出和运行时服务。CLI 负责组装桌面适配器；Android 和嵌入式宿主可提供自己的适配器。
+核心库按 Clean Architecture 分为领域算法与应用用例，通过接口接入媒体、图像、渲染、输出和运行时服务。CLI 负责组装桌面适配器；Android 和嵌入式宿主可提供自己的适配器。
 
 使用已安装的 Eigen 单独构建、安装核心库：
 
@@ -31,6 +31,8 @@ cmake --install build-lib --prefix /path/to/sdk
 ```
 
 交叉编译时传入目标平台的 `CMAKE_TOOLCHAIN_FILE`。使用方通过 `find_package(StillFlow CONFIG REQUIRED)` 导入并链接 `StillFlow::application`，实现应用层端口后调用 `stillflow::stabilize`。核心库需要支持 C++20、文件系统和异常的标准库。
+
+新增渲染后端时实现 `RenderBackend`，通过 `make_renderer_factory` 注册并注入 `Services::renderers`。注册顺序决定自动选择与回退顺序；显式选择后端时失败即退出。图像通过持有生命周期的只读映射或原生句柄交换。
 
 ## 合成素材
 
@@ -50,7 +52,7 @@ python3 scripts/generate_video.py --output .local/synthetic --frames 60
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
 
-默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--gpu off` 强制使用 CPU，`--gpu cuda` 要求 CUDA 可用，失败时退出。性能报告记录实际后端、设备、处理帧数和回退原因；GPU 阶段耗时包含数据传输与同步。运动估计、轨迹优化和视频编解码使用 CPU。
+默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--backend cpu` 强制使用 CPU，`--backend cuda` 要求 CUDA 可用，失败时退出。性能报告按后端记录设备、能力、处理帧数和失败原因；渲染阶段耗时包含数据传输与同步。运动估计、轨迹优化和视频编解码使用 CPU。
 
 使用相同裁剪量对照扫描行修正效果；`--rs off` 保留相同运动估计，仅关闭扫描行补偿。性能比较时省略对比视频：
 

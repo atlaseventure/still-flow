@@ -78,12 +78,18 @@ nlohmann::json profile_json(const Profile& profile) {
     }
     return result;
 }
-nlohmann::json acceleration_json(const AccelerationReport& data) {
-    nlohmann::json result{{"requested", data.requested}, {"backend", data.backend},
-        {"device", data.device}, {"gpu_frames", data.gpu_frames}, {"cpu_frames", data.cpu_frames},
-        {"fallback_reason", data.fallback_reason}};
-    if (!data.cuda_compiler.empty()) result["cuda_compiler"] = data.cuda_compiler;
-    return result;
+nlohmann::json rendering_json(const RenderingReport& data) {
+    auto backends = nlohmann::json::array(), failures = nlohmann::json::array();
+    for (const auto& backend : data.backends) {
+        auto formats = nlohmann::json::array();
+        for (auto format : backend.info.capabilities.formats) formats.push_back(pixel_format_name(format));
+        backends.push_back({{"id", backend.info.id}, {"device", backend.info.device}, {"frames", backend.frames},
+            {"capabilities", {{"formats", formats}, {"image_access", backend.info.capabilities.image_access}}},
+            {"implementation", backend.info.implementation}});
+    }
+    for (const auto& failure : data.failures)
+        failures.push_back({{"backend", failure.backend}, {"stage", failure.stage}, {"reason", failure.reason}});
+    return {{"requested", data.requested}, {"backend", data.backend}, {"backends", backends}, {"failures", failures}};
 }
 class LocalOutputStorage final : public OutputStorage {
 public:
@@ -103,10 +109,10 @@ public:
         const auto resets = std::count_if(frames.begin(), frames.end(), [](const auto& f) { return f.motion.reset; });
         const auto limited = std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.strength < 0.999; });
         nlohmann::json report{
-            {"schema_version", 1}, {"version", STILLFLOW_VERSION},
+            {"schema_version", 2}, {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()}, {"output", fs::absolute(options.output).string()},
             {"frames_csv", fs::absolute(frames_path).string()},
-            {"acceleration", acceleration_json(data.acceleration)},
+            {"rendering", rendering_json(data.rendering)},
             {"video", {{"width", info.width}, {"height", info.height}, {"nominal_fps", info.fps},
                 {"frames", frames.size()}, {"duration_s", duration}, {"input_codec", info.codec},
                 {"display_rotation_applied", info.rotation}, {"analysis_width", analysis_size.width}, {"analysis_height", analysis_size.height}}},

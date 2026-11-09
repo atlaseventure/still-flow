@@ -1,14 +1,11 @@
 #pragma once
 #include "stillflow/application/media.hpp"
+#include "stillflow/application/rendering.hpp"
 #include "stillflow/application/options.hpp"
 #include "stillflow/domain/types.hpp"
 #include "stillflow/domain/profile.hpp"
 
 namespace stillflow {
-struct AccelerationReport {
-    std::string requested, backend, device, fallback_reason, cuda_compiler;
-    size_t gpu_frames = 0, cpu_frames = 0;
-};
 struct ResourceUsage { double cpu_seconds = 0, peak_rss_mib = 0; };
 struct RunSummary {
     size_t frames = 0;
@@ -23,7 +20,7 @@ struct RunReport {
     const std::vector<FrameMotion>& frames;
     const std::vector<Warp>& warps;
     const Profile& profile;
-    AccelerationReport acceleration;
+    RenderingReport rendering;
     RunSummary summary;
     double analysis_ms;
 };

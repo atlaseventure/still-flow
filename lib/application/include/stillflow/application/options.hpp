@@ -10,7 +10,7 @@ struct Options : StabilizationSettings {
     int crf = 18;
     std::string scan_axis = "auto";
     std::string preset = "fast";
-    std::string gpu = "auto";
+    std::string backend = "auto";
     bool audio = true;
     bool overwrite = false;
 };
