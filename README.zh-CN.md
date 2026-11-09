@@ -6,13 +6,14 @@
 
 ## 构建
 
-Ubuntu 安装依赖并构建 Release 版本：
+Linux 环境需具备 C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。首次构建下载固定版本的源码、校验完整性，并在本地构建全部依赖库。
 
 ```sh
-sudo apt install build-essential cmake ninja-build pkg-config libopencv-dev libeigen3-dev nlohmann-json3-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+每个依赖默认使用 12 个编译任务，可通过 `-DSTILLFLOW_BUILD_JOBS=N` 调整。增量构建复用已下载的源码和已编译的依赖。
 
 ## 使用
 

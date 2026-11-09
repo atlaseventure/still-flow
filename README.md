@@ -6,13 +6,14 @@ Offline video stabilization and rolling shutter wobble suppression without train
 
 ## Build
 
-Install dependencies on Ubuntu and build in Release mode:
+On Linux, provide a C++20 compiler, CMake, Ninja, Make, pkg-config, Python, and Perl. The first build downloads verified, pinned sources and builds all library dependencies locally.
 
 ```sh
-sudo apt install build-essential cmake ninja-build pkg-config libopencv-dev libeigen3-dev nlohmann-json3-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+Dependencies use 12 compilation jobs each; adjust with `-DSTILLFLOW_BUILD_JOBS=N`. Incremental builds reuse downloaded sources and compiled libraries.
 
 ## Usage
 

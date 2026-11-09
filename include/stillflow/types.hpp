@@ -12,7 +12,7 @@ struct Options {
     int analysis_width = 960;
     int features = 1200;
     int bands = 12;
-    int threads = 4;
+    int threads = 12;
     int crf = 18;
     double smooth_seconds = 0.45;
     double rs_seconds = 0.30;

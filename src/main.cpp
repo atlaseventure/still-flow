@@ -1,5 +1,6 @@
 #include "stillflow/stabilizer.hpp"
 
+#include <opencv2/core/version.hpp>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -22,7 +23,7 @@ Usage: stillflow INPUT OUTPUT [options]
   --rs-smooth SECONDS     Scanline trajectory smoothing scale (default 0.30)
   --rs-strength N         Scanline correction gain, 0..1 (default 1)
   --crop FRACTION         Fixed crop on EACH edge, 0..0.25 (default 0.08)
-  --threads N             Threads per OpenCV/codec worker pool (default 4)
+  --threads N             Threads per OpenCV/codec worker pool (default 12)
   --crf N                 H.264 quality, 0..51 (default 18)
   --preset NAME           x264 encoding preset (default fast)
   --no-audio              Omit audio instead of stream copying
@@ -59,7 +60,8 @@ int integer(const std::string& text, const std::string& option, int low, int hig
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--version") {
-            std::cout << "stillflow " << STILLFLOW_VERSION << " (C++20)\n"; return EXIT_SUCCESS;
+            std::cout << "stillflow " << STILLFLOW_VERSION << " (C++20, OpenCV " << CV_VERSION << ")\n";
+            return EXIT_SUCCESS;
         }
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
             std::cout << help; return argc == 1 ? EXIT_FAILURE : EXIT_SUCCESS;

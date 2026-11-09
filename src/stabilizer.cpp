@@ -160,6 +160,8 @@ int run(const Options& options) {
         });
         VideoFrame frame;
         cv::Mat map_x, map_y, stabilized;
+        std::unique_ptr<cv::FontFace> label_font;
+        if (compare_writer) label_font = std::make_unique<cv::FontFace>("sans");
         for (;;) {
             bool available;
             { ScopeTimer timer(profile, "render.decode_and_audio"); available = reader.next(frame); }
@@ -188,8 +190,8 @@ int run(const Options& options) {
                 ScopeTimer timer(profile, "comparison.compose_and_encode");
                 cv::Mat combined;
                 cv::hconcat(frame.bgr, stabilized, combined);
-                cv::putText(combined, "INPUT", {20, 35}, cv::FONT_HERSHEY_SIMPLEX, 0.8, {255, 255, 255}, 2, cv::LINE_AA);
-                cv::putText(combined, "STABILIZED", {size.width + 20, 35}, cv::FONT_HERSHEY_SIMPLEX, 0.8, {255, 255, 255}, 2, cv::LINE_AA);
+                cv::putText(combined, "INPUT", {20, 35}, {255, 255, 255}, *label_font, 24, 600);
+                cv::putText(combined, "STABILIZED", {size.width + 20, 35}, {255, 255, 255}, *label_font, 24, 600);
                 compare_writer->video(combined, frame.pts_us, duration);
             }
             ++rendered;
