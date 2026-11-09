@@ -8,7 +8,7 @@ extern "C" {
 namespace stillflow {
 namespace {
 class HostRuntime final : public Runtime {
-public:
+  public:
     void configure(int threads) override {
         cv::setNumThreads(threads);
         cv::setRNGSeed(42);
@@ -17,15 +17,12 @@ public:
     ResourceUsage resources() const override {
         struct rusage usage{};
         getrusage(RUSAGE_SELF, &usage);
-        return {usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 +
-                usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6,
+        return {usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 + usage.ru_stime.tv_sec +
+                    usage.ru_stime.tv_usec / 1e6,
                 usage.ru_maxrss / 1024.0};
     }
 };
-}
+} // namespace
 std::unique_ptr<Runtime> make_runtime() { return std::make_unique<HostRuntime>(); }
-std::string build_description() {
-    return "stillflow " STILLFLOW_VERSION " (C++20, OpenCV " CV_VERSION
-        ")";
-}
+std::string build_description() { return "stillflow " STILLFLOW_VERSION " (C++20, OpenCV " CV_VERSION ")"; }
 } // namespace stillflow

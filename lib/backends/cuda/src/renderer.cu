@@ -1,7 +1,7 @@
 #include "stillflow/backends/cuda.hpp"
 
-#include <cuda_runtime.h>
 #include <cstring>
+#include <cuda_runtime.h>
 
 namespace stillflow {
 namespace {
@@ -10,14 +10,15 @@ void check(cudaError_t result, const char* operation) {
         throw BackendError(std::string(operation) + ": " + cudaGetErrorString(result));
 }
 
-template<class T, bool pinned = false> class Buffer {
-public:
+template <class T, bool pinned = false> class Buffer {
+  public:
     ~Buffer() { release(data_); }
     Buffer() = default;
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     void reserve(size_t count) {
-        if (count <= capacity_) return;
+        if (count <= capacity_)
+            return;
         T* next = nullptr;
         if constexpr (pinned)
             check(cudaMallocHost(reinterpret_cast<void**>(&next), count * sizeof(T)), "Allocate CUDA staging buffer");
@@ -28,18 +29,22 @@ public:
         capacity_ = count;
     }
     T* data() const { return data_; }
-private:
+
+  private:
     static void release(T* pointer) {
-        if (!pointer) return;
-        if constexpr (pinned) cudaFreeHost(pointer);
-        else cudaFree(pointer);
+        if (!pointer)
+            return;
+        if constexpr (pinned)
+            cudaFreeHost(pointer);
+        else
+            cudaFree(pointer);
     }
     T* data_ = nullptr;
     size_t capacity_ = 0;
 };
 
 class Stream {
-public:
+  public:
     Stream() { check(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking), "Create CUDA stream"); }
     ~Stream() { cudaStreamDestroy(value); }
     Stream(const Stream&) = delete;
@@ -53,8 +58,8 @@ struct DeviceMap {
     int bands, horizontal;
 };
 
-__global__ void render_kernel(const unsigned char* input, unsigned char* output,
-    int width, int height, DeviceMap m, unsigned int* invalid_count) {
+__global__ void render_kernel(const unsigned char* input, unsigned char* output, int width, int height, DeviceMap m,
+                              unsigned int* invalid_count) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     bool invalid = false;
@@ -64,9 +69,9 @@ __global__ void render_kernel(const unsigned char* input, unsigned char* output,
         if (m.bands) {
             const float coordinate = m.horizontal ? px : py;
             int band = 0;
-            while (band < m.bands - 2 && coordinate > m.scan[band + 1]) ++band;
-            const float t = fminf(1, fmaxf(0,
-                (coordinate - m.scan[band]) / (m.scan[band + 1] - m.scan[band])));
+            while (band < m.bands - 2 && coordinate > m.scan[band + 1])
+                ++band;
+            const float t = fminf(1, fmaxf(0, (coordinate - m.scan[band]) / (m.scan[band + 1] - m.scan[band])));
             px -= m.offset_x[band] * (1 - t) + m.offset_x[band + 1] * t;
             py -= m.offset_y[band] * (1 - t) + m.offset_y[band + 1] * t;
         }
@@ -95,7 +100,7 @@ __global__ void render_kernel(const unsigned char* input, unsigned char* output,
 }
 
 class CudaBackend final : public RenderBackend {
-public:
+  public:
     explicit CudaBackend(std::string name) : name_(std::move(name)) { invalid_.reserve(1); }
     ~CudaBackend() override { cudaStreamSynchronize(stream_.value); }
     BackendInfo info() const override {
@@ -103,7 +108,8 @@ public:
     }
     void upload(const Image& input) override {
         const auto mapping = map_host_image(input);
-        if (mapping.format != PixelFormat::bgr8) throw BackendError("CUDA rendering requires BGR8 input");
+        if (mapping.format != PixelFormat::bgr8)
+            throw BackendError("CUDA rendering requires BGR8 input");
         size_ = mapping.size;
         const size_t stride = static_cast<size_t>(size_.width) * 3;
         const size_t bytes = stride * size_.height;
@@ -112,38 +118,45 @@ public:
         staging_.reserve(bytes);
         for (int y = 0; y < size_.height; ++y)
             std::memcpy(staging_.data() + y * stride, mapping.bytes.data() + y * mapping.row_stride, stride);
-        check(cudaMemcpyAsync(input_.data(), staging_.data(), bytes,
-            cudaMemcpyHostToDevice, stream_.value), "Upload CUDA frame");
+        check(cudaMemcpyAsync(input_.data(), staging_.data(), bytes, cudaMemcpyHostToDevice, stream_.value),
+              "Upload CUDA frame");
     }
     double warp(const MapParameters& p) override {
         DeviceMap m{};
-        m.origin_x = p.origin_x; m.origin_y = p.origin_y;
-        m.xx = p.xx; m.xy = p.xy; m.yx = p.yx; m.yy = p.yy;
-        m.bands = p.bands; m.horizontal = p.horizontal;
+        m.origin_x = p.origin_x;
+        m.origin_y = p.origin_y;
+        m.xx = p.xx;
+        m.xy = p.xy;
+        m.yx = p.yx;
+        m.yy = p.yy;
+        m.bands = p.bands;
+        m.horizontal = p.horizontal;
         for (int i = 0; i < p.bands; ++i) {
             m.scan[i] = p.scan[i];
-            m.offset_x[i] = p.offset_x[i]; m.offset_y[i] = p.offset_y[i];
+            m.offset_x[i] = p.offset_x[i];
+            m.offset_y[i] = p.offset_y[i];
         }
         check(cudaMemsetAsync(invalid_.data(), 0, sizeof(unsigned int), stream_.value), "Reset CUDA crop check");
         const dim3 block(16, 16), grid((size_.width + 15) / 16, (size_.height + 15) / 16);
-        render_kernel<<<grid, block, 0, stream_.value>>>(input_.data(), output_.data(),
-            size_.width, size_.height, m, invalid_.data());
+        render_kernel<<<grid, block, 0, stream_.value>>>(input_.data(), output_.data(), size_.width, size_.height, m,
+                                                         invalid_.data());
         check(cudaGetLastError(), "Launch CUDA warp");
         unsigned int invalid = 0;
-        check(cudaMemcpyAsync(&invalid, invalid_.data(), sizeof(invalid), cudaMemcpyDeviceToHost,
-            stream_.value), "Read CUDA crop check");
+        check(cudaMemcpyAsync(&invalid, invalid_.data(), sizeof(invalid), cudaMemcpyDeviceToHost, stream_.value),
+              "Read CUDA crop check");
         check(cudaStreamSynchronize(stream_.value), "Complete CUDA warp");
         return static_cast<double>(invalid) / (static_cast<double>(size_.width) * size_.height);
     }
     Image download() override {
         const size_t bytes = static_cast<size_t>(size_.width) * size_.height * 3;
-        check(cudaMemcpyAsync(staging_.data(), output_.data(), bytes,
-            cudaMemcpyDeviceToHost, stream_.value), "Download CUDA frame");
+        check(cudaMemcpyAsync(staging_.data(), output_.data(), bytes, cudaMemcpyDeviceToHost, stream_.value),
+              "Download CUDA frame");
         check(cudaStreamSynchronize(stream_.value), "Complete CUDA download");
         std::vector<uint8_t> pixels(staging_.data(), staging_.data() + bytes);
         return make_host_image(size_, PixelFormat::bgr8, std::move(pixels));
     }
-private:
+
+  private:
     std::string name_;
     Size size_;
     Stream stream_;
@@ -152,12 +165,13 @@ private:
     Buffer<unsigned char, true> staging_;
     Buffer<unsigned int> invalid_;
 };
-}
+} // namespace
 
 std::unique_ptr<RenderBackend> make_cuda_backend() {
     int count = 0;
     check(cudaGetDeviceCount(&count), "Detect CUDA device");
-    if (count == 0) throw BackendError("No CUDA device available");
+    if (count == 0)
+        throw BackendError("No CUDA device available");
     check(cudaSetDevice(0), "Select CUDA device");
     cudaDeviceProp properties{};
     check(cudaGetDeviceProperties(&properties, 0), "Read CUDA device");

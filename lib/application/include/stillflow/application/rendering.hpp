@@ -16,8 +16,13 @@ struct BackendInfo {
     BackendCapabilities capabilities;
     std::map<std::string, std::string> implementation;
 };
-struct BackendRun { BackendInfo info; size_t frames = 0; };
-struct BackendFailure { std::string backend, stage, reason; };
+struct BackendRun {
+    BackendInfo info;
+    size_t frames = 0;
+};
+struct BackendFailure {
+    std::string backend, stage, reason;
+};
 struct RenderingReport {
     std::string requested, backend;
     std::vector<BackendRun> backends;
@@ -25,9 +30,12 @@ struct RenderingReport {
 };
 // Only backend availability/execution failures trigger automatic fallback.
 // Invalid input, invalid geometry and programming errors propagate unchanged.
-class BackendError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+class BackendError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 class RenderBackend {
-public:
+  public:
     virtual ~RenderBackend() = default;
     virtual BackendInfo info() const = 0;
     // Retain any input lease needed until device reads have completed.
@@ -42,14 +50,14 @@ struct BackendProvider {
     std::function<std::unique_ptr<RenderBackend>()> create;
 };
 class Renderer {
-public:
+  public:
     virtual ~Renderer() = default;
-    virtual Image render(const Image& input, Warp& warp, Size analysis_size,
-        double crop, bool horizontal, Profile& profile) = 0;
+    virtual Image render(const Image& input, Warp& warp, Size analysis_size, double crop, bool horizontal,
+                         Profile& profile) = 0;
     virtual RenderingReport report() const = 0;
 };
 class RendererFactory {
-public:
+  public:
     virtual ~RendererFactory() = default;
     virtual std::unique_ptr<Renderer> create(const std::string& requested) const = 0;
 };

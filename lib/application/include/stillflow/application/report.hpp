@@ -1,12 +1,14 @@
 #pragma once
 #include "stillflow/application/media.hpp"
-#include "stillflow/application/rendering.hpp"
 #include "stillflow/application/options.hpp"
-#include "stillflow/domain/types.hpp"
+#include "stillflow/application/rendering.hpp"
 #include "stillflow/domain/profile.hpp"
+#include "stillflow/domain/types.hpp"
 
 namespace stillflow {
-struct ResourceUsage { double cpu_seconds = 0, peak_rss_mib = 0; };
+struct ResourceUsage {
+    double cpu_seconds = 0, peak_rss_mib = 0;
+};
 struct RunSummary {
     size_t frames = 0;
     double wall_ms = 0;

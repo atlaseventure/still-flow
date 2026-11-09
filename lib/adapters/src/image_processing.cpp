@@ -1,37 +1,41 @@
-#include "stillflow/adapters/backends.hpp"
 #include "image.hpp"
 #include "motion.hpp"
+#include "stillflow/adapters/backends.hpp"
 #include <opencv2/imgproc.hpp>
 
 namespace stillflow {
 namespace {
 class OpenCvMotionAnalyzer final : public MotionAnalyzer {
-public:
+  public:
     OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal) : estimator_(settings, horizontal) {}
     Motion estimate(const Image& previous, const Image& current, Profile& profile) override {
         auto before = read_pixels(previous), after = read_pixels(current);
         return estimator_.estimate(before.pixels, after.pixels, profile);
     }
-private:
+
+  private:
     MotionEstimator estimator_;
 };
 class OpenCvProcessing final : public ImageProcessing {
-public:
+  public:
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
         return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal);
     }
     Image gray_proxy(const Image& input, Size size) override {
         cv::Mat gray, small;
         auto view = read_pixels(input);
-        if (view.mapping.format != PixelFormat::bgr8) throw std::invalid_argument("Preprocessing requires BGR8 input");
+        if (view.mapping.format != PixelFormat::bgr8)
+            throw std::invalid_argument("Preprocessing requires BGR8 input");
         cv::cvtColor(view.pixels, gray, cv::COLOR_BGR2GRAY);
         const cv::Size target(size.width, size.height);
-        if (gray.size() == target) return image(std::move(gray));
+        if (gray.size() == target)
+            return image(std::move(gray));
         cv::resize(gray, small, target, 0, 0, cv::INTER_AREA);
         return image(std::move(small));
     }
     Image comparison(const Image& input, const Image& stabilized) override {
-        if (!font_) font_ = std::make_unique<cv::FontFace>("sans");
+        if (!font_)
+            font_ = std::make_unique<cv::FontFace>("sans");
         cv::Mat combined;
         auto before = read_pixels(input), after = read_pixels(stabilized);
         cv::hconcat(before.pixels, after.pixels, combined);
@@ -39,9 +43,10 @@ public:
         cv::putText(combined, "STABILIZED", {input->size().width + 20, 35}, {255, 255, 255}, *font_, 24, 600);
         return image(std::move(combined));
     }
-private:
+
+  private:
     std::unique_ptr<cv::FontFace> font_;
 };
-}
+} // namespace
 std::unique_ptr<ImageProcessing> make_image_processing() { return std::make_unique<OpenCvProcessing>(); }
 } // namespace stillflow

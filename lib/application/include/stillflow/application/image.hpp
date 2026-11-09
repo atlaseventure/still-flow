@@ -31,9 +31,12 @@ struct NativeImageView {
     const void* handle;
     std::shared_ptr<const void> lifetime;
 };
-class ImageAccessError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+class ImageAccessError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 class ImageData {
-public:
+  public:
     virtual ~ImageData() = default;
     virtual Size size() const = 0;
     virtual PixelFormat format() const = 0;

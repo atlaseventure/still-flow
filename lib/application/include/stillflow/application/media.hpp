@@ -18,7 +18,7 @@ struct VideoFrame {
 };
 // Borrowed during the reader callback; consumers copy packets they retain.
 class AudioPacket {
-public:
+  public:
     virtual ~AudioPacket() = default;
 };
 } // namespace stillflow

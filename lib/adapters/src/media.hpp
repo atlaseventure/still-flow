@@ -1,10 +1,10 @@
 #pragma once
 
 #include "stillflow/application/media.hpp"
-#include <opencv2/core.hpp>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <opencv2/core.hpp>
 #include <string>
 
 extern "C" {
@@ -18,7 +18,7 @@ struct DecodedFrame {
 };
 
 class Reader {
-public:
+  public:
     Reader(const std::filesystem::path& path, int threads);
     ~Reader();
     Reader(const Reader&) = delete;
@@ -27,15 +27,15 @@ public:
     [[nodiscard]] const VideoInfo& info() const;
     [[nodiscard]] AVFormatContext* context() const;
     void set_audio_callback(std::function<void(const AVPacket*)> callback);
-private:
+
+  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 class Writer {
-public:
-    Writer(const std::filesystem::path& path, cv::Size size, double fps,
-           AVFormatContext* source, int64_t origin_us,
+  public:
+    Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
            int threads, int crf, const std::string& preset, bool audio);
     ~Writer();
     Writer(const Writer&) = delete;
@@ -43,7 +43,8 @@ public:
     void video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us);
     void audio(const AVPacket* packet);
     void finish();
-private:
+
+  private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

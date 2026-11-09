@@ -1,9 +1,24 @@
 if(NOT STILLFLOW_DEPS_ROOT)
     message(FATAL_ERROR "Set STILLFLOW_DEPS_ROOT to the media dependency prefix, or disable STILLFLOW_BUILD_ADAPTERS")
 endif()
-find_package(OpenCV 5.1 REQUIRED CONFIG COMPONENTS core imgproc video geometry features
-    PATHS "${STILLFLOW_DEPS_ROOT}" NO_DEFAULT_PATH)
-find_package(nlohmann_json 3.12 REQUIRED CONFIG PATHS "${STILLFLOW_DEPS_ROOT}" NO_DEFAULT_PATH)
+find_package(
+    OpenCV 5.1 REQUIRED CONFIG
+    COMPONENTS core
+               imgproc
+               video
+               geometry
+               features
+               PATHS
+               "${STILLFLOW_DEPS_ROOT}"
+               NO_DEFAULT_PATH)
+find_package(
+    nlohmann_json
+    3.12
+    REQUIRED
+    CONFIG
+    PATHS
+    "${STILLFLOW_DEPS_ROOT}"
+    NO_DEFAULT_PATH)
 find_package(PkgConfig REQUIRED)
 set(ENV{PKG_CONFIG_PATH} "")
 set(ENV{PKG_CONFIG_LIBDIR} "${STILLFLOW_DEPS_ROOT}/lib/pkgconfig")
@@ -36,8 +51,7 @@ foreach(target stillflow_media stillflow_images stillflow_host)
     target_include_directories(${target} PUBLIC include)
     target_include_directories(${target} SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
     target_link_libraries(${target} PUBLIC stillflow_application)
-    target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 endforeach()
 target_link_libraries(stillflow_media PRIVATE opencv_core opencv_imgproc stillflow_ffmpeg)
 target_link_libraries(stillflow_images PRIVATE ${OpenCV_LIBS} Eigen3::Eigen)

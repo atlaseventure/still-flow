@@ -17,6 +17,23 @@ cmake --build build
 
 构建时自动检测 CUDA Toolkit；GPU 运行需要兼容的 NVIDIA 驱动。自定义工具包位置可通过 `CUDACXX` 指定 `nvcc`。使用 `-DSTILLFLOW_WITH_CUDA=OFF` 构建纯 CPU 版本。
 
+## 代码质量
+
+使用 Python 3.14 运行质量工具：
+
+```sh
+python3.14 -m venv .local/quality-venv
+.local/quality-venv/bin/python -m pip install -r scripts/requirements-quality.txt
+.local/quality-venv/bin/python scripts/quality.py format
+.local/quality-venv/bin/python scripts/quality.py check --build-dir build
+```
+
+`format --check` 只检查格式；`lint` 执行静态分析。`check` 执行两者，需要先完成 CLI 构建。命令输出 JSON Lines，失败时返回非零退出码，排除 Git 忽略的文件。
+
+静态分析默认 12 并发，编译输入未变化时复用已通过的结果。使用 `--jobs N` 调整并发数，或用 `--no-cache` 执行完整分析。
+
+CUDA 分析需要包含 cuRAND 的工具包头文件。使用 `--require-cuda` 强制检查 CUDA；CPU 构建会报告跳过的 CUDA 源文件。分开安装的工具包可通过 `--extra-arg=-isystem/path/to/include` 补充头文件路径。
+
 ## 库集成
 
 核心库按 Clean Architecture 分为领域算法与应用用例，通过接口接入媒体、图像、渲染、输出和运行时服务。CLI 负责组装桌面适配器；Android 和嵌入式宿主可提供自己的适配器。

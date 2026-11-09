@@ -17,6 +17,23 @@ Dependencies use 12 compilation jobs each; adjust with `-DSTILLFLOW_BUILD_JOBS=N
 
 The build detects the CUDA Toolkit automatically; GPU execution requires a compatible NVIDIA driver. Set `CUDACXX` to `nvcc` for a custom toolkit location. Use `-DSTILLFLOW_WITH_CUDA=OFF` for a CPU-only build.
 
+## Code quality
+
+Use Python 3.14 for the quality tools:
+
+```sh
+python3.14 -m venv .local/quality-venv
+.local/quality-venv/bin/python -m pip install -r scripts/requirements-quality.txt
+.local/quality-venv/bin/python scripts/quality.py format
+.local/quality-venv/bin/python scripts/quality.py check --build-dir build
+```
+
+`format --check` checks formatting without writing; `lint` runs static analysis. `check` runs both and requires a completed CLI build. Commands emit JSON Lines and exit nonzero on failure. Git-ignored files are excluded.
+
+Static analysis defaults to 12 concurrent processes and reuses successful results when compilation inputs are unchanged. Use `--jobs N` to adjust concurrency or `--no-cache` to run a full analysis.
+
+CUDA analysis requires toolkit headers including cuRAND. Use `--require-cuda` to require CUDA coverage; CPU builds report CUDA sources as skipped. Split toolkit installations can add header paths with `--extra-arg=-isystem/path/to/include`.
+
 ## Library integration
 
 The core follows Clean Architecture: domain algorithms and application use cases depend on ports for media, images, rendering, outputs and runtime services. The CLI assembles desktop adapters; Android and embedded hosts can supply their own adapters.

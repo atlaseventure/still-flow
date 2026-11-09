@@ -13,19 +13,21 @@ inline double milliseconds(Clock::time_point start) {
 }
 
 class Profile {
-public:
+  public:
     void add(const std::string& stage, double ms) { samples_[stage].push_back(ms); }
     [[nodiscard]] const std::map<std::string, std::vector<double>>& samples() const { return samples_; }
-private:
+
+  private:
     std::map<std::string, std::vector<double>> samples_;
 };
 
 class ScopeTimer {
-public:
+  public:
     ScopeTimer(Profile& profile, std::string stage)
         : profile_(profile), stage_(std::move(stage)), start_(Clock::now()) {}
     ~ScopeTimer() { profile_.add(stage_, milliseconds(start_)); }
-private:
+
+  private:
     Profile& profile_;
     std::string stage_;
     Clock::time_point start_;

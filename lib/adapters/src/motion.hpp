@@ -3,10 +3,11 @@
 #include <opencv2/core.hpp>
 namespace stillflow {
 class MotionEstimator {
-public:
+  public:
     MotionEstimator(const StabilizationSettings& options, bool horizontal_scan);
     Motion estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile);
-private:
+
+  private:
     StabilizationSettings options_;
     bool horizontal_;
 };
