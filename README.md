@@ -87,7 +87,7 @@ Input must be progressive 8-bit SDR video with square pixels and even dimensions
 
 The default crop removes 8% from each edge while retaining the output dimensions. Correction strength decreases automatically when the crop margin is insufficient. The scan axis follows rotation metadata; use `--scan-axis` for footage whose pixels were rotated and whose rotation metadata was removed.
 
-Trajectory processing follows the [LightStab demo](https://github.com/liutao23/LightStab): accumulated mesh displacements, causal cascaded smoothing, and compensation from the trajectory difference. Gaussian kernels adapt to motion and confidence without training. `--smooth` and `--rs-smooth` control the temporal kernel width; zero disables the corresponding correction.
+Trajectory processing follows the [LightStab demo](https://github.com/liutao23/LightStab): accumulated mesh displacements, causal cascaded smoothing, and compensation from the trajectory difference. Shot starts use reliable subsequent motion to initialize scanline smoothing. Gaussian kernels adapt to motion and confidence without training. `--smooth` and `--rs-smooth` control the temporal kernel width; zero disables the corresponding correction.
 
 Scanline correction is a geometric approximation suited to small motions between frames. Inspect results for strong parallax, fast foreground motion, blur, and high-frequency wobble. Fit residuals in performance reports are diagnostic measurements rather than image quality scores.
 

@@ -81,6 +81,49 @@ class CausalPath {
     std::array<std::deque<Point>, trajectory_smoothing_passes> passes_;
 };
 
+std::vector<Point> initialize_rows(std::vector<CausalPath>& paths, const std::vector<FrameMotion>& frames, size_t start,
+                                   int columns, int rows, bool horizontal, double seconds, double pixel_scale) {
+    if (seconds <= 0 || frames[start].motion.state == MotionState::missing)
+        return {};
+    // Reflect a reliable prefix around the shot boundary. The original causal
+    // cascade then starts with real local-motion history instead of retaining
+    // the first frame's rolling-shutter shape. Never cross an unreliable link.
+    size_t end = start;
+    const double origin = frames[start].seconds;
+    // Five kernel widths cover the cascade's dominant history; its exact
+    // maximum support is six observations per pass.
+    for (size_t i = start + 1; i < frames.size() && i - start <= size_t{6} * trajectory_smoothing_passes; ++i) {
+        const auto& frame = frames[i];
+        if (frame.segment != frames[start].segment || frame.motion.reset)
+            break;
+        if (!std::isfinite(frame.seconds) || frame.seconds <= frames[i - 1].seconds)
+            throw std::invalid_argument("Trajectory timestamps must increase within a shot");
+        if (frame.seconds - origin > 5 * seconds || frame.motion.state != MotionState::tracked ||
+            frame.motion.rs_confidence < 0.5 || frame.motion.row_delta.empty())
+            break;
+        end = i;
+    }
+    if (end - start < 6)
+        return {};
+    std::vector<Point> correction(paths.size());
+    for (int y = 0; y < rows; ++y)
+        for (int x = 0; x < columns; ++x) {
+            const int vertex = y * columns + x;
+            const double position =
+                horizontal ? static_cast<double>(x) / (columns - 1) : static_cast<double>(y) / (rows - 1);
+            auto& path = paths[vertex];
+            path.advance({}, 2 * origin - frames[end].seconds, frames[end].motion.rs_confidence, seconds, pixel_scale);
+            for (size_t i = end; i > start; --i) {
+                const Point delta = row_motion(frames[i].motion, position) * -1;
+                if (!finite(delta))
+                    throw std::runtime_error("Nonfinite observed mesh motion");
+                correction[vertex] = path.advance(delta, 2 * origin - frames[i - 1].seconds,
+                                                  frames[i].motion.rs_confidence, seconds, pixel_scale);
+            }
+        }
+    return correction;
+}
+
 double gradient_bound(const Warp& warp, Size size) {
     const double dx = static_cast<double>(size.width - 1) / (warp.columns - 1);
     const double dy = static_cast<double>(size.height - 1) / (warp.rows - 1);
@@ -135,17 +178,21 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         const bool start = i == 0 || frame.segment != frames[i - 1].segment || motion.reset;
         if (!std::isfinite(frame.seconds) || (!start && frame.seconds <= frames[i - 1].seconds))
             throw std::invalid_argument("Trajectory timestamps must increase within a shot");
+        std::vector<Point> initial_rows;
         if (start) {
             global.assign(count, CausalPath{});
             local.assign(count, CausalPath{});
             missing_seconds = 0;
             row_strength = 0;
             previous_crop = previous_tracking = 1;
+            if (options.rolling_shutter && options.rs_strength > 0)
+                initial_rows =
+                    initialize_rows(local, frames, i, columns, rows, horizontal, options.rs_seconds, pixel_scale);
         }
         const double dt = start ? std::max(0.0, frame.duration) : frame.seconds - frames[i - 1].seconds;
         const bool missing = motion.state == MotionState::missing;
         const bool has_rows = !start && motion.state == MotionState::tracked && options.rolling_shutter;
-        row_strength = has_rows ? std::min(1.0, row_strength + dt / 0.15) : 0;
+        row_strength = !initial_rows.empty() ? 1 : has_rows ? std::min(1.0, row_strength + dt / 0.15) : 0;
         auto& warp = output[i];
         warp.columns = columns;
         warp.rows = rows;
@@ -164,9 +211,12 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                     throw std::runtime_error("Nonfinite observed mesh motion");
                 const auto g = global[vertex].advance(delta, frame.seconds, start ? 1 : motion.confidence,
                                                       options.smooth_seconds, pixel_scale);
-                const auto r = local[vertex].advance(residual, frame.seconds, has_rows ? motion.rs_confidence : 0,
-                                                     options.rs_seconds, pixel_scale) *
-                               (options.rs_strength * row_strength);
+                const auto local_correction =
+                    initial_rows.empty()
+                        ? local[vertex].advance(residual, frame.seconds, has_rows ? motion.rs_confidence : 0,
+                                                options.rs_seconds, pixel_scale)
+                        : initial_rows[vertex];
+                const auto r = local_correction * (options.rs_strength * row_strength);
                 warp.displacement[vertex] = g + r;
                 warp.global_offset = warp.global_offset + g * (1.0 / count);
                 row_energy += r.dot(r);
