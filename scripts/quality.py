@@ -113,6 +113,27 @@ def lint_scripts(files):
     return 0
 
 
+CURAND_SHIM = "curand_mtgp32_kernel.h"
+
+
+def cuda_header_shims(cuda_path):
+    """Return include arguments for headers Clang's CUDA wrapper needs but the toolkit omits.
+
+    Clang's runtime wrapper unconditionally includes cuRAND's MTGP32 kernel header, which minimal
+    toolkit installations without cuRAND lack. NVCC never includes it, so analysis uses an empty stand-in.
+    """
+    roots = [cuda_path / "include", *sorted(cuda_path.glob("targets/*/include"))]
+    if any((root / CURAND_SHIM).is_file() for root in roots):
+        return []
+    directory = ROOT / ".local" / "cuda-shims"
+    header = directory / CURAND_SHIM
+    content = "// Empty stand-in for Clang CUDA analysis; the toolkit has no cuRAND headers.\n#pragma once\n"
+    if not header.is_file() or header.read_text(encoding="utf-8") != content:
+        directory.mkdir(parents=True, exist_ok=True)
+        header.write_text(content, encoding="utf-8")
+    return ["-isystem", str(directory)]
+
+
 def cuda_arguments(entry):
     """Translate NVCC driver flags while preserving the configured compilation context."""
     args = entry.get("arguments") or shlex.split(entry["command"])
@@ -121,7 +142,8 @@ def cuda_arguments(entry):
     compiler = Path(args[0])
     if not compiler.is_absolute():
         compiler = Path(entry["directory"]) / compiler
-    translated = ["clang++", f"--cuda-path={compiler.resolve().parent.parent}"]
+    cuda_path = compiler.resolve().parent.parent
+    translated = ["clang++", f"--cuda-path={cuda_path}", *cuda_header_shims(cuda_path)]
     iterator = iter(args[1:])
     for arg in iterator:
         if arg == "-forward-unknown-to-host-compiler":

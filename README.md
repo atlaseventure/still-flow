@@ -32,7 +32,7 @@ python3.14 -m venv .local/quality-venv
 
 Static analysis defaults to 12 concurrent processes and reuses successful results when compilation inputs are unchanged. Use `--jobs N` to adjust concurrency or `--no-cache` to run a full analysis.
 
-CUDA analysis requires toolkit headers including cuRAND. Use `--require-cuda` to require CUDA coverage; CPU builds report CUDA sources as skipped. Split toolkit installations can add header paths with `--extra-arg=-isystem/path/to/include`.
+CUDA analysis uses the toolkit headers; toolkits without cuRAND get an empty stand-in for the cuRAND header that Clang always includes. Use `--require-cuda` to require CUDA coverage; CPU builds report CUDA sources as skipped. Split toolkit installations can add header paths with `--extra-arg=-isystem/path/to/include`.
 
 ## Library integration
 

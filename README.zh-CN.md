@@ -32,7 +32,7 @@ python3.14 -m venv .local/quality-venv
 
 静态分析默认 12 并发，编译输入未变化时复用已通过的结果。使用 `--jobs N` 调整并发数，或用 `--no-cache` 执行完整分析。
 
-CUDA 分析需要包含 cuRAND 的工具包头文件。使用 `--require-cuda` 强制检查 CUDA；CPU 构建会报告跳过的 CUDA 源文件。分开安装的工具包可通过 `--extra-arg=-isystem/path/to/include` 补充头文件路径。
+CUDA 分析使用工具包头文件；工具包缺少 cuRAND 时，会为 Clang 始终包含的 cuRAND 头文件提供空的替代文件。使用 `--require-cuda` 强制检查 CUDA；CPU 构建会报告跳过的 CUDA 源文件。分开安装的工具包可通过 `--extra-arg=-isystem/path/to/include` 补充头文件路径。
 
 ## 库集成
 
