@@ -19,6 +19,7 @@ struct BackendInfo {
 struct BackendRun {
     BackendInfo info;
     size_t frames = 0;
+    bool gpu = false;
 };
 struct BackendFailure {
     std::string backend, stage, reason;
@@ -48,6 +49,8 @@ class RenderBackend {
 struct BackendProvider {
     std::string id;
     std::function<std::unique_ptr<RenderBackend>()> create;
+    // Renders on a GPU; "auto" codec selection then prefers hardware codecs.
+    bool gpu = false;
 };
 class Renderer {
   public:
@@ -60,6 +63,9 @@ class RendererFactory {
   public:
     virtual ~RendererFactory() = default;
     virtual std::unique_ptr<Renderer> create(const std::string& requested) const = 0;
+    // Whether the request is expected to render on a GPU before create()
+    // resolves it; for "auto" this is the most preferred provider.
+    virtual bool prefers_gpu(const std::string& /*requested*/) const { return false; }
 };
 // Registration order is the preference/fallback order for "auto". Explicit
 // selection uses only that provider. Providers and their captures are copied.

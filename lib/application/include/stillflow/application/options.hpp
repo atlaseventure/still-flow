@@ -11,6 +11,8 @@ struct Options : StabilizationSettings {
     std::string scan_axis = "auto";
     std::string preset = "fast";
     std::string backend = "auto";
+    // Media adapter codec names; "auto" prefers hardware with GPU rendering.
+    std::string decoder = "auto", encoder = "auto";
     bool audio = true;
     bool overwrite = false;
 };

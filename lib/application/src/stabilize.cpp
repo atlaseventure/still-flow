@@ -30,6 +30,8 @@ void validate_options(const Options& o) {
     range(o.crop, 0, 0.25, "crop");
     if (o.scan_axis != "auto" && o.scan_axis != "x" && o.scan_axis != "y")
         throw std::invalid_argument("scan_axis must be auto, x or y");
+    if (o.decoder.empty() || o.encoder.empty())
+        throw std::invalid_argument("decoder and encoder must be named; use auto for adapter selection");
 }
 
 using AudioPackets = std::vector<std::shared_ptr<const AudioPacket>>;
@@ -72,6 +74,7 @@ struct Analysis {
     bool horizontal = false;
     int64_t origin = 0;
     std::vector<FrameMotion> frames;
+    CodecReport decoder;
 };
 
 // Decoding runs ahead on its own thread and proxies are generated in order;
@@ -79,7 +82,10 @@ struct Analysis {
 // runs on a worker pool.
 Analysis analyze(const Options& options, Services& services, PendingRenderer& renderer, Profile& profile) {
     Analysis result;
-    auto reader = services.media.reader(options.input, options.threads);
+    // The backend is still initializing, so hardware decoding follows the
+    // provider expected to win rather than the one that will be selected.
+    auto reader = services.media.reader(options.input, options.threads,
+                                        {options.decoder, services.renderers.prefers_gpu(options.backend)});
     result.info = reader->info();
     const auto& info = result.info;
     result.horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
@@ -164,6 +170,7 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
         group.fail(std::current_exception());
     }
     group.finish();
+    result.decoder = reader->codec();
     profile.merge(decode_profile);
     for (const auto& worker : worker_profiles)
         profile.merge(worker);
@@ -176,6 +183,7 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
         frames[i].segment = segment;
     }
     services.progress.analyzed(frames.size(), true);
+    services.progress.codec("analysis_decoder", result.decoder);
     return result;
 }
 
@@ -240,14 +248,18 @@ RunSummary stabilize(const Options& request, Services services) {
     if (!options.compare.empty())
         comparison = services.outputs.stage(options.compare);
     size_t rendered = 0;
+    std::vector<std::pair<std::string, CodecReport>> codecs{{"analysis_decoder", analysis.decoder}};
     {
-        auto reader = services.media.reader(options.input, options.threads);
+        const auto backends = renderer.report().backends;
+        const bool gpu = !backends.empty() && backends.back().gpu;
+        auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         const Size size(info.width, info.height);
-        auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, options);
+        const CodecRequest encoder{options.encoder, gpu};
+        auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, options, encoder);
         std::unique_ptr<VideoWriter> compare_writer;
         if (comparison)
             compare_writer = services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps,
-                                                   *reader, origin, options);
+                                                   *reader, origin, options, encoder);
         Channel<DecodedItem> decoded(frame_queue_depth);
         Channel<EncodeItem> encode(frame_queue_depth), compare(frame_queue_depth);
         Profile decode_profile, encode_profile, compare_profile;
@@ -306,6 +318,10 @@ RunSummary stabilize(const Options& request, Services services) {
             group.fail(std::current_exception());
         }
         group.finish();
+        codecs.emplace_back("render_decoder", reader->codec());
+        codecs.emplace_back("encoder", writer->codec());
+        if (compare_writer)
+            codecs.emplace_back("comparison_encoder", compare_writer->codec());
         profile.merge(decode_profile);
         profile.merge(encode_profile);
         profile.merge(compare_profile);
@@ -313,13 +329,15 @@ RunSummary stabilize(const Options& request, Services services) {
             throw std::runtime_error("Frame count changed between passes");
     }
     services.progress.rendered(rendered, frames.size(), true);
+    for (auto it = codecs.begin() + 1; it != codecs.end(); ++it)
+        services.progress.codec(it->first, it->second);
     const double total_ms = milliseconds(start);
     RunSummary summary{frames.size(), total_ms, services.runtime.resources()};
     auto report_file = services.outputs.stage(options.report);
     auto csv_file = services.outputs.stage(frames_path);
-    services.outputs.write_report(
-        report_file->temporary(), csv_file->temporary(),
-        {options, info, analysis_size, horizontal, frames, warps, profile, renderer.report(), summary, analysis_ms});
+    services.outputs.write_report(report_file->temporary(), csv_file->temporary(),
+                                  {options, info, analysis_size, horizontal, frames, warps, profile, renderer.report(),
+                                   std::move(codecs), summary, analysis_ms});
     output->publish();
     if (comparison)
         comparison->publish();

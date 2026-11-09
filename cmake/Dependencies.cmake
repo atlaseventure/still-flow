@@ -129,18 +129,39 @@ if(STILLFLOW_BUILD_ADAPTERS)
         BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}"
         INSTALL_COMMAND "${STILLFLOW_MAKE}" install-lib-static)
 
+    # NVIDIA codec support is header-only: FFmpeg loads libcuda, libnvcuvid and
+    # libnvidia-encode from the driver at runtime, so builds need no CUDA Toolkit
+    # and binaries still run without an NVIDIA driver. 12.2 requires driver 550+.
+    set(nvidia_codec_args --disable-ffnvcodec --disable-hwaccels)
+    set(ffmpeg_dependencies dep_x264 dep_dav1d dep_zlib)
+    if(STILLFLOW_WITH_NVCODEC)
+        ExternalProject_Add(
+            dep_nvcodec
+            ${common}
+            URL https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n12.2.72.0.tar.gz
+            URL_HASH SHA256=dbeaec433d93b850714760282f1d0992b1254fc3b5a6cb7d76fc1340a1e47563
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND ""
+            BUILD_IN_SOURCE TRUE
+            INSTALL_COMMAND "${STILLFLOW_MAKE}" "PREFIX=${prefix}" LIBDIR=lib install)
+        list(APPEND ffmpeg_dependencies dep_nvcodec)
+        # AV1 stays on dav1d: FFmpeg prefers it, and dav1d has no hwaccel.
+        set(nvidia_codec_args --enable-ffnvcodec --enable-cuda --enable-nvdec --enable-nvenc --disable-hwaccels
+                              --enable-hwaccel=h264_nvdec,hevc_nvdec,vp9_nvdec,mpeg2_nvdec,mpeg4_nvdec)
+    endif()
+
     ExternalProject_Add(
         dep_ffmpeg
         ${common}
         URL https://ffmpeg.org/releases/ffmpeg-8.0.1.tar.xz
         URL_HASH SHA256=05ee0b03119b45c0bdb4df654b96802e909e0a752f72e4fe3794f487229e5a41
-        DEPENDS dep_x264 dep_dav1d dep_zlib
+        DEPENDS ${ffmpeg_dependencies}
         CONFIGURE_COMMAND
             ${build_env} <SOURCE_DIR>/configure "--prefix=${prefix}" "--cc=${CMAKE_C_COMPILER}"
             "--cxx=${CMAKE_CXX_COMPILER}" --pkg-config-flags=--static --disable-autodetect --disable-shared
             --enable-static --enable-pic --enable-gpl --enable-libx264 --enable-libdav1d --enable-zlib
             --disable-programs --disable-doc --disable-debug --disable-avdevice --disable-avfilter --disable-swresample
-            --disable-network --disable-hwaccels
+            --disable-network ${nvidia_codec_args}
         BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}"
         INSTALL_COMMAND "${STILLFLOW_MAKE}" install)
 

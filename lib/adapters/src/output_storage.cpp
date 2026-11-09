@@ -99,12 +99,25 @@ nlohmann::json rendering_json(const RenderingReport& data) {
             {{"id", backend.info.id},
              {"device", backend.info.device},
              {"frames", backend.frames},
+             {"gpu", backend.gpu},
              {"capabilities", {{"formats", formats}, {"image_access", backend.info.capabilities.image_access}}},
              {"implementation", backend.info.implementation}});
     }
     for (const auto& failure : data.failures)
         failures.push_back({{"backend", failure.backend}, {"stage", failure.stage}, {"reason", failure.reason}});
     return {{"requested", data.requested}, {"backend", data.backend}, {"backends", backends}, {"failures", failures}};
+}
+nlohmann::json codecs_json(const std::vector<std::pair<std::string, CodecReport>>& codecs) {
+    auto result = nlohmann::json::object();
+    for (const auto& [stream, codec] : codecs)
+        result[stream] = {{"requested", codec.request.name},
+                          {"prefer_hardware", codec.request.prefer_hardware},
+                          {"implementation", codec.implementation},
+                          {"device", codec.device},
+                          {"frames", codec.frames},
+                          {"hardware_frames", codec.hardware_frames},
+                          {"fallbacks", codec.fallbacks}};
+    return result;
 }
 class LocalOutputStorage final : public OutputStorage {
   public:
@@ -127,12 +140,13 @@ class LocalOutputStorage final : public OutputStorage {
         const auto limited =
             std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.strength < 0.999; });
         nlohmann::json report{
-            {"schema_version", 2},
+            {"schema_version", 3},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
             {"frames_csv", fs::absolute(frames_path).string()},
             {"rendering", rendering_json(data.rendering)},
+            {"codecs", codecs_json(data.codecs)},
             {"video",
              {{"width", info.width},
               {"height", info.height},
@@ -156,6 +170,8 @@ class LocalOutputStorage final : public OutputStorage {
               {"threads", options.threads},
               {"crf", options.crf},
               {"preset", options.preset},
+              {"decoder", options.decoder},
+              {"encoder", options.encoder},
               {"audio_copy", options.audio},
               {"comparison", !options.compare.empty()}}},
             {"performance",

@@ -23,6 +23,15 @@ class ConsoleProgress final : public stillflow::Progress {
             std::cerr << "; " << failure.backend << ": " << failure.reason;
         std::cerr << '\n';
     }
+    void codec(const std::string& stream, const stillflow::CodecReport& report) override {
+        std::cerr << "Codec " << stream << ": " << report.implementation;
+        if (!report.device.empty())
+            std::cerr << " (" << report.device << ", " << report.hardware_frames << '/' << report.frames
+                      << " frames in hardware)";
+        for (const auto& reason : report.fallbacks)
+            std::cerr << "; " << reason;
+        std::cerr << '\n';
+    }
     void analyzing(const stillflow::VideoInfo& info, stillflow::Size size, bool horizontal) override {
         std::cerr << "Analyze " << info.width << 'x' << info.height << " at " << size.width << 'x' << size.height
                   << ", scan axis " << (horizontal ? 'x' : 'y') << '\n';
@@ -59,8 +68,10 @@ Usage: stillflow INPUT OUTPUT [options]
   --crop FRACTION         Fixed crop on EACH edge, 0..0.25 (default 0.08)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
   --backend auto|NAME     Rendering backend (default auto)
-  --crf N                 H.264 quality, 0..51 (default 18)
-  --preset NAME           x264 encoding preset (default fast)
+  --decoder NAME          Video decoder: auto, cpu or nvdec (default auto)
+  --encoder NAME          H.264 encoder: auto, x264 or nvenc (default auto)
+  --crf N                 H.264 quality, 0..51 (default 18); NVENC constant quality
+  --preset NAME           x264 preset (default fast); NVENC maps it or takes p1..p7
   --no-audio              Omit audio instead of stream copying
   --overwrite             Replace existing output/report files
   --version               Print version
@@ -70,6 +81,8 @@ Accepts progressive 8-bit SDR video with square pixels and even dimensions.
 Writes H.264 MP4/MKV; keeps VFR presentation times and compatible audio.
 auto assumes sensor rows and adjusts for display-rotation metadata.
 Crop limits reduce correction strength. No IMU, training or network required.
+Codec auto uses NVDEC/NVENC when rendering on CUDA and falls back to CPU
+codecs; nvdec/nvenc require the NVIDIA driver and fail instead.
 )";
 
 double number(const std::string& text, const std::string& option) {
@@ -155,7 +168,15 @@ int main(int argc, char** argv) {
                 o.crop = bounded(value, option, 0, 0.25);
             else if (option == "--preset")
                 o.preset = value;
-            else if (option == "--backend") {
+            else if (option == "--decoder") {
+                if (value != "auto" && value != "cpu" && value != "nvdec")
+                    throw std::runtime_error("--decoder must be auto, cpu or nvdec");
+                o.decoder = value;
+            } else if (option == "--encoder") {
+                if (value != "auto" && value != "x264" && value != "nvenc")
+                    throw std::runtime_error("--encoder must be auto, x264 or nvenc");
+                o.encoder = value;
+            } else if (option == "--backend") {
                 if (backend_selected && o.backend != value)
                     throw std::runtime_error("Conflicting rendering backend selections");
                 o.backend = value;
@@ -177,7 +198,7 @@ int main(int argc, char** argv) {
         auto images = stillflow::make_image_processing();
         std::vector<stillflow::BackendProvider> providers;
 #ifdef STILLFLOW_CLI_CUDA
-        providers.push_back({"cuda", stillflow::make_cuda_backend});
+        providers.push_back({"cuda", stillflow::make_cuda_backend, true});
 #endif
         providers.push_back({"cpu", stillflow::make_cpu_backend});
         auto renderers = stillflow::make_renderer_factory(std::move(providers));

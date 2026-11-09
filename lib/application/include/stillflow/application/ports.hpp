@@ -15,6 +15,8 @@ class VideoReader {
     virtual const VideoInfo& info() const = 0;
     // Invoked on the thread calling next(), before it returns the frame demuxed alongside.
     virtual void set_audio_callback(std::function<void(const AudioPacket&)> callback) = 0;
+    // Valid after the last next() call; reflects every frame decoded so far.
+    virtual CodecReport codec() const = 0;
 };
 class VideoWriter {
   public:
@@ -22,15 +24,18 @@ class VideoWriter {
     virtual void video(const Image& image, int64_t pts_us, int64_t duration_us) = 0;
     virtual void audio(const AudioPacket& packet) = 0;
     virtual void finish() = 0;
+    virtual CodecReport codec() const = 0;
 };
 class MediaFactory {
   public:
     virtual ~MediaFactory() = default;
-    virtual std::unique_ptr<VideoReader> reader(const std::filesystem::path& path, int threads) = 0;
+    virtual std::unique_ptr<VideoReader> reader(const std::filesystem::path& path, int threads,
+                                                const CodecRequest& decoder) = 0;
     // The source reader must outlive all writers created from it. Writers run on
     // their own threads while the reader keeps decoding.
     virtual std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double fps,
-                                                VideoReader& source, int64_t origin_us, const Options& options) = 0;
+                                                VideoReader& source, int64_t origin_us, const Options& options,
+                                                const CodecRequest& encoder) = 0;
 };
 class MotionAnalyzer {
   public:
@@ -71,6 +76,8 @@ class Progress {
     virtual void analyzing(const VideoInfo& info, Size analysis_size, bool horizontal) = 0;
     virtual void analyzed(size_t frames, bool complete) = 0;
     virtual void rendered(size_t frames, size_t total, bool complete) = 0;
+    // Called once per video stream after it is fully decoded or encoded.
+    virtual void codec(const std::string& /*stream*/, const CodecReport& /*report*/) {}
 };
 struct Services {
     MediaFactory& media;

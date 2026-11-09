@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Offline video stabilization and rolling shutter wobble suppression without training. Includes a command-line interface, comparison videos, and performance reports by processing stage. NVIDIA GPUs can accelerate coordinate mapping, boundary checks, and image resampling.
+Offline video stabilization and rolling shutter wobble suppression without training. Includes a command-line interface, comparison videos, and performance reports by processing stage. NVIDIA GPUs can accelerate coordinate mapping, boundary checks, image resampling, and video decoding and encoding (NVDEC/NVENC).
 
 ## Build
 
@@ -16,6 +16,8 @@ cmake --build build
 Dependencies use 12 compilation jobs each; adjust with `-DSTILLFLOW_BUILD_JOBS=N`. Incremental builds reuse downloaded sources and compiled libraries.
 
 The build detects the CUDA Toolkit automatically; GPU execution requires a compatible NVIDIA driver. Set `CUDACXX` to `nvcc` for a custom toolkit location. Use `-DSTILLFLOW_WITH_CUDA=OFF` for a CPU-only build.
+
+FFmpeg is built with NVDEC/NVENC support from header-only NVIDIA codec interfaces. No CUDA Toolkit is required, and the driver libraries load at runtime, so binaries also run without an NVIDIA driver. Hardware codecs require driver 550 or newer. Use `-DSTILLFLOW_WITH_NVCODEC=OFF` to build without them.
 
 ## Code quality
 
@@ -69,7 +71,9 @@ Process a video and generate a side-by-side comparison:
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
 
-CUDA is selected automatically, with CPU fallback when unavailable or if execution fails. `--backend cpu` forces CPU rendering; `--backend cuda` requires CUDA and exits on failure. Reports record each backend's device, capabilities, frame counts and failure reasons; rendering timings include transfers and synchronization. Motion estimation, trajectory optimization, and video codecs run on the CPU.
+CUDA is selected automatically, with CPU fallback when unavailable or if execution fails. `--backend cpu` forces CPU rendering; `--backend cuda` requires CUDA and exits on failure. Reports record each backend's device, capabilities, frame counts and failure reasons; rendering timings include transfers and synchronization. Motion estimation and trajectory optimization run on the CPU.
+
+With CUDA rendering, `--decoder auto` and `--encoder auto` use NVDEC and NVENC, and fall back to CPU codecs per stream when hardware is unavailable or rejects a stream (for example H.264 4:4:4, or a comparison wider than 4096 pixels). `--decoder nvdec` and `--encoder nvenc` require hardware and exit on failure; `cpu` and `x264` force software. NVDEC produces the same frames as CPU decoding, so analysis and rendering are unchanged. NVENC uses constant-quality VBR: `--crf` sets the CQ level, and x264 `--preset` names map to NVENC `p1`..`p7` (or pass `p1`..`p7` directly). Bitrate at the same value differs from x264. Reports list each stream's codec, hardware frame count and fallback reasons.
 
 Compare scanline correction with the same crop. `--rs off` keeps the same motion estimation and disables scanline compensation. Omit the comparison video when benchmarking:
 

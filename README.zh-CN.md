@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-无需训练的离线视频防抖与卷帘快门晃动抑制，提供命令行处理、前后对比视频和分阶段性能报告。支持使用 NVIDIA GPU 加速坐标映射、边界检查和图像重采样。
+无需训练的离线视频防抖与卷帘快门晃动抑制，提供命令行处理、前后对比视频和分阶段性能报告。支持使用 NVIDIA GPU 加速坐标映射、边界检查、图像重采样以及视频解码和编码（NVDEC/NVENC）。
 
 ## 构建
 
@@ -16,6 +16,8 @@ cmake --build build
 每个依赖默认使用 12 个编译任务，可通过 `-DSTILLFLOW_BUILD_JOBS=N` 调整。增量构建复用已下载的源码和已编译的依赖。
 
 构建时自动检测 CUDA Toolkit；GPU 运行需要兼容的 NVIDIA 驱动。自定义工具包位置可通过 `CUDACXX` 指定 `nvcc`。使用 `-DSTILLFLOW_WITH_CUDA=OFF` 构建纯 CPU 版本。
+
+FFmpeg 通过只含头文件的 NVIDIA 编解码接口启用 NVDEC/NVENC，不需要 CUDA Toolkit；驱动库在运行时加载，因此没有 NVIDIA 驱动时程序同样可以运行。硬件编解码需要 550 或更新版本的驱动。使用 `-DSTILLFLOW_WITH_NVCODEC=OFF` 构建不含硬件编解码的版本。
 
 ## 代码质量
 
@@ -69,7 +71,9 @@ python3 scripts/generate_video.py --output .local/synthetic --frames 60
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
 
-默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--backend cpu` 强制使用 CPU，`--backend cuda` 要求 CUDA 可用，失败时退出。性能报告按后端记录设备、能力、处理帧数和失败原因；渲染阶段耗时包含数据传输与同步。运动估计、轨迹优化和视频编解码使用 CPU。
+默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--backend cpu` 强制使用 CPU，`--backend cuda` 要求 CUDA 可用，失败时退出。性能报告按后端记录设备、能力、处理帧数和失败原因；渲染阶段耗时包含数据传输与同步。运动估计和轨迹优化使用 CPU。
+
+使用 CUDA 渲染时，`--decoder auto` 和 `--encoder auto` 采用 NVDEC 和 NVENC；硬件不可用或不支持某路视频流时（例如 H.264 4:4:4，或宽度超过 4096 像素的对比视频），该路流单独回退到 CPU 编解码。`--decoder nvdec` 和 `--encoder nvenc` 要求使用硬件，失败时退出；`cpu` 和 `x264` 强制使用软件编解码。NVDEC 与 CPU 解码得到相同的帧，因此分析和渲染结果不变。NVENC 使用恒定质量 VBR：`--crf` 设置 CQ 级别，x264 的 `--preset` 名称映射到 NVENC 的 `p1`..`p7`，也可直接指定 `p1`..`p7`。相同数值下码率与 x264 不同。性能报告列出每路流的编解码器、硬件处理帧数和回退原因。
 
 使用相同裁剪量对照扫描行修正效果；`--rs off` 保留相同运动估计，仅关闭扫描行补偿。性能比较时省略对比视频：
 

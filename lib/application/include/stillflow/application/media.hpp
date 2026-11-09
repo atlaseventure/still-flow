@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace stillflow {
 struct VideoInfo {
@@ -15,6 +16,21 @@ struct VideoInfo {
 struct VideoFrame {
     Image bgr;
     int64_t pts_us = 0, duration_us = 0;
+};
+// Codec choice handed to media adapters. "auto" lets the adapter choose,
+// trying hardware first when prefer_hardware is set and falling back to
+// software. Other names are adapter-defined and fail instead of falling back.
+struct CodecRequest {
+    std::string name = "auto";
+    bool prefer_hardware = false;
+};
+// The codec a reader or writer actually used. A hardware decoder may hand
+// individual streams back to software, so frames are counted separately.
+struct CodecReport {
+    CodecRequest request;
+    std::string implementation, device;
+    size_t frames = 0, hardware_frames = 0;
+    std::vector<std::string> fallbacks;
 };
 // Borrowed during the reader callback; consumers retain() packets they keep.
 class AudioPacket {

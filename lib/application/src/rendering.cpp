@@ -106,7 +106,7 @@ class FallbackRenderer final : public Renderer {
                 if (!backend || backend->info().id != provider.id)
                     throw std::logic_error("Backend provider returned an invalid identity: " + provider.id);
                 active_ = std::make_unique<CropRenderer>(std::move(backend));
-                report_.backends.push_back({active_->info(), 0});
+                report_.backends.push_back({active_->info(), 0, provider.gpu});
                 return;
             } catch (const BackendError& error) {
                 report_.failures.push_back({provider.id, "initialize", error.what()});
@@ -142,6 +142,12 @@ class RegisteredRendererFactory final : public RendererFactory {
         if (found == providers_.end())
             throw std::invalid_argument("Rendering backend is not registered: " + requested);
         return std::make_unique<FallbackRenderer>(requested, std::vector<BackendProvider>{*found});
+    }
+    bool prefers_gpu(const std::string& requested) const override {
+        const auto found = std::find_if(providers_.begin(), providers_.end(), [&](const auto& provider) {
+            return requested == "auto" || provider.id == requested;
+        });
+        return found != providers_.end() && found->gpu;
     }
 
   private:
