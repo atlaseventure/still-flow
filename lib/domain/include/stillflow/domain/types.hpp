@@ -54,6 +54,11 @@ struct FrameMotion {
     int segment = 0;
 };
 
+struct CropWindow {
+    // Normalized target coordinates. Equal x/y scale preserves aspect ratio.
+    // Zero scale requests the legacy fixed crop passed to prepare_map().
+    double left = 0, top = 0, scale = 0;
+};
 struct Warp {
     // Forward displacement S - O on a regular grid spanning the analysis image.
     int columns = 0, rows = 0;
@@ -63,7 +68,13 @@ struct Warp {
     double strength = 1;
     double crop_strength = 1;
     double tracking_strength = 1;
+    double geometry_strength = 1;
+    double planned_strength = 1;
+    double render_strength = 1;
+    int boundary_retries = 0;
+    double boundary_invalid_fraction = 0;
     double invalid_fraction = 0;
+    CropWindow window;
 };
 
 } // namespace stillflow

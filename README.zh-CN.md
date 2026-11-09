@@ -78,14 +78,14 @@ python3 scripts/generate_video.py --output .local/synthetic --frames 60
 使用相同裁剪量对照扫描行修正效果；`--rs off` 保留相同运动估计，仅关闭扫描行补偿。性能比较时省略对比视频：
 
 ```sh
-./build/stillflow input.mp4 global.mp4 --rs off --report global.json
-./build/stillflow input.mp4 corrected.mp4 --rs on --report corrected.json
+./build/stillflow input.mp4 global.mp4 --rs off --crop-mode fixed --report global.json
+./build/stillflow input.mp4 corrected.mp4 --rs on --crop-mode fixed --report corrected.json
 ./build/stillflow --help
 ```
 
 输入使用逐行、方形像素、偶数宽高的 8-bit SDR 视频。输出保留可变帧率时间戳，复制兼容的音轨；音轨与容器不兼容时使用 MKV 或 `--no-audio`。
 
-默认每侧裁剪 8%，保持输出尺寸。裁剪空间不足时自动降低修正强度。扫描方向根据旋转元数据调整；已经旋转像素且移除元数据的素材可用 `--scan-axis` 指定。
+默认根据运动几何为每个镜头选择固定裁切窗口，保持宽高比和输出尺寸。`--crop` 设置等效每侧裁切预算，默认 8%，至少保留 70.56% 的面积；窗口可以偏心。`--crop-mode fixed` 使用指定的居中固定裁切量；`--crop-mode adaptive` 允许长镜头中缓慢移动窗口和缩放。预算不足时利用离线前视平滑调整补偿强度。报告分别记录裁切、网格形变和最终边界限幅，以及实际保留面积。扫描方向根据旋转元数据调整；已经旋转像素且移除元数据的素材可用 `--scan-axis` 指定。
 
 轨迹处理沿用 [LightStab demo](https://github.com/liutao23/LightStab) 的网格位移累积、因果级联平滑与轨迹差补偿，在镜头起始处利用可靠的后续运动初始化扫描行平滑，使用无需训练的运动与置信度自适应高斯核。`--smooth` 和 `--rs-smooth` 调整时间核宽度；设为零时关闭对应补偿。
 

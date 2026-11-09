@@ -5,6 +5,9 @@
 namespace stillflow {
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size analysis_size,
                              const StabilizationSettings& options, bool horizontal_scan);
+// Geometry-constrained, shot-local viewport and compensation planning.
+void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
+                const StabilizationSettings& options);
 
 struct TemporalLink {
     size_t from = 0, to = 0;

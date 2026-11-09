@@ -29,17 +29,37 @@ class CropRenderer {
         }
         {
             ScopeTimer timer(profile, stage + ".warp");
-            for (int attempt = 0;; ++attempt) {
+            const auto check = [&] {
                 const auto map = prepare_map(warp, analysis, input->size(), crop, horizontal);
                 warp.invalid_fraction = backend_->warp(map);
                 if (!std::isfinite(warp.invalid_fraction) || warp.invalid_fraction < 0 || warp.invalid_fraction > 1)
                     throw BackendError("Backend returned an invalid boundary fraction");
-                if (warp.invalid_fraction == 0)
-                    break;
-                if (attempt > 4)
+                return warp.invalid_fraction == 0;
+            };
+            warp.planned_strength = warp.strength;
+            warp.render_strength = 1;
+            warp.boundary_retries = 0;
+            warp.boundary_invalid_fraction = 0;
+            if (!check()) {
+                warp.boundary_invalid_fraction = warp.invalid_fraction;
+                double low = 0, high = warp.strength;
+                warp.strength = 0;
+                ++warp.boundary_retries;
+                if (!check())
                     throw std::runtime_error("Cannot construct a valid crop");
-                warp.strength = attempt < 3 ? warp.strength * 0.75 : 0;
-                warp.crop_strength = std::min(warp.crop_strength, warp.strength);
+                for (int iteration = 0; iteration < 16; ++iteration) {
+                    warp.strength = (low + high) * 0.5;
+                    ++warp.boundary_retries;
+                    if (check())
+                        low = warp.strength;
+                    else
+                        high = warp.strength;
+                }
+                warp.strength = low;
+                ++warp.boundary_retries;
+                if (!check())
+                    throw std::runtime_error("Boundary validation is inconsistent");
+                warp.render_strength = warp.planned_strength > 0 ? low / warp.planned_strength : 1;
             }
         }
         ScopeTimer timer(profile, stage + ".download");

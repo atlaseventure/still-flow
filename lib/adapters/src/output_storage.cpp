@@ -56,7 +56,9 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
     file << "frame,time_s,segment,reset,tracks,confidence,rs_confidence,fit_residual_px,step_x_px,step_y_px,step_angle_"
             "rad,warp_x_px,warp_y_px,row_correction_rms_px,strength,invalid_fraction,motion_state,failure_reason,"
             "fit_confidence,coverage,crop_strength,tracking_strength,match_reliability,model_consistency,spatial_span,"
-            "residual_normalized,temporal_links,temporal_residual\n";
+            "residual_normalized,temporal_links,temporal_residual,crop_left,crop_top,crop_right,crop_bottom,"
+            "retained_area_ratio,geometry_strength,planned_strength,render_strength,boundary_retries,boundary_invalid_"
+            "fraction\n";
     file << std::setprecision(9);
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& f = frames[i];
@@ -70,7 +72,10 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
              << ',' << f.motion.coverage << ',' << w.crop_strength << ',' << w.tracking_strength << ','
              << f.motion.match_reliability << ',' << f.motion.model_consistency << ',' << f.motion.spatial_span << ','
              << f.motion.residual_normalized << ',' << f.motion.temporal_links << ',' << f.motion.temporal_residual
-             << '\n';
+             << ',' << w.window.left << ',' << w.window.top << ',' << 1 - w.window.left - w.window.scale << ','
+             << 1 - w.window.top - w.window.scale << ',' << w.window.scale * w.window.scale << ','
+             << w.geometry_strength << ',' << w.planned_strength << ',' << w.render_strength << ','
+             << w.boundary_retries << ',' << w.boundary_invalid_fraction << '\n';
     }
 }
 
@@ -139,6 +144,17 @@ class LocalOutputStorage final : public OutputStorage {
             std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.crop_strength < 0.999; });
         const auto tracking_limited =
             std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.tracking_strength < 0.999; });
+        const auto geometry_limited =
+            std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.geometry_strength < 0.999; });
+        const auto boundary_fallback =
+            std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.boundary_retries > 0; });
+        double minimum_area = 1, maximum_area = 0, mean_area = 0;
+        for (const auto& w : warps) {
+            const double area = w.window.scale * w.window.scale;
+            minimum_area = std::min(minimum_area, area);
+            maximum_area = std::max(maximum_area, area);
+            mean_area += area / warps.size();
+        }
         auto states = nlohmann::json::object(), failures = nlohmann::json::object();
         for (const auto& frame : frames) {
             const std::string state = motion_state_name(frame.motion.state);
@@ -149,7 +165,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 6},
+            {"schema_version", 7},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -174,8 +190,9 @@ class LocalOutputStorage final : public OutputStorage {
               {"smooth_seconds", options.smooth_seconds},
               {"rs_seconds", options.rs_seconds},
               {"rs_strength", options.rs_strength},
-              {"crop_per_edge", options.crop},
-              {"retained_area_ratio", std::pow(1 - 2 * options.crop, 2)},
+              {"crop_mode", crop_mode_name(options.crop_mode)},
+              {"crop_budget_per_edge", options.crop},
+              {"minimum_retained_area_ratio", std::pow(1 - 2 * options.crop, 2)},
               {"threads", options.threads},
               {"crf", options.crf},
               {"preset", options.preset},
@@ -183,6 +200,12 @@ class LocalOutputStorage final : public OutputStorage {
               {"encoder", options.encoder},
               {"audio_copy", options.audio},
               {"comparison", !options.compare.empty()}}},
+            {"cropping",
+             {{"method", "geometric_viewport"},
+              {"retained_area_ratio", {{"minimum", minimum_area}, {"mean", mean_area}, {"maximum", maximum_area}}},
+              {"strength_note",
+               "Geometry and tracking are caps; crop_strength is the remaining boundary fraction. Planned strength "
+               "includes temporal smoothing; render_strength records final boundary fallback."}}},
             {"trajectory",
              {{"method", "lightstab_demo_causal_mesh"},
               {"kernel", "gaussian_motion_confidence"},
@@ -199,6 +222,8 @@ class LocalOutputStorage final : public OutputStorage {
              {{"tracking_resets", resets},
               {"crop_limited_frames", limited},
               {"tracking_limited_frames", tracking_limited},
+              {"geometry_limited_frames", geometry_limited},
+              {"boundary_fallback_frames", boundary_fallback},
               {"motion_states", states},
               {"tracking_failure_reasons", failures},
               {"note", "Motion residuals are fit diagnostics, not ground-truth image quality metrics."}}},

@@ -66,7 +66,8 @@ Usage: stillflow INPUT OUTPUT [options]
   --smooth SECONDS        Global trajectory smoothing scale (default 0.45)
   --rs-smooth SECONDS     Scanline trajectory smoothing scale (default 0.30)
   --rs-strength N         Scanline correction gain, 0..1 (default 1)
-  --crop FRACTION         Fixed crop on EACH edge, 0..0.25 (default 0.08)
+  --crop FRACTION         Maximum equivalent per-edge crop, 0..0.25 (default 0.08)
+  --crop-mode MODE        auto (shot-fixed), fixed or adaptive (default auto)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
   --backend auto|NAME     Rendering backend (default auto)
   --decoder NAME          Video decoder: auto, cpu or nvdec (default auto)
@@ -163,7 +164,16 @@ int main(int argc, char** argv) {
                 o.rs_strength = number(value, option);
             else if (option == "--crop")
                 o.crop = number(value, option);
-            else if (option == "--preset")
+            else if (option == "--crop-mode") {
+                if (value == "auto")
+                    o.crop_mode = stillflow::CropMode::automatic;
+                else if (value == "fixed")
+                    o.crop_mode = stillflow::CropMode::fixed;
+                else if (value == "adaptive")
+                    o.crop_mode = stillflow::CropMode::adaptive;
+                else
+                    throw std::runtime_error("--crop-mode must be auto, fixed or adaptive");
+            } else if (option == "--preset")
                 o.preset = value;
             else if (option == "--decoder") {
                 if (value != "auto" && value != "cpu" && value != "nvdec")

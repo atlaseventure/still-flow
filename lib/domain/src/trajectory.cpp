@@ -124,42 +124,6 @@ std::vector<Point> initialize_rows(std::vector<CausalPath>& paths, const std::ve
     return correction;
 }
 
-double gradient_bound(const Warp& warp, Size size) {
-    const double dx = static_cast<double>(size.width - 1) / (warp.columns - 1);
-    const double dy = static_cast<double>(size.height - 1) / (warp.rows - 1);
-    double bound = 0;
-    for (int y = 0; y + 1 < warp.rows; ++y)
-        for (int x = 0; x + 1 < warp.columns; ++x) {
-            const auto a = warp.displacement[y * warp.columns + x];
-            const auto b = warp.displacement[y * warp.columns + x + 1];
-            const auto c = warp.displacement[(y + 1) * warp.columns + x];
-            const auto d = warp.displacement[(y + 1) * warp.columns + x + 1];
-            const double horizontal = std::max(norm(b - a), norm(d - c)) / dx;
-            const double vertical = std::max(norm(c - a), norm(d - b)) / dy;
-            bound = std::max(bound, std::hypot(horizontal, vertical));
-        }
-    return bound;
-}
-
-bool fits(const Warp& warp, Size size, double crop, double strength) {
-    Warp candidate = warp;
-    candidate.strength = strength;
-    const auto map = prepare_map(candidate, size, size, crop, false);
-    const auto valid = [&](double x, double y) {
-        const Point target(map.origin_x + x * (size.width - 1) * map.step_x,
-                           map.origin_y + y * (size.height - 1) * map.step_y);
-        const auto p = source_point(map, target);
-        return finite(p) && p.x >= 0 && p.x <= size.width - 1 && p.y >= 0 && p.y <= size.height - 1;
-    };
-    // A contractive displacement has no folded cells. Check the crop boundary;
-    // the rendering backend additionally checks every output pixel.
-    for (int i = 0; i <= 64; ++i) {
-        const double t = i / 64.0;
-        if (!valid(t, 0) || !valid(t, 1) || !valid(0, t) || !valid(1, t))
-            return false;
-    }
-    return true;
-}
 } // namespace
 
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, const StabilizationSettings& options,
@@ -171,7 +135,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
     const int count = columns * rows;
     const double pixel_scale = std::max(size.width, size.height) / 960.0;
     std::vector<CausalPath> global(count), local(count);
-    double missing_seconds = 0, row_strength = 0, previous_crop = 1, previous_tracking = 1;
+    double missing_seconds = 0, row_strength = 0, previous_tracking = 1;
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& frame = frames[i];
         const auto& motion = frame.motion;
@@ -184,7 +148,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
             local.assign(count, CausalPath{});
             missing_seconds = 0;
             row_strength = 0;
-            previous_crop = previous_tracking = 1;
+            previous_tracking = 1;
             if (options.rolling_shutter && options.rs_strength > 0)
                 initial_rows =
                     initialize_rows(local, frames, i, columns, rows, horizontal, options.rs_seconds, pixel_scale);
@@ -222,28 +186,11 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 row_energy += r.dot(r);
             }
         warp.row_correction_rms = std::sqrt(row_energy / count);
-        // Bound the displacement Jacobian so backward fixed-point sampling is
-        // contractive and cannot fold. Eight iterations leave < 0.25^8 error.
-        const double bound = gradient_bound(warp, size);
-        double high = bound > 0.25 ? 0.25 / bound : 1;
-        if (!fits(warp, size, options.crop, high)) {
-            double low = 0;
-            for (int iteration = 0; iteration < 12; ++iteration) {
-                const double middle = (low + high) / 2;
-                if (fits(warp, size, options.crop, middle))
-                    low = middle;
-                else
-                    high = middle;
-            }
-            high = low;
-        }
-        warp.crop_strength = std::min(high, previous_crop + dt / 0.25);
         missing_seconds = missing ? missing_seconds + dt : 0;
         warp.tracking_strength = std::min(std::max(0.0, 1 - missing_seconds / 0.25), previous_tracking + dt / 0.25);
-        warp.strength = std::min(warp.crop_strength, warp.tracking_strength);
-        previous_crop = warp.crop_strength;
         previous_tracking = warp.tracking_strength;
     }
+    plan_crops(frames, output, size, options);
     return output;
 }
 
@@ -275,9 +222,14 @@ MapParameters prepare_map(const Warp& warp, Size size, Size output, double crop,
     MapParameters map;
     map.columns = warp.columns;
     map.rows = warp.rows;
-    map.origin_x = crop * (output.width - 1);
-    map.origin_y = crop * (output.height - 1);
-    map.step_x = map.step_y = 1 - 2 * crop;
+    const auto window = warp.window.scale == 0 ? CropWindow{crop, crop, 1 - 2 * crop} : warp.window;
+    if (!std::isfinite(window.left) || !std::isfinite(window.top) || !std::isfinite(window.scale) ||
+        window.scale <= 0 || window.scale > 1 || window.left < 0 || window.top < 0 ||
+        window.left + window.scale > 1 + 1e-12 || window.top + window.scale > 1 + 1e-12)
+        throw std::invalid_argument("Invalid crop window");
+    map.origin_x = window.left * (output.width - 1);
+    map.origin_y = window.top * (output.height - 1);
+    map.step_x = map.step_y = window.scale;
     map.grid_x = static_cast<double>(warp.columns - 1) / (output.width - 1);
     map.grid_y = static_cast<double>(warp.rows - 1) / (output.height - 1);
     const double sx = static_cast<double>(output.width - 1) / (size.width - 1);

@@ -78,14 +78,14 @@ With CUDA rendering, `--decoder auto` and `--encoder auto` use NVDEC and NVENC, 
 Compare scanline correction with the same crop. `--rs off` keeps the same motion estimation and disables scanline compensation. Omit the comparison video when benchmarking:
 
 ```sh
-./build/stillflow input.mp4 global.mp4 --rs off --report global.json
-./build/stillflow input.mp4 corrected.mp4 --rs on --report corrected.json
+./build/stillflow input.mp4 global.mp4 --rs off --crop-mode fixed --report global.json
+./build/stillflow input.mp4 corrected.mp4 --rs on --crop-mode fixed --report corrected.json
 ./build/stillflow --help
 ```
 
 Input must be progressive 8-bit SDR video with square pixels and even dimensions. Output preserves variable frame rate timestamps and copies compatible audio tracks. Use MKV or `--no-audio` if the audio codec is incompatible with the output container.
 
-The default crop removes 8% from each edge while retaining the output dimensions. Correction strength decreases automatically when the crop margin is insufficient. The scan axis follows rotation metadata; use `--scan-axis` for footage whose pixels were rotated and whose rotation metadata was removed.
+By default, each shot gets a fixed, aspect-preserving crop computed from the motion geometry. `--crop` sets the maximum equivalent per-edge crop (default 8%, retaining at least 70.56% of the area); the window can be off-center. `--crop-mode fixed` uses the exact centered crop, while `--crop-mode adaptive` allows slow viewport motion and zoom for long shots. Output dimensions stay unchanged. Offline planning smooths correction strength when the crop budget is insufficient. Reports separate crop, mesh-geometry and final boundary limits and record the actual retained area. The scan axis follows rotation metadata; use `--scan-axis` for footage whose pixels were rotated and whose rotation metadata was removed.
 
 Trajectory processing follows the [LightStab demo](https://github.com/liutao23/LightStab): accumulated mesh displacements, causal cascaded smoothing, and compensation from the trajectory difference. Shot starts use reliable subsequent motion to initialize scanline smoothing. Gaussian kernels adapt to motion and confidence without training. `--smooth` and `--rs-smooth` control the temporal kernel width; zero disables the corresponding correction.
 
