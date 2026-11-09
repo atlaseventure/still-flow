@@ -1,17 +1,23 @@
 #include "stillflow/backends/cpu.hpp"
 #include <algorithm>
-#include <cstring>
+#include <numeric>
 #include <opencv2/imgproc.hpp>
+#include <vector>
 
 namespace stillflow {
 namespace {
-void build_maps(const MapParameters& m, cv::Size output, cv::Mat& map_x, cv::Mat& map_y) {
+// Builds remap tables and returns the number of samples outside the input,
+// using the same float bounds as cv::remap's stored coordinates.
+size_t build_maps(const MapParameters& m, cv::Size output, cv::Mat& map_x, cv::Mat& map_y) {
     map_x.create(output, CV_32F);
     map_y.create(output, CV_32F);
+    const auto max_x = static_cast<float>(output.width - 1), max_y = static_cast<float>(output.height - 1);
+    std::vector<size_t> invalid_rows(output.height);
     cv::parallel_for_(cv::Range(0, output.height), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             auto* mx = map_x.ptr<float>(y);
             auto* my = map_y.ptr<float>(y);
+            size_t invalid = 0;
             cv::Point2d u(m.origin_x + y * m.xy, m.origin_y + y * m.yy);
             int band = 0;
             for (int x = 0; x < output.width; ++x) {
@@ -27,14 +33,34 @@ void build_maps(const MapParameters& m, cv::Size output, cv::Mat& map_x, cv::Mat
                     p.x -= m.offset_x[band] * (1 - t) + m.offset_x[band + 1] * t;
                     p.y -= m.offset_y[band] * (1 - t) + m.offset_y[band + 1] * t;
                 }
-                mx[x] = static_cast<float>(p.x);
-                my[x] = static_cast<float>(p.y);
+                const auto fx = static_cast<float>(p.x), fy = static_cast<float>(p.y);
+                mx[x] = fx;
+                my[x] = fy;
+                invalid += !(fx >= 0 && fx <= max_x && fy >= 0 && fy <= max_y);
                 u.x += m.xx;
                 u.y += m.yx;
             }
+            invalid_rows[y] = invalid;
         }
     });
+    return std::accumulate(invalid_rows.begin(), invalid_rows.end(), size_t{0});
 }
+
+// Output storage is a reference-counted Mat, so it outlives later renders and
+// the backend itself without a zero-filled staging copy.
+class MatImage final : public ImageData {
+  public:
+    explicit MatImage(cv::Mat pixels) : pixels_(std::move(pixels)) {}
+    Size size() const override { return {pixels_.cols, pixels_.rows}; }
+    PixelFormat format() const override { return PixelFormat::bgr8; }
+    HostImageView map_read() const override {
+        const size_t bytes = (pixels_.rows - 1) * pixels_.step + pixels_.cols * pixels_.elemSize();
+        return {size(), format(), pixels_.step, {pixels_.data, bytes}, std::make_shared<const cv::Mat>(pixels_)};
+    }
+
+  private:
+    cv::Mat pixels_;
+};
 
 class CpuBackend final : public RenderBackend {
   public:
@@ -50,20 +76,17 @@ class CpuBackend final : public RenderBackend {
     }
     double warp(const MapParameters& map) override {
         try {
-            build_maps(map, input_.size(), map_x_, map_y_);
-            cv::Mat valid = (map_x_ >= 0) & (map_x_ <= input_.cols - 1) & (map_y_ >= 0) & (map_y_ <= input_.rows - 1);
-            return 1 - static_cast<double>(cv::countNonZero(valid)) / input_.total();
+            const auto invalid = build_maps(map, input_.size(), map_x_, map_y_);
+            return static_cast<double>(invalid) / static_cast<double>(input_.total());
         } catch (const cv::Exception& error) {
             throw BackendError(error.what());
         }
     }
     Image download() override {
         try {
-            const size_t stride = static_cast<size_t>(input_.cols) * 3;
-            std::vector<uint8_t> bytes(stride * input_.rows);
-            cv::Mat output(input_.rows, input_.cols, CV_8UC3, bytes.data(), stride);
+            cv::Mat output(input_.rows, input_.cols, CV_8UC3);
             cv::remap(input_, output, map_x_, map_y_, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
-            return make_host_image(mapping_.size, PixelFormat::bgr8, std::move(bytes), stride);
+            return std::make_shared<MatImage>(std::move(output));
         } catch (const cv::Exception& error) {
             throw BackendError(error.what());
         }

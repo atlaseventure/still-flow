@@ -3,11 +3,17 @@
 #include <functional>
 
 namespace stillflow {
+// Threading: stabilize() runs decoding, motion estimation, rendering and each
+// encoder on separate threads. An object is never called concurrently, but it
+// may be called from a thread other than the one that created it. Distinct
+// MotionAnalyzer instances run concurrently, and RendererFactory::create may
+// run concurrently with the analysis pass.
 class VideoReader {
   public:
     virtual ~VideoReader() = default;
     virtual bool next(VideoFrame& frame) = 0;
     virtual const VideoInfo& info() const = 0;
+    // Invoked on the thread calling next(), before it returns the frame demuxed alongside.
     virtual void set_audio_callback(std::function<void(const AudioPacket&)> callback) = 0;
 };
 class VideoWriter {
@@ -21,7 +27,8 @@ class MediaFactory {
   public:
     virtual ~MediaFactory() = default;
     virtual std::unique_ptr<VideoReader> reader(const std::filesystem::path& path, int threads) = 0;
-    // The source reader must outlive all writers created from it.
+    // The source reader must outlive all writers created from it. Writers run on
+    // their own threads while the reader keeps decoding.
     virtual std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double fps,
                                                 VideoReader& source, int64_t origin_us, const Options& options) = 0;
 };

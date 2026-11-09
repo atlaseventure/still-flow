@@ -8,7 +8,21 @@ namespace {
 class FfmpegAudioPacket final : public AudioPacket {
   public:
     explicit FfmpegAudioPacket(const AVPacket* value) : packet(value) {}
+    ~FfmpegAudioPacket() override { av_packet_free(&owned_); }
+    FfmpegAudioPacket(const FfmpegAudioPacket&) = delete;
+    FfmpegAudioPacket& operator=(const FfmpegAudioPacket&) = delete;
+    std::shared_ptr<const AudioPacket> retain() const override {
+        auto copy = std::make_shared<FfmpegAudioPacket>(nullptr);
+        copy->owned_ = av_packet_clone(packet);
+        if (!copy->owned_)
+            throw std::bad_alloc();
+        copy->packet = copy->owned_;
+        return copy;
+    }
     const AVPacket* packet;
+
+  private:
+    AVPacket* owned_ = nullptr;
 };
 class FfmpegReader final : public VideoReader {
   public:

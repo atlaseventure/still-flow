@@ -37,14 +37,50 @@ int colorspace(AVColorSpace space) {
         return SWS_CS_ITU601;
     }
 }
+// Explicitly initialized contexts use swscale's frame path, which splits each
+// conversion into slices across threads with the same output as sws_scale().
+SwsContext* make_scaler(int width, int height, AVPixelFormat source, AVPixelFormat target, int flags, int threads,
+                        const char* operation) {
+    SwsContext* sws = sws_alloc_context();
+    if (!sws)
+        throw std::bad_alloc();
+    sws->flags = flags;
+    sws->src_w = sws->dst_w = width;
+    sws->src_h = sws->dst_h = height;
+    sws->src_format = source;
+    sws->dst_format = target;
+    sws->threads = threads;
+    if (sws_init_context(sws, nullptr, nullptr) < 0) {
+        sws_freeContext(sws);
+        throw std::runtime_error(operation);
+    }
+    return sws;
+}
+void keep_pixels(void*, uint8_t*) {}
+// References caller-owned packed pixels without copying; swscale requires
+// reference-counted frames and would otherwise duplicate the image.
+void borrow(AVFrame* frame, uint8_t* data, size_t stride, int width, int height, AVPixelFormat format) {
+    av_frame_unref(frame);
+    frame->width = width;
+    frame->height = height;
+    frame->format = format;
+    frame->data[0] = data;
+    frame->linesize[0] = static_cast<int>(stride);
+    frame->buf[0] = av_buffer_create(data, stride * height, keep_pixels, nullptr, 0);
+    if (!frame->buf[0])
+        throw std::bad_alloc();
+}
 } // namespace
 
 struct Reader::Impl {
     AVFormatContext* format = nullptr;
     AVCodecContext* decoder = nullptr;
     AVFrame* frame = nullptr;
+    AVFrame* converted = nullptr;
     AVPacket* packet = nullptr;
     SwsContext* scaler = nullptr;
+    int scaler_format = AV_PIX_FMT_NONE;
+    int threads = 1;
     int video_stream = -1;
     bool draining = false;
     int64_t last_pts = AV_NOPTS_VALUE;
@@ -53,6 +89,7 @@ struct Reader::Impl {
     ~Impl() {
         sws_freeContext(scaler);
         av_packet_free(&packet);
+        av_frame_free(&converted);
         av_frame_free(&frame);
         avcodec_free_context(&decoder);
         avformat_close_input(&format);
@@ -72,6 +109,7 @@ Reader::Reader(const std::filesystem::path& path, int threads) : impl_(std::make
         throw std::bad_alloc();
     check(avcodec_parameters_to_context(s.decoder, stream->codecpar), "Set decoder parameters");
     s.decoder->thread_count = threads;
+    s.threads = threads;
     s.decoder->err_recognition = AV_EF_CAREFUL | AV_EF_EXPLODE;
     check(avcodec_open2(s.decoder, codec, nullptr), "Open decoder");
     s.info.width = s.decoder->width;
@@ -100,8 +138,9 @@ Reader::Reader(const std::filesystem::path& path, int threads) : impl_(std::make
         s.info.horizontal_scan = true;
     }
     s.frame = av_frame_alloc();
+    s.converted = av_frame_alloc();
     s.packet = av_packet_alloc();
-    if (!s.frame || !s.packet)
+    if (!s.frame || !s.converted || !s.packet)
         throw std::bad_alloc();
 }
 
@@ -165,19 +204,23 @@ bool Reader::next(DecodedFrame& output) {
     s.last_pts = output.pts_us;
     output.duration_us = frame->duration > 0 ? av_rescale_q(frame->duration, time_base, microseconds)
                                              : static_cast<int64_t>(std::llround(1000000 / s.info.fps));
-    s.scaler =
-        sws_getCachedContext(s.scaler, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
-                             frame->width, frame->height, AV_PIX_FMT_BGR24, SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!s.scaler)
-        throw std::runtime_error("Create decoder color converter");
+    // Frame dimensions are fixed (checked above); only the pixel format may change.
+    if (!s.scaler || s.scaler_format != frame->format) {
+        sws_freeContext(s.scaler);
+        s.scaler = nullptr;
+        s.scaler = make_scaler(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), AV_PIX_FMT_BGR24,
+                               SWS_BILINEAR, s.threads, "Create decoder color converter");
+        s.scaler_format = frame->format;
+    }
     const int* coefficients = sws_getCoefficients(colorspace(frame->colorspace));
     check(sws_setColorspaceDetails(s.scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0,
                                    1 << 16, 1 << 16),
           "Set input colorspace");
     cv::Mat raw(frame->height, frame->width, CV_8UC3);
-    uint8_t* data[] = {raw.data, nullptr, nullptr, nullptr};
-    int stride[] = {static_cast<int>(raw.step), 0, 0, 0};
-    check(sws_scale(s.scaler, frame->data, frame->linesize, 0, frame->height, data, stride), "Convert decoded frame");
+    borrow(s.converted, raw.data, raw.step, raw.cols, raw.rows, AV_PIX_FMT_BGR24);
+    const int converted = sws_scale_frame(s.scaler, s.converted, frame);
+    av_frame_unref(s.converted);
+    check(converted, "Convert decoded frame");
     switch (s.info.rotation) {
     case 90:
         cv::rotate(raw, output.bgr, cv::ROTATE_90_CLOCKWISE);
@@ -197,10 +240,11 @@ bool Reader::next(DecodedFrame& output) {
 
 struct Writer::Impl {
     AVFormatContext* format = nullptr;
-    AVFormatContext* source = nullptr; // Reader must outlive writer.
+    std::vector<AVRational> source_time_base; // Copied so audio muxing never reads the live demuxer.
     AVCodecContext* encoder = nullptr;
     AVStream* video = nullptr;
     AVFrame* frame = nullptr;
+    AVFrame* source_frame = nullptr;
     AVPacket* packet = nullptr;
     SwsContext* scaler = nullptr;
     std::vector<int> stream_map;
@@ -210,6 +254,7 @@ struct Writer::Impl {
     ~Impl() {
         sws_freeContext(scaler);
         av_packet_free(&packet);
+        av_frame_free(&source_frame);
         av_frame_free(&frame);
         avcodec_free_context(&encoder);
         if (format) {
@@ -241,7 +286,8 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
                int threads, int crf, const std::string& preset, bool audio)
     : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
-    s.source = source;
+    for (unsigned i = 0; i < source->nb_streams; ++i)
+        s.source_time_base.push_back(source->streams[i]->time_base);
     s.origin_us = origin_us;
     check(avformat_alloc_output_context2(&s.format, nullptr, nullptr, path.c_str()), "Create output container");
     if (!s.format)
@@ -299,8 +345,9 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
         check(avio_open(&s.format->pb, path.c_str(), AVIO_FLAG_WRITE), "Open output file");
     check(avformat_write_header(s.format, nullptr), "Write output header");
     s.frame = av_frame_alloc();
+    s.source_frame = av_frame_alloc();
     s.packet = av_packet_alloc();
-    if (!s.frame || !s.packet)
+    if (!s.frame || !s.source_frame || !s.packet)
         throw std::bad_alloc();
     s.frame->format = s.encoder->pix_fmt;
     s.frame->width = size.width;
@@ -310,10 +357,8 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     s.frame->color_primaries = s.encoder->color_primaries;
     s.frame->color_trc = s.encoder->color_trc;
     check(av_frame_get_buffer(s.frame, 32), "Allocate encoder frame");
-    s.scaler = sws_getContext(size.width, size.height, AV_PIX_FMT_BGR24, size.width, size.height, s.encoder->pix_fmt,
-                              SWS_BICUBIC, nullptr, nullptr, nullptr);
-    if (!s.scaler)
-        throw std::runtime_error("Create encoder color converter");
+    s.scaler = make_scaler(size.width, size.height, AV_PIX_FMT_BGR24, s.encoder->pix_fmt, SWS_BICUBIC, threads,
+                           "Create encoder color converter");
     const int* coefficients = sws_getCoefficients(SWS_CS_ITU709);
     check(sws_setColorspaceDetails(s.scaler, coefficients, 1, coefficients, 0, 0, 1 << 16, 1 << 16),
           "Set output colorspace");
@@ -323,9 +368,10 @@ Writer::~Writer() = default;
 void Writer::video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us) {
     auto& s = *impl_;
     check(av_frame_make_writable(s.frame), "Make encoder frame writable");
-    const uint8_t* data[] = {bgr.data, nullptr, nullptr, nullptr};
-    int stride[] = {static_cast<int>(bgr.step), 0, 0, 0};
-    check(sws_scale(s.scaler, data, stride, 0, bgr.rows, s.frame->data, s.frame->linesize), "Convert output frame");
+    borrow(s.source_frame, bgr.data, bgr.step, bgr.cols, bgr.rows, AV_PIX_FMT_BGR24);
+    const int converted = sws_scale_frame(s.scaler, s.frame, s.source_frame);
+    av_frame_unref(s.source_frame);
+    check(converted, "Convert output frame");
     s.frame->pts = pts_us - s.origin_us;
     s.frame->duration = duration_us;
     s.durations[s.frame->pts] = duration_us;
@@ -341,7 +387,7 @@ void Writer::audio(const AVPacket* packet) {
     auto* copy = av_packet_clone(packet);
     if (!copy)
         throw std::bad_alloc();
-    const auto input_base = s.source->streams[packet->stream_index]->time_base;
+    const auto input_base = s.source_time_base[packet->stream_index];
     const int64_t offset = av_rescale_q(s.origin_us, microseconds, input_base);
     if (copy->pts != AV_NOPTS_VALUE)
         copy->pts -= offset;

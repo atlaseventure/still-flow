@@ -14,7 +14,8 @@ target_compile_features(stillflow_application PUBLIC cxx_std_20)
 target_include_directories(
     stillflow_application PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/application/include>
                                  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(stillflow_application PUBLIC stillflow_domain)
+find_package(Threads REQUIRED)
+target_link_libraries(stillflow_application PUBLIC stillflow_domain Threads::Threads)
 
 foreach(target stillflow_domain stillflow_application)
     target_compile_options(${target} PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)

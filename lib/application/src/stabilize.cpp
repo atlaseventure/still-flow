@@ -1,11 +1,19 @@
 #include "stillflow/application/stabilize.hpp"
+#include "pipeline.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <future>
 #include <stdexcept>
+#include <utility>
 
 namespace stillflow {
 namespace {
+// Frames buffered between stages. Small depths keep memory bounded while
+// letting decode, rendering and each encoder run concurrently.
+constexpr size_t frame_queue_depth = 4;
+
 void validate_options(const Options& o) {
     auto range = [](double value, double low, double high, const char* name) {
         if (!std::isfinite(value) || value < low || value > high)
@@ -23,7 +31,184 @@ void validate_options(const Options& o) {
     if (o.scan_axis != "auto" && o.scan_axis != "x" && o.scan_axis != "y")
         throw std::invalid_argument("scan_axis must be auto, x or y");
 }
+
+using AudioPackets = std::vector<std::shared_ptr<const AudioPacket>>;
+
+// Backend initialization (for example CUDA context creation) runs while the
+// analysis pass decodes, so its latency is hidden behind CPU work.
+class PendingRenderer {
+  public:
+    PendingRenderer(RendererFactory& factory, const std::string& backend, Progress& progress) : progress_(progress) {
+        future_ = std::async(std::launch::async, [&factory, backend] {
+            const auto start = Clock::now();
+            auto renderer = factory.create(backend);
+            return std::pair{std::move(renderer), milliseconds(start)};
+        });
+    }
+    // Surfaces initialization failures without waiting for the analysis pass.
+    void poll(Profile& profile) {
+        if (!renderer_ && future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            get(profile);
+    }
+    Renderer& get(Profile& profile) {
+        if (!renderer_) {
+            auto [renderer, ms] = future_.get();
+            renderer_ = std::move(renderer);
+            profile.add("render.backend_init", ms);
+            progress_.backend(renderer_->report());
+        }
+        return *renderer_;
+    }
+
+  private:
+    Progress& progress_;
+    std::future<std::pair<std::unique_ptr<Renderer>, double>> future_;
+    std::unique_ptr<Renderer> renderer_;
+};
+
+struct Analysis {
+    VideoInfo info;
+    Size size;
+    bool horizontal = false;
+    int64_t origin = 0;
+    std::vector<FrameMotion> frames;
+};
+
+// Decoding runs ahead on its own thread and proxies are generated in order;
+// motion estimation between consecutive proxies is independent per pair and
+// runs on a worker pool.
+Analysis analyze(const Options& options, Services& services, PendingRenderer& renderer, Profile& profile) {
+    Analysis result;
+    auto reader = services.media.reader(options.input, options.threads);
+    result.info = reader->info();
+    const auto& info = result.info;
+    result.horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
+    const double scale = std::min(1.0, static_cast<double>(options.analysis_width) / info.width);
+    result.size = {std::max(32, static_cast<int>(std::lround(info.width * scale))),
+                   std::max(32, static_cast<int>(std::lround(info.height * scale)))};
+    services.progress.analyzing(info, result.size, result.horizontal);
+
+    struct Task {
+        Image previous, current;
+        Motion* output;
+    };
+    const int workers =
+        std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, std::max(1, options.threads));
+    std::vector<std::unique_ptr<MotionAnalyzer>> analyzers;
+    analyzers.reserve(workers);
+    for (int i = 0; i < workers; ++i)
+        analyzers.push_back(services.images.analyzer(options, result.horizontal));
+    std::vector<Profile> worker_profiles(workers);
+    // Indexed by frame; owned separately so workers write through stable pointers.
+    std::vector<std::unique_ptr<Motion>> estimated;
+    Channel<VideoFrame> decoded(frame_queue_depth);
+    Channel<Task> tasks(static_cast<size_t>(workers) * 2);
+    Profile decode_profile;
+    ThreadGroup group;
+    group.watch(decoded);
+    group.watch(tasks);
+    group.spawn([&] {
+        VideoFrame frame;
+        for (;;) {
+            {
+                ScopeTimer timer(decode_profile, "analysis.decode");
+                if (!reader->next(frame))
+                    break;
+            }
+            if (!decoded.push(std::exchange(frame, {})))
+                break;
+        }
+        decoded.close();
+    });
+    for (int i = 0; i < workers; ++i)
+        group.spawn([&, i] {
+            while (auto task = tasks.pop())
+                *task->output = analyzers[i]->estimate(task->previous, task->current, worker_profiles[i]);
+        });
+
+    auto& frames = result.frames;
+    try {
+        Image previous;
+        while (auto decoded_frame = decoded.pop()) {
+            renderer.poll(profile);
+            const auto& source = *decoded_frame;
+            if (frames.empty())
+                result.origin = source.pts_us;
+            Image current;
+            {
+                ScopeTimer timer(profile, "analysis.preprocess");
+                current = services.images.gray_proxy(source.bgr, result.size);
+            }
+            FrameMotion frame;
+            frame.seconds = (source.pts_us - result.origin) / 1000000.0;
+            frame.duration = source.duration_us / 1000000.0;
+            frame.motion.row_delta.resize(options.bands);
+            estimated.emplace_back();
+            if (previous) {
+                const double gap = frame.seconds - frames.back().seconds;
+                if (gap > std::max(0.5, 5 / info.fps))
+                    frame.motion.reset = true;
+                else {
+                    estimated.back() = std::make_unique<Motion>();
+                    if (!tasks.push({previous, current, estimated.back().get()}))
+                        break;
+                }
+            }
+            frames.push_back(std::move(frame));
+            previous = std::move(current);
+            if (frames.size() % 120 == 0)
+                services.progress.analyzed(frames.size(), false);
+        }
+        tasks.close();
+    } catch (...) {
+        group.fail(std::current_exception());
+    }
+    group.finish();
+    profile.merge(decode_profile);
+    for (const auto& worker : worker_profiles)
+        profile.merge(worker);
+    int segment = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (estimated[i])
+            frames[i].motion = std::move(*estimated[i]);
+        if (i && frames[i].motion.reset)
+            ++segment;
+        frames[i].segment = segment;
+    }
+    services.progress.analyzed(frames.size(), true);
+    return result;
+}
+
+struct DecodedItem {
+    VideoFrame frame; // Empty after the last frame; carries trailing audio only.
+    AudioPackets audio;
+};
+struct EncodeItem {
+    Image input, stabilized; // stabilized is empty for trailing audio.
+    int64_t pts_us = 0, duration_us = 0;
+    AudioPackets audio;
+};
+
+// Per writer, audio packets precede the frame they were demuxed with, matching
+// the order of a sequential decode/encode loop so outputs are byte-identical.
+void write_stream(Channel<EncodeItem>& queue, VideoWriter& writer, ImageProcessing* comparison, Profile& profile,
+                  const char* encode_stage, const char* flush_stage) {
+    while (auto item = queue.pop()) {
+        for (const auto& packet : item->audio)
+            writer.audio(*packet);
+        if (!item->stabilized)
+            continue;
+        ScopeTimer timer(profile, encode_stage);
+        writer.video(comparison ? comparison->comparison(item->input, item->stabilized) : item->stabilized,
+                     item->pts_us, item->duration_us);
+    }
+    if (queue.cancelled())
+        return; // Another stage failed; the staged output is discarded unpublished.
+    ScopeTimer timer(profile, flush_stage);
+    writer.finish();
+}
 } // namespace
+
 RunSummary stabilize(const Options& request, Services services) {
     auto options = request;
     if (options.report.empty())
@@ -35,70 +220,21 @@ RunSummary stabilize(const Options& request, Services services) {
     services.outputs.validate(options, frames_path);
     services.runtime.configure(options.threads);
     Profile profile;
-    const auto backend_start = Clock::now();
-    auto renderer = services.renderers.create(options.backend);
-    profile.add("render.backend_init", milliseconds(backend_start));
-    services.progress.backend(renderer->report());
-    VideoInfo info;
-    Size analysis_size;
-    std::vector<FrameMotion> frames;
-    int64_t origin = 0;
-    bool horizontal = false;
-    {
-        auto reader = services.media.reader(options.input, options.threads);
-        info = reader->info();
-        horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
-        const double scale = std::min(1.0, static_cast<double>(options.analysis_width) / info.width);
-        analysis_size = {std::max(32, static_cast<int>(std::lround(info.width * scale))),
-                         std::max(32, static_cast<int>(std::lround(info.height * scale)))};
-        auto estimator = services.images.analyzer(options, horizontal);
-        VideoFrame decoded;
-        Image previous;
-        int segment = 0;
-        services.progress.analyzing(info, analysis_size, horizontal);
-        for (;;) {
-            bool available;
-            {
-                ScopeTimer timer(profile, "analysis.decode");
-                available = reader->next(decoded);
-            }
-            if (!available)
-                break;
-            if (frames.empty())
-                origin = decoded.pts_us;
-            Image current;
-            {
-                ScopeTimer timer(profile, "analysis.preprocess");
-                current = services.images.gray_proxy(decoded.bgr, analysis_size);
-            }
-            FrameMotion frame;
-            frame.seconds = (decoded.pts_us - origin) / 1000000.0;
-            frame.duration = decoded.duration_us / 1000000.0;
-            frame.motion.row_delta.resize(options.bands);
-            if (previous) {
-                const double gap = frame.seconds - frames.back().seconds;
-                if (gap > std::max(0.5, 5 / info.fps))
-                    frame.motion.reset = true;
-                else
-                    frame.motion = estimator->estimate(previous, current, profile);
-                if (frame.motion.reset)
-                    ++segment;
-            }
-            frame.segment = segment;
-            frames.push_back(std::move(frame));
-            previous = std::move(current);
-            if (frames.size() % 120 == 0)
-                services.progress.analyzed(frames.size(), false);
-        }
-        services.progress.analyzed(frames.size(), true);
-    }
+    PendingRenderer pending(services.renderers, options.backend, services.progress);
+    auto analysis = analyze(options, services, pending, profile);
+    const auto& info = analysis.info;
+    const auto& frames = analysis.frames;
+    const auto analysis_size = analysis.size;
+    const bool horizontal = analysis.horizontal;
+    const auto origin = analysis.origin;
     if (frames.empty())
         throw std::runtime_error("Input contains no decoded video frames");
     // Actual PTS differences, rather than nominal FPS, define frame durations for VFR files.
     for (size_t i = 0; i + 1 < frames.size(); ++i)
-        frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
+        analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
     auto warps = plan_warps(frames, analysis_size, options, horizontal, profile);
     const auto analysis_ms = milliseconds(start);
+    auto& renderer = pending.get(profile);
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())
@@ -112,49 +248,69 @@ RunSummary stabilize(const Options& request, Services services) {
         if (comparison)
             compare_writer = services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps,
                                                    *reader, origin, options);
-        reader->set_audio_callback([&](const AudioPacket& packet) {
-            writer->audio(packet);
-            if (compare_writer)
-                compare_writer->audio(packet);
+        Channel<DecodedItem> decoded(frame_queue_depth);
+        Channel<EncodeItem> encode(frame_queue_depth), compare(frame_queue_depth);
+        Profile decode_profile, encode_profile, compare_profile;
+        ThreadGroup group;
+        group.watch(decoded);
+        group.watch(encode);
+        group.watch(compare);
+        group.spawn([&] {
+            AudioPackets audio;
+            reader->set_audio_callback([&](const AudioPacket& packet) { audio.push_back(packet.retain()); });
+            for (;;) {
+                DecodedItem item;
+                bool available;
+                {
+                    ScopeTimer timer(decode_profile, "render.decode_and_audio");
+                    available = reader->next(item.frame);
+                }
+                item.audio = std::move(audio);
+                audio.clear();
+                if (!decoded.push(std::move(item)) || !available)
+                    break;
+            }
+            reader->set_audio_callback(nullptr);
+            decoded.close();
         });
-        VideoFrame frame;
-        for (;;) {
-            bool available;
-            {
-                ScopeTimer timer(profile, "render.decode_and_audio");
-                available = reader->next(frame);
+        group.spawn(
+            [&] { write_stream(encode, *writer, nullptr, encode_profile, "render.encode", "render.encode_flush"); });
+        if (compare_writer)
+            group.spawn([&] {
+                write_stream(compare, *compare_writer, &services.images, compare_profile,
+                             "comparison.compose_and_encode", "comparison.flush");
+            });
+        try {
+            while (auto item = decoded.pop()) {
+                EncodeItem out{item->frame.bgr, nullptr, item->frame.pts_us, 0, std::move(item->audio)};
+                if (out.input) {
+                    const auto pts = item->frame.pts_us;
+                    if (rendered >= frames.size() ||
+                        std::abs((pts - origin) / 1000000.0 - frames[rendered].seconds) > 0.000001)
+                        throw std::runtime_error("Input changed between analysis and render passes");
+                    out.stabilized =
+                        renderer.render(out.input, warps[rendered], analysis_size, options.crop, horizontal, profile);
+                    out.duration_us = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
+                    ++rendered;
+                    if (rendered % 120 == 0)
+                        services.progress.rendered(rendered, frames.size(), false);
+                }
+                if (compare_writer && !compare.push(out))
+                    break;
+                if (!encode.push(std::move(out)))
+                    break;
             }
-            if (!available)
-                break;
-            if (rendered >= frames.size() ||
-                std::abs((frame.pts_us - origin) / 1000000.0 - frames[rendered].seconds) > 0.000001)
-                throw std::runtime_error("Input changed between analysis and render passes");
-            auto& warp = warps[rendered];
-            auto stabilized = renderer->render(frame.bgr, warp, analysis_size, options.crop, horizontal, profile);
-            const auto duration = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
-            {
-                ScopeTimer timer(profile, "render.encode");
-                writer->video(stabilized, frame.pts_us, duration);
-            }
-            if (compare_writer) {
-                ScopeTimer timer(profile, "comparison.compose_and_encode");
-                auto combined = services.images.comparison(frame.bgr, stabilized);
-                compare_writer->video(combined, frame.pts_us, duration);
-            }
-            ++rendered;
-            if (rendered % 120 == 0)
-                services.progress.rendered(rendered, frames.size(), false);
+            encode.close();
+            compare.close();
+        } catch (...) {
+            group.fail(std::current_exception());
         }
+        group.finish();
+        profile.merge(decode_profile);
+        profile.merge(encode_profile);
+        profile.merge(compare_profile);
         if (rendered != frames.size())
             throw std::runtime_error("Frame count changed between passes");
-        {
-            ScopeTimer timer(profile, "render.encode_flush");
-            writer->finish();
-        }
-        if (compare_writer) {
-            ScopeTimer timer(profile, "comparison.flush");
-            compare_writer->finish();
-        }
     }
     services.progress.rendered(rendered, frames.size(), true);
     const double total_ms = milliseconds(start);
@@ -163,7 +319,7 @@ RunSummary stabilize(const Options& request, Services services) {
     auto csv_file = services.outputs.stage(frames_path);
     services.outputs.write_report(
         report_file->temporary(), csv_file->temporary(),
-        {options, info, analysis_size, horizontal, frames, warps, profile, renderer->report(), summary, analysis_ms});
+        {options, info, analysis_size, horizontal, frames, warps, profile, renderer.report(), summary, analysis_ms});
     output->publish();
     if (comparison)
         comparison->publish();
