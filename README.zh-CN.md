@@ -87,6 +87,8 @@ python3 scripts/generate_video.py --output .local/synthetic --frames 60
 
 默认每侧裁剪 8%，保持输出尺寸。裁剪空间不足时自动降低修正强度。扫描方向根据旋转元数据调整；已经旋转像素且移除元数据的素材可用 `--scan-axis` 指定。
 
+轨迹处理沿用 [LightStab demo](https://github.com/liutao23/LightStab) 的网格位移累积、因果级联平滑与轨迹差补偿，使用无需训练的运动与置信度自适应高斯核。`--smooth` 和 `--rs-smooth` 调整时间核宽度；设为零时关闭对应补偿。
+
 扫描行修正采用几何近似，适合小幅帧间运动；严重视差、快速前景运动、模糊和高频果冻效应需要单独检查。性能报告中的拟合残差用于诊断，不作为画质评分。
 
 ## 许可证

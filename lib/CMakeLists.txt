@@ -1,4 +1,4 @@
-add_library(stillflow_domain STATIC domain/src/geometry.cpp domain/src/motion.cpp)
+add_library(stillflow_domain STATIC domain/src/geometry.cpp domain/src/motion.cpp domain/src/trajectory.cpp)
 add_library(StillFlow::domain ALIAS stillflow_domain)
 set_target_properties(stillflow_domain PROPERTIES EXPORT_NAME domain POSITION_INDEPENDENT_CODE ON)
 target_compile_features(stillflow_domain PUBLIC cxx_std_20)

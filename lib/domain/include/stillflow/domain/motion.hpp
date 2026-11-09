@@ -13,14 +13,18 @@ struct TemporalLink {
 // Fuses measured connections within one short, continuous shot interval.
 bool recover_motion(std::span<FrameMotion> frames, const std::vector<TemporalLink>& links, Size analysis_size);
 
-// Maps output pixel centers into the original input in one resampling step.
+inline constexpr int max_mesh_vertices = 9 * 32;
+inline constexpr int mesh_inverse_iterations = 8;
+inline constexpr int trajectory_smoothing_passes = 50;
+
+// Forward mesh in output-resolution pixels; invert before the single resampling.
 struct MapParameters {
     double origin_x = 0, origin_y = 0;
-    double xx = 0, xy = 0, yx = 0, yy = 0;
-    double scan[32]{}, offset_x[32]{}, offset_y[32]{};
-    int bands = 0;
-    bool horizontal = false;
+    double step_x = 1, step_y = 1, grid_x = 0, grid_y = 0;
+    double offset_x[max_mesh_vertices]{}, offset_y[max_mesh_vertices]{};
+    int columns = 0, rows = 0;
 };
+Point source_point(const MapParameters& map, Point target);
 MapParameters prepare_map(const Warp& warp, Size analysis_size, Size output_size, double crop, bool horizontal_scan);
 
 } // namespace stillflow

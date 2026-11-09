@@ -55,9 +55,11 @@ struct FrameMotion {
 };
 
 struct Warp {
-    // Forward mapping from input to stable image, before the fixed output crop.
-    Matrix3 global = Matrix3::eye();
-    std::vector<Point> row_offset;
+    // Forward displacement S - O on a regular grid spanning the analysis image.
+    int columns = 0, rows = 0;
+    std::vector<Point> displacement;
+    Point global_offset;
+    double row_correction_rms = 0;
     double strength = 1;
     double crop_strength = 1;
     double tracking_strength = 1;

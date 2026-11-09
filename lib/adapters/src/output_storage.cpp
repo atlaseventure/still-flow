@@ -61,19 +61,16 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& f = frames[i];
         const auto& w = warps[i];
-        double row_energy = 0;
-        for (const auto& point : w.row_offset)
-            row_energy += point.dot(point);
-        const double rms = w.row_offset.empty() ? 0 : std::sqrt(row_energy / w.row_offset.size());
         file << i << ',' << f.seconds << ',' << f.segment << ',' << f.motion.reset << ',' << f.motion.tracks << ','
              << f.motion.confidence << ',' << f.motion.rs_confidence << ',' << f.motion.residual_px << ','
              << f.motion.step(0, 2) << ',' << f.motion.step(1, 2) << ','
-             << std::atan2(f.motion.step(1, 0), f.motion.step(0, 0)) << ',' << w.global(0, 2) << ',' << w.global(1, 2)
-             << ',' << rms << ',' << w.strength << ',' << w.invalid_fraction << ',' << motion_state_name(f.motion.state)
-             << ',' << f.motion.failure << ',' << f.motion.fit_confidence << ',' << f.motion.coverage << ','
-             << w.crop_strength << ',' << w.tracking_strength << ',' << f.motion.match_reliability << ','
-             << f.motion.model_consistency << ',' << f.motion.spatial_span << ',' << f.motion.residual_normalized << ','
-             << f.motion.temporal_links << ',' << f.motion.temporal_residual << '\n';
+             << std::atan2(f.motion.step(1, 0), f.motion.step(0, 0)) << ',' << w.global_offset.x << ','
+             << w.global_offset.y << ',' << w.row_correction_rms << ',' << w.strength << ',' << w.invalid_fraction
+             << ',' << motion_state_name(f.motion.state) << ',' << f.motion.failure << ',' << f.motion.fit_confidence
+             << ',' << f.motion.coverage << ',' << w.crop_strength << ',' << w.tracking_strength << ','
+             << f.motion.match_reliability << ',' << f.motion.model_consistency << ',' << f.motion.spatial_span << ','
+             << f.motion.residual_normalized << ',' << f.motion.temporal_links << ',' << f.motion.temporal_residual
+             << '\n';
     }
 }
 
@@ -152,7 +149,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 5},
+            {"schema_version", 6},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -186,6 +183,10 @@ class LocalOutputStorage final : public OutputStorage {
               {"encoder", options.encoder},
               {"audio_copy", options.audio},
               {"comparison", !options.compare.empty()}}},
+            {"trajectory",
+             {{"method", "lightstab_demo_causal_mesh"},
+              {"kernel", "gaussian_motion_confidence"},
+              {"passes", trajectory_smoothing_passes}}},
             {"performance",
              {{"wall_ms", total_ms},
               {"analysis_and_plan_ms", analysis_ms},
