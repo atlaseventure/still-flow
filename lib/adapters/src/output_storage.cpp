@@ -55,7 +55,8 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
     file.exceptions(std::ios::badbit | std::ios::failbit);
     file << "frame,time_s,segment,reset,tracks,confidence,rs_confidence,fit_residual_px,step_x_px,step_y_px,step_angle_"
             "rad,warp_x_px,warp_y_px,row_correction_rms_px,strength,invalid_fraction,motion_state,failure_reason,"
-            "fit_confidence,coverage,crop_strength,tracking_strength\n";
+            "fit_confidence,coverage,crop_strength,tracking_strength,match_reliability,model_consistency,spatial_span,"
+            "residual_normalized,temporal_links,temporal_residual\n";
     file << std::setprecision(9);
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& f = frames[i];
@@ -70,7 +71,9 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
              << std::atan2(f.motion.step(1, 0), f.motion.step(0, 0)) << ',' << w.global(0, 2) << ',' << w.global(1, 2)
              << ',' << rms << ',' << w.strength << ',' << w.invalid_fraction << ',' << motion_state_name(f.motion.state)
              << ',' << f.motion.failure << ',' << f.motion.fit_confidence << ',' << f.motion.coverage << ','
-             << w.crop_strength << ',' << w.tracking_strength << '\n';
+             << w.crop_strength << ',' << w.tracking_strength << ',' << f.motion.match_reliability << ','
+             << f.motion.model_consistency << ',' << f.motion.spatial_span << ',' << f.motion.residual_normalized << ','
+             << f.motion.temporal_links << ',' << f.motion.temporal_residual << '\n';
     }
 }
 
@@ -149,7 +152,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 4},
+            {"schema_version", 5},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},

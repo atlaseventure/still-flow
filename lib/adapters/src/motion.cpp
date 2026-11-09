@@ -39,11 +39,82 @@ std::string geometry_failure(const Matrix3& step, Point center, double extent) {
     return {};
 }
 
+// Residual scales are expressed at a 960-pixel analysis extent. The same
+// evidence thresholds therefore apply when the proxy resolution changes.
+double residual_scale(const cv::Mat& image) { return std::max(image.cols, image.rows) / 960.0; }
+int cell_at(cv::Point2f point, const cv::Mat& image) {
+    const int x = std::clamp(static_cast<int>(point.x * 8 / image.cols), 0, 7);
+    const int y = std::clamp(static_cast<int>(point.y * 6 / image.rows), 0, 5);
+    return y * 8 + x;
+}
+struct Quality {
+    double matching = 0, consistency = 0, coverage = 0, span = 0, confidence = 0;
+    int support = 0;
+    bool reliable() const {
+        return support >= 24 && matching >= 0.25 && consistency >= 0.25 && coverage >= 0.30 && span >= 0.08;
+    }
+};
+Quality quality(const std::vector<cv::Point2f>& texture, const std::vector<cv::Point2f>& points,
+                const std::vector<double>& reliability, const std::vector<double>& residuals, const cv::Mat& image) {
+    Quality result;
+    if (points.empty())
+        return result;
+    std::array<int, 48> textured{};
+    std::array<double, 48> supported{};
+    for (auto point : texture)
+        ++textured[cell_at(point, image)];
+    Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+    Eigen::Matrix2d moment = Eigen::Matrix2d::Zero();
+    double weight_sum = 0;
+    const double scale = 3 * residual_scale(image);
+    for (size_t i = 0; i < points.size(); ++i) {
+        const double e = residuals[i] / scale;
+        const double weight = 1 / (1 + e * e);
+        result.matching += reliability[i];
+        result.consistency += weight;
+        supported[cell_at(points[i], image)] += weight;
+        if (e > 2)
+            continue;
+        ++result.support;
+        const Eigen::Vector2d location(points[i].x / image.cols, points[i].y / image.rows);
+        mean += weight * location;
+        moment += weight * location * location.transpose();
+        weight_sum += weight;
+    }
+    result.matching /= points.size();
+    result.matching *= std::min(1.0, 2.0 * points.size() / std::max(size_t{1}, texture.size()));
+    result.consistency /= points.size();
+    int available = 0;
+    for (size_t i = 0; i < textured.size(); ++i) {
+        if (textured[i] < 2)
+            continue;
+        ++available;
+        result.coverage += std::min(1.0, supported[i] / 2);
+    }
+    result.coverage /= std::max(1, available);
+    if (weight_sum > 0) {
+        mean /= weight_sum;
+        const Eigen::Matrix2d covariance = moment / weight_sum - mean * mean.transpose();
+        result.span =
+            std::sqrt(std::max(0.0, Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(covariance).eigenvalues()(0)));
+    }
+    const double spatial = std::min(1.0, result.coverage / 0.6) * std::min(1.0, result.span / 0.18);
+    result.confidence = std::cbrt(result.matching * result.consistency * spatial);
+    return result;
+}
+void record_quality(Motion& motion, const Quality& score) {
+    motion.match_reliability = score.matching;
+    motion.model_consistency = score.consistency;
+    motion.coverage = score.coverage;
+    motion.spatial_span = score.span;
+    motion.confidence = score.confidence;
+}
+
 struct DescriptorMotion {
     Matrix3 step = Matrix3::eye();
     bool textured = false;
     int inliers = 0;
-    double confidence = 0, coverage = 0;
+    Quality score;
 };
 
 // Independent correspondences recover motion when large displacement, blur or
@@ -64,6 +135,7 @@ DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& curre
     matcher.knnMatch(descriptors_before, descriptors_after, forward, 2);
     matcher.knnMatch(descriptors_after, descriptors_before, backward, 2);
     std::vector<cv::Point2f> p, q;
+    std::vector<double> reliability;
     for (const auto& pair : forward) {
         if (pair.size() != 2 || pair[0].distance >= 0.75 * pair[1].distance)
             continue;
@@ -73,27 +145,30 @@ DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& curre
             continue;
         p.push_back(keys_before[pair[0].queryIdx].pt);
         q.push_back(keys_after[pair[0].trainIdx].pt);
+        reliability.push_back(1 - std::pow(pair[0].distance / pair[1].distance, 2));
     }
     if (p.size() < 8)
         return result;
     cv::Mat inliers;
-    const auto mapping = cv::estimateAffinePartial2D(p, q, inliers, cv::RANSAC, 3, 2000, 0.99, 10);
+    const auto mapping =
+        cv::estimateAffinePartial2D(p, q, inliers, cv::RANSAC, 3 * residual_scale(previous), 2000, 0.99, 10);
     if (mapping.empty())
         return result;
     for (int r = 0; r < 2; ++r)
         for (int c = 0; c < 3; ++c)
             result.step(r, c) = mapping.at<double>(r, c);
-    std::array<int, 48> cells{};
+    std::vector<cv::Point2f> texture;
+    texture.reserve(keys_before.size());
+    for (const auto& key : keys_before)
+        texture.push_back(key.pt);
+    std::vector<double> residuals;
     for (size_t i = 0; i < p.size(); ++i) {
-        if (norm(transform(result.step, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y}) > 3)
-            continue;
-        ++result.inliers;
-        const int x = std::clamp(static_cast<int>(p[i].x * 8 / previous.cols), 0, 7);
-        const int y = std::clamp(static_cast<int>(p[i].y * 6 / previous.rows), 0, 5);
-        ++cells[y * 8 + x];
+        const double error = norm(transform(result.step, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y});
+        residuals.push_back(error);
+        if (error <= 3 * residual_scale(previous))
+            ++result.inliers;
     }
-    result.coverage = std::count_if(cells.begin(), cells.end(), [](int n) { return n >= 2; }) / 48.0;
-    result.confidence = (static_cast<double>(result.inliers) / p.size()) * std::min(1.0, result.coverage / 0.6);
+    result.score = quality(texture, p, reliability, residuals, previous);
     return result;
 }
 
@@ -133,16 +208,16 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     double global_support = 0;
     const Point center((previous.cols - 1) * 0.5, (previous.rows - 1) * 0.5);
     const double norm = std::max(previous.cols, previous.rows);
+    const double pixel_scale = residual_scale(previous);
     const auto missing = [&](const std::string& reason) {
         result.step = Matrix3::eye();
         result.failure = reason;
         result.state = MotionState::missing;
         ScopeTimer timer(profile, "analysis.recover_features");
         const auto descriptors = descriptor_motion(previous, current, options_.features);
-        if (descriptors.inliers >= 24 && descriptors.confidence >= 0.25 && descriptors.coverage >= 0.20 &&
-            geometry_failure(descriptors.step, center, norm).empty()) {
+        if (descriptors.score.reliable() && geometry_failure(descriptors.step, center, norm).empty()) {
             result.step = descriptors.step;
-            result.confidence = descriptors.confidence;
+            record_quality(result, descriptors.score);
             result.state = MotionState::descriptor_fallback;
         } else if (scene_cut(previous, current, global_support, descriptors)) {
             result.state = MotionState::cut;
@@ -162,7 +237,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                              (y + 1) * previous.rows / rows - y * previous.rows / rows);
                 std::vector<cv::Point2f> points;
                 cv::goodFeaturesToTrack(previous(roi), points, std::max(1, options_.features / (columns * rows)), 0.015,
-                                        6);
+                                        6 * pixel_scale);
                 for (auto point : points)
                     source.push_back(point + cv::Point2f(static_cast<float>(roi.x), static_cast<float>(roi.y)));
             }
@@ -179,12 +254,15 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                                  3);
     }
     std::vector<cv::Point2f> p, q;
+    std::vector<double> reliability;
     for (size_t i = 0; i < source.size(); ++i) {
         if (forward_status[i] && backward_status[i] && forward_error[i] < 35 &&
-            cv::norm(source[i] - backward[i]) < 1.5 && destination[i].x >= 1 && destination[i].x < current.cols - 1 &&
-            destination[i].y >= 1 && destination[i].y < current.rows - 1) {
+            cv::norm(source[i] - backward[i]) < 1.5 * pixel_scale && destination[i].x >= 1 &&
+            destination[i].x < current.cols - 1 && destination[i].y >= 1 && destination[i].y < current.rows - 1) {
             p.push_back(source[i]);
             q.push_back(destination[i]);
+            const double round_trip = cv::norm(source[i] - backward[i]) / (1.5 * pixel_scale);
+            reliability.push_back(std::exp(-0.5 * round_trip * round_trip) / (1 + std::pow(forward_error[i] / 35, 2)));
         }
     }
     result.tracks = static_cast<int>(p.size());
@@ -193,7 +271,8 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     }
     ScopeTimer fit_timer(profile, "analysis.fit");
     cv::Mat inliers;
-    const auto initial = cv::estimateAffinePartial2D(p, q, inliers, cv::RANSAC, 3, 2000, 0.99, 10);
+    const auto initial =
+        cv::estimateAffinePartial2D(p, q, inliers, cv::RANSAC, 3 * residual_scale(previous), 2000, 0.99, 10);
     if (initial.empty()) {
         return missing("model");
     }
@@ -201,26 +280,20 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         for (int c = 0; c < 3; ++c)
             result.step(r, c) = initial.at<double>(r, c);
     const Matrix3 global = result.step;
-    std::array<int, 48> global_cells{};
+    std::vector<double> global_residuals;
     int global_inliers = 0;
     for (size_t i = 0; i < p.size(); ++i) {
-        if (stillflow::norm(transform(global, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y}) > 3)
-            continue;
-        ++global_inliers;
-        const int x = std::clamp(static_cast<int>(p[i].x * 8 / previous.cols), 0, 7);
-        const int y = std::clamp(static_cast<int>(p[i].y * 6 / previous.rows), 0, 5);
-        ++global_cells[y * 8 + x];
+        const double error = stillflow::norm(transform(global, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y});
+        global_residuals.push_back(error);
+        if (error <= 3 * pixel_scale)
+            ++global_inliers;
     }
     global_support = static_cast<double>(global_inliers) / source.size();
-    const double global_coverage =
-        std::count_if(global_cells.begin(), global_cells.end(), [](int n) { return n >= 2; }) / 48.0;
-    const double global_confidence =
-        (static_cast<double>(global_inliers) / p.size()) * std::min(1.0, global_coverage / 0.6);
+    const auto global_quality = quality(source, p, reliability, global_residuals, previous);
     const auto fallback = [&](const std::string& reason) {
-        if (global_inliers >= 24 && global_confidence >= 0.25 && global_coverage >= 0.20 &&
-            geometry_failure(global, center, norm).empty()) {
+        if (global_quality.reliable() && geometry_failure(global, center, norm).empty()) {
             result.step = global;
-            result.confidence = global_confidence;
+            record_quality(result, global_quality);
             result.state = MotionState::global_fallback;
             result.failure = reason;
             return result;
@@ -235,7 +308,6 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     Eigen::MatrixXd design = Eigen::MatrixXd::Zero(count * 2, dimensions);
     Eigen::VectorXd observed(count * 2), weights(count), parameters = Eigen::VectorXd::Zero(dimensions);
     std::vector<int> band_counts(options_.bands, 0);
-    std::array<int, 48> cells{};
     for (Eigen::Index i = 0; i < count; ++i) {
         const double x = (p[i].x - center.x) / norm, y = (p[i].y - center.y) / norm;
         design(2 * i, 0) = x;
@@ -247,7 +319,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         observed(2 * i) = q[i].x - p[i].x;
         observed(2 * i + 1) = q[i].y - p[i].y;
         const double error = stillflow::norm(transform(result.step, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y});
-        weights(i) = std::min(1.0, 3.0 / std::max(0.01, error));
+        weights(i) = std::min(1.0, 3.0 * pixel_scale / std::max(0.01, error));
         if (bands) {
             // Midpoint scan coordinates approximate source/target row correspondence
             // for small inter-frame motion; this is not a physical readout-time fit.
@@ -290,7 +362,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         const Eigen::VectorXd residual = design * parameters - observed;
         for (Eigen::Index i = 0; i < count; ++i) {
             const double error = residual.segment<2>(2 * i).norm();
-            weights(i) = std::min(1.0, 2.0 / std::max(0.01, error));
+            weights(i) = std::min(1.0, 2.0 * pixel_scale / std::max(0.01, error));
         }
     }
     const double a = 1 + parameters(0) / norm, b = parameters(1) / norm;
@@ -299,29 +371,22 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                    0, 0,  1};
     std::vector<double> residuals;
     const Eigen::VectorXd residual = design * parameters - observed;
-    int reliable = 0;
     for (Eigen::Index i = 0; i < count; ++i) {
         const double error = residual.segment<2>(2 * i).norm();
         residuals.push_back(error);
-        if (error > 3)
+        if (error > 3 * pixel_scale || !bands)
             continue;
-        ++reliable;
-        const int cx = std::clamp(static_cast<int>(p[i].x * 8 / previous.cols), 0, 7);
-        const int cy = std::clamp(static_cast<int>(p[i].y * 6 / previous.rows), 0, 5);
-        ++cells[cy * 8 + cx];
         const double location = horizontal_ ? p[i].x / previous.cols : p[i].y / previous.rows;
-        ++band_counts[std::clamp(static_cast<int>(location * options_.bands), 0, options_.bands - 1)];
+        ++band_counts[std::clamp(static_cast<int>(location * bands), 0, bands - 1)];
     }
-    const double coverage = std::count_if(cells.begin(), cells.end(), [](int n) { return n >= 2; }) / 48.0;
-    result.confidence = (static_cast<double>(reliable) / count) * std::min(1.0, coverage / 0.6);
+    const auto score = quality(source, p, reliability, residuals, previous);
+    record_quality(result, score);
     result.fit_confidence = result.confidence;
-    result.coverage = coverage;
     result.residual_px = median(residuals);
-    if (result.confidence < 0.25)
-        return fallback("confidence");
-    if (coverage < 0.20)
-        return fallback("coverage");
-    if (result.residual_px > 6)
+    result.residual_normalized = result.residual_px / norm;
+    if (!score.reliable())
+        return fallback(score.coverage < 0.30 || score.span < 0.08 ? "distribution" : "consistency");
+    if (result.residual_normalized > 6.0 / 960)
         return fallback("residual");
     if (const auto reason = geometry_failure(result.step, center, norm); !reason.empty())
         return fallback(reason);
@@ -329,7 +394,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         const double row_coverage =
             std::count_if(band_counts.begin(), band_counts.end(), [](int n) { return n >= 4; }) /
             static_cast<double>(bands);
-        result.rs_confidence = result.confidence * row_coverage;
+        result.rs_confidence = score.consistency * std::min(1.0, score.coverage / 0.6) * row_coverage;
         for (int j = 0; j < bands; ++j) {
             const Point delta(parameters(4 + 2 * j), parameters(5 + 2 * j));
             if (stillflow::norm(delta) > norm * 0.05) {

@@ -60,67 +60,99 @@ struct Analysis {
     std::optional<CodecReport> recovery_decoder;
 };
 
-// Re-decode only when short missing spans need a bridge. Retain two endpoint
-// proxies instead of keeping an entire clip of analysis images in memory.
+// Decode recovery windows on demand. Two/three-frame links constrain weak
+// adjacent fits jointly; endpoint links also bridge short textureless spans.
 void bridge_gaps(Analysis& analysis, const Options& options, Services& services, Profile& profile) {
     auto& frames = analysis.frames;
-    std::vector<std::pair<size_t, size_t>> gaps;
+    const auto weak = [](const Motion& motion) {
+        return motion.state == MotionState::missing ||
+               (motion.model_consistency > 0 && motion.model_consistency < 0.40);
+    };
+    std::vector<std::pair<size_t, size_t>> windows;
     for (size_t first = 1; first < frames.size();) {
-        if (frames[first].motion.state != MotionState::missing) {
+        if (!weak(frames[first].motion) || frames[first].motion.reset) {
             ++first;
             continue;
         }
         size_t last = first + 1;
-        while (last < frames.size() && frames[last].motion.state == MotionState::missing)
+        while (last < frames.size() && !frames[last].motion.reset && weak(frames[last].motion))
             ++last;
+        // Long failures use the gradual tracking fade. Never measure across cuts
+        // or timestamp gaps, even when a neighboring proxy happens to look alike.
         if (last < frames.size() && !frames[last].motion.reset &&
-            frames[last].seconds - frames[first - 1].seconds <= 0.20)
-            gaps.emplace_back(first, last);
+            frames[last].seconds - frames[first - 1].seconds <= 0.20) {
+            size_t begin = first - 1, end = last;
+            for (int k = 0; k < 2 && begin > 0 && !frames[begin].motion.reset; ++k)
+                --begin;
+            for (int k = 0; k < 2 && end + 1 < frames.size() && !frames[end + 1].motion.reset; ++k)
+                ++end;
+            // Cap both proxy storage and the dense local solve. Adjacent
+            // windows share one anchor when a long chain of weak fits occurs.
+            if (!windows.empty() && begin <= windows.back().second && end - windows.back().first < 24) {
+                windows.back().second = end;
+            } else {
+                if (!windows.empty())
+                    begin = std::max(begin, windows.back().second);
+                if (end - begin < 24)
+                    windows.emplace_back(begin, end);
+            }
+        }
         first = last;
     }
-    if (gaps.empty())
+    if (windows.empty())
         return;
     ScopeTimer timer(profile, "analysis.bridge");
     auto reader = services.media.reader(options.input, options.threads,
                                         {options.decoder, services.renderers.prefers_gpu(options.backend)});
     auto analyzer = services.images.analyzer(options, analysis.horizontal);
-    const Point center((analysis.size.width - 1) * 0.5, (analysis.size.height - 1) * 0.5);
-    Image anchor;
-    size_t gap = 0, index = 0;
+    size_t window = 0, index = 0;
+    std::vector<Image> proxies;
     VideoFrame source;
-    while (gap < gaps.size() && reader->next(source)) {
-        const auto [first, last] = gaps[gap];
+    while (window < windows.size() && reader->next(source)) {
+        const auto [begin, end] = windows[window];
         if (index >= frames.size() ||
             std::abs((source.pts_us - analysis.origin) / 1000000.0 - frames[index].seconds) > 0.000001)
             throw std::runtime_error("Input changed during tracking recovery");
-        if (index == first - 1)
-            anchor = services.images.gray_proxy(source.bgr, analysis.size);
-        if (index == last) {
-            const auto current = services.images.gray_proxy(source.bgr, analysis.size);
-            const auto bridge = analyzer->estimate(anchor, current, profile);
-            if (bridge.state == MotionState::tracked || bridge.state == MotionState::global_fallback ||
-                bridge.state == MotionState::descriptor_fallback) {
-                // Preserve the reliable outgoing step. Interpolate the missing
-                // camera poses so their product exactly reaches the measured anchor.
-                const auto end = frames[last].motion.step.inv() * bridge.step;
-                const double duration = frames[last - 1].seconds - frames[first - 1].seconds;
-                auto previous = Matrix3::eye();
-                for (size_t i = first; i < last; ++i) {
-                    const double t = (frames[i].seconds - frames[first - 1].seconds) / duration;
-                    const auto camera = interpolate_similarity(end, center, t);
-                    auto& motion = frames[i].motion;
-                    motion.step = camera * previous.inv();
-                    motion.state = MotionState::bridged;
-                    motion.confidence = bridge.confidence * 0.5;
-                    previous = camera;
+        if (index >= begin)
+            proxies.push_back(services.images.gray_proxy(source.bgr, analysis.size));
+        if (index == end) {
+            std::vector<TemporalLink> links;
+            for (size_t to = 2; to < proxies.size(); ++to)
+                for (size_t from = to > 3 ? to - 3 : 0; from + 2 <= to; ++from) {
+                    auto motion = analyzer->estimate(proxies[from], proxies[to], profile);
+                    if (!motion.reset && motion.state != MotionState::missing)
+                        links.push_back({from, to, std::move(motion)});
                 }
+            // With two or more blank frames, some visible endpoint connections
+            // are longer than three frames. Add independent neighboring anchors
+            // within the same short recovery horizon.
+            for (size_t first = begin + 1; first <= end; ++first) {
+                if (frames[first].motion.state != MotionState::missing)
+                    continue;
+                size_t last = first;
+                while (last <= end && frames[last].motion.state == MotionState::missing)
+                    ++last;
+                if (last <= end)
+                    for (size_t from = first > begin + 1 ? first - 2 : first - 1; from < first; ++from)
+                        for (size_t to = last - 1; to <= std::min(end, last + 1); ++to) {
+                            if (to - from <= 3 || frames[to].seconds - frames[from].seconds > 0.20)
+                                continue;
+                            auto motion = analyzer->estimate(proxies[from - begin], proxies[to - begin], profile);
+                            if (!motion.reset && motion.state != MotionState::missing)
+                                links.push_back({from - begin, to - begin, std::move(motion)});
+                        }
+                first = last - 1;
             }
-            ++gap;
-            anchor = gap < gaps.size() && gaps[gap].first - 1 == index ? current : Image{};
+            recover_motion(std::span<FrameMotion>(frames).subspan(begin, end - begin + 1), links, analysis.size);
+            const auto anchor = proxies.back();
+            proxies.clear();
+            ++window;
+            if (window < windows.size() && windows[window].first == end)
+                proxies.push_back(anchor);
         }
         ++index;
     }
-    if (gap != gaps.size())
+    if (window != windows.size())
         throw std::runtime_error("Input changed during tracking recovery");
     analysis.recovery_decoder = reader->codec();
 }

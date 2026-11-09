@@ -39,6 +39,12 @@ struct Motion {
     std::string failure;
     double fit_confidence = 0;
     double coverage = 0;
+    double match_reliability = 0;
+    double model_consistency = 0;
+    double spatial_span = 0;
+    double residual_normalized = 0;
+    int temporal_links = 0;
+    double temporal_residual = 0;
 };
 
 struct FrameMotion {
