@@ -1,6 +1,7 @@
 #pragma once
 
-#include "stillflow/motion.hpp"
+#include "motion.hpp"
+#include "stillflow/application/report.hpp"
 #include <memory>
 
 namespace stillflow {
@@ -20,8 +21,8 @@ class FrameRenderer {
 public:
     explicit FrameRenderer(const std::string& mode);
     void render(const cv::Mat& input, cv::Mat& output, Warp& warp,
-        cv::Size analysis_size, double crop, bool horizontal, Profile& profile);
-    nlohmann::json report() const;
+        Size analysis_size, double crop, bool horizontal, Profile& profile);
+    AccelerationReport report() const;
 private:
     std::string mode_, device_, fallback_;
     std::unique_ptr<GpuRenderer> gpu_;

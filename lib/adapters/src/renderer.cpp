@@ -1,7 +1,6 @@
-#include "stillflow/renderer.hpp"
+#include "renderer.hpp"
 
 #include <opencv2/imgproc.hpp>
-#include <iostream>
 #include <stdexcept>
 
 namespace stillflow {
@@ -31,13 +30,10 @@ FrameRenderer::FrameRenderer(const std::string& mode) : mode_(mode) {
             fallback_ = error.what();
         }
     }
-    std::cerr << "Render backend: " << (gpu_ ? "CUDA (" + device_ + ")" : "CPU");
-    if (!fallback_.empty()) std::cerr << " (" << fallback_ << ')';
-    std::cerr << '\n';
 }
 
 void FrameRenderer::render(const cv::Mat& input, cv::Mat& output, Warp& warp,
-    cv::Size analysis_size, double crop, bool horizontal, Profile& profile) {
+    Size analysis_size, double crop, bool horizontal, Profile& profile) {
     if (gpu_) {
         const double original_strength = warp.strength;
         try {
@@ -46,7 +42,7 @@ void FrameRenderer::render(const cv::Mat& input, cv::Mat& output, Warp& warp,
             ScopeTimer timer(profile, "render.cuda_warp");
             gpu_->upload(input);
             for (int attempt = 0; ; ++attempt) {
-                warp.invalid_fraction = gpu_->warp(prepare_map(warp, analysis_size, input.size(), crop, horizontal));
+                warp.invalid_fraction = gpu_->warp(prepare_map(warp, analysis_size, {input.cols, input.rows}, crop, horizontal));
                 if (warp.invalid_fraction == 0) break;
                 reduce_strength(warp, attempt);
             }
@@ -56,7 +52,6 @@ void FrameRenderer::render(const cv::Mat& input, cv::Mat& output, Warp& warp,
         } catch (const std::exception& error) {
             if (mode_ == "cuda") throw;
             fallback_ = error.what();
-            std::cerr << "CUDA rendering failed; using CPU: " << fallback_ << '\n';
             gpu_.reset();
             warp.strength = original_strength;
         }
@@ -80,12 +75,13 @@ void FrameRenderer::render(const cv::Mat& input, cv::Mat& output, Warp& warp,
     ++cpu_frames_;
 }
 
-nlohmann::json FrameRenderer::report() const {
-    return {{"requested", mode_}, {"backend", gpu_frames_ ? (cpu_frames_ ? "mixed" : "cuda") : "cpu"},
-        {"device", device_}, {"gpu_frames", gpu_frames_}, {"cpu_frames", cpu_frames_},
+AccelerationReport FrameRenderer::report() const {
+    return {mode_, gpu_frames_ ? (cpu_frames_ ? "mixed" : "cuda") : "cpu", device_, fallback_,
 #ifdef STILLFLOW_CUDA_VERSION
-        {"cuda_compiler", STILLFLOW_CUDA_VERSION},
+        STILLFLOW_CUDA_VERSION,
+#else
+        "",
 #endif
-        {"fallback_reason", fallback_}};
+        gpu_frames_, cpu_frames_};
 }
 } // namespace stillflow

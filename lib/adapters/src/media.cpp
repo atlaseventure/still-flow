@@ -1,4 +1,4 @@
-#include "stillflow/media.hpp"
+#include "media.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <cmath>
@@ -105,7 +105,7 @@ void Reader::set_audio_callback(std::function<void(const AVPacket*)> callback) {
     impl_->audio_callback = std::move(callback);
 }
 
-bool Reader::next(VideoFrame& output) {
+bool Reader::next(DecodedFrame& output) {
     auto& s = *impl_;
     for (;;) {
         const int received = avcodec_receive_frame(s.decoder, s.frame);

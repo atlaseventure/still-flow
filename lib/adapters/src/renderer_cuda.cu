@@ -1,4 +1,4 @@
-#include "stillflow/renderer.hpp"
+#include "renderer.hpp"
 
 #include <cuda_runtime.h>
 #include <stdexcept>

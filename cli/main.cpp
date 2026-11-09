@@ -1,6 +1,7 @@
-#include "stillflow/stabilizer.hpp"
+#include "stillflow/application/stabilize.hpp"
+#include "stillflow/adapters/backends.hpp"
 
-#include <opencv2/core/version.hpp>
+#include <iomanip>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -8,6 +9,28 @@
 #include <cstdlib>
 
 namespace {
+class ConsoleProgress final : public stillflow::Progress {
+public:
+    void backend(const stillflow::AccelerationReport& report) override {
+        std::cerr << "Render backend: " << (report.device.empty() ? "CPU" : "CUDA (" + report.device + ")");
+        if (!report.fallback_reason.empty()) std::cerr << " (" << report.fallback_reason << ')';
+        std::cerr << '\n';
+    }
+    void analyzing(const stillflow::VideoInfo& info, stillflow::Size size, bool horizontal) override {
+        std::cerr << "Analyze " << info.width << 'x' << info.height << " at " << size.width << 'x' << size.height
+                  << ", scan axis " << (horizontal ? 'x' : 'y') << '\n';
+    }
+    void analyzed(size_t frames, bool complete) override {
+        std::cerr << "\rAnalyzed " << frames << " frames";
+        if (complete) std::cerr << '\n';
+        else std::cerr << std::flush;
+    }
+    void rendered(size_t frames, size_t total, bool complete) override {
+        std::cerr << "\rRendered " << frames << '/' << total;
+        if (complete) std::cerr << '\n';
+        else std::cerr << std::flush;
+    }
+};
 constexpr std::string_view help = R"(stillflow - offline video stabilization with scanline wobble suppression
 
 Usage: stillflow INPUT OUTPUT [options]
@@ -61,11 +84,7 @@ int integer(const std::string& text, const std::string& option, int low, int hig
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--version") {
-            std::cout << "stillflow " << STILLFLOW_VERSION << " (C++20, OpenCV " << CV_VERSION
-#ifdef STILLFLOW_CUDA_VERSION
-                      << ", CUDA " << STILLFLOW_CUDA_VERSION
-#endif
-                      << ")\n";
+            std::cout << stillflow::build_description() << '\n';
             return EXIT_SUCCESS;
         }
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
@@ -108,7 +127,16 @@ int main(int argc, char** argv) {
             } else throw std::runtime_error("Unknown option: " + option);
         }
         if (o.report.empty()) o.report = o.output.string() + ".profile.json";
-        return stillflow::run(o);
+        auto media = stillflow::make_media_factory();
+        auto images = stillflow::make_image_processing();
+        auto outputs = stillflow::make_output_storage();
+        auto runtime = stillflow::make_runtime();
+        ConsoleProgress progress;
+        const auto result = stillflow::stabilize(o, {*media, *images, *outputs, *runtime, progress});
+        std::cout << std::fixed << std::setprecision(2) << result.frames << " frames, " << result.wall_ms / 1000
+                  << " s, " << result.frames * 1000.0 / result.wall_ms << " end-to-end fps, "
+                  << result.resources.peak_rss_mib << " MiB peak RSS\nReport: " << o.report << '\n';
+        return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "stillflow: " << error.what() << '\n';
         return EXIT_FAILURE;

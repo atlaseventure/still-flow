@@ -17,6 +17,31 @@ Dependencies use 12 compilation jobs each; adjust with `-DSTILLFLOW_BUILD_JOBS=N
 
 The build detects the CUDA Toolkit automatically; GPU execution requires a compatible NVIDIA driver. Set `CUDACXX` to `nvcc` for a custom toolkit location. Use `-DSTILLFLOW_WITH_CUDA=OFF` for a CPU-only build.
 
+## Library integration
+
+The core follows Clean Architecture: domain algorithms and application use cases depend on ports for media, images, outputs and runtime services. The CLI assembles desktop adapters; Android and embedded hosts can supply their own adapters.
+
+Build and install the core with an installed Eigen package:
+
+```sh
+cmake -S . -B build-lib -G Ninja -DSTILLFLOW_SUPERBUILD=OFF \
+  -DSTILLFLOW_BUILD_CLI=OFF -DSTILLFLOW_BUILD_ADAPTERS=OFF
+cmake --build build-lib
+cmake --install build-lib --prefix /path/to/sdk
+```
+
+For cross-compilation, pass the target platform's `CMAKE_TOOLCHAIN_FILE`. Consumers import `find_package(StillFlow CONFIG REQUIRED)`, link `StillFlow::application`, implement the application ports and call `stillflow::stabilize`. The core requires a C++20 standard library with filesystem and exception support.
+
+## Synthetic footage
+
+Install FFmpeg and the Python dependencies in `scripts/requirements.txt`. Generate a shaky rolling-shutter clip, a stable reference and parameter metadata:
+
+```sh
+python3 scripts/generate_video.py --output .local/synthetic --frames 60
+```
+
+Use `--overwrite` to replace existing footage.
+
 ## Usage
 
 Process a video and generate a side-by-side comparison:

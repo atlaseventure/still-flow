@@ -41,6 +41,8 @@ ExternalProject_Add(dep_eigen ${common}
         -DEIGEN_BUILD_DOC:BOOL=OFF -DEIGEN_BUILD_PKGCONFIG:BOOL=ON
     BUILD_COMMAND ${build_command})
 
+set(stillflow_dependencies dep_eigen)
+if(STILLFLOW_BUILD_ADAPTERS)
 ExternalProject_Add(dep_json ${common}
     URL https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz
     URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
@@ -129,6 +131,9 @@ ExternalProject_Add(dep_opencv ${common}
         -DWITH_OPENJPEG:BOOL=OFF -DWITH_JASPER:BOOL=OFF -DWITH_OPENEXR:BOOL=OFF -DWITH_AVIF:BOOL=OFF
     BUILD_COMMAND ${build_command})
 
+    list(APPEND stillflow_dependencies dep_opencv dep_ffmpeg dep_json)
+endif()
+
 string(REPLACE ";" "|" cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
 set(cuda_args "-DSTILLFLOW_WITH_CUDA:BOOL=${STILLFLOW_WITH_CUDA}")
 if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
@@ -139,12 +144,14 @@ if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
     endif()
 endif()
 ExternalProject_Add(stillflow
-    DEPENDS dep_opencv dep_ffmpeg dep_json
+    DEPENDS ${stillflow_dependencies}
     SOURCE_DIR "${CMAKE_SOURCE_DIR}"
     BINARY_DIR "${CMAKE_BINARY_DIR}/app"
     DOWNLOAD_COMMAND ""
     LIST_SEPARATOR "|"
     CMAKE_ARGS ${cmake_args} ${cuda_args}
+        "-DSTILLFLOW_BUILD_CLI:BOOL=${STILLFLOW_BUILD_CLI}"
+        "-DSTILLFLOW_BUILD_ADAPTERS:BOOL=${STILLFLOW_BUILD_ADAPTERS}"
         "-DSTILLFLOW_DEPS_ROOT:PATH=${prefix}"
         "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY:PATH=${CMAKE_BINARY_DIR}"
         "-DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_INSTALL_PREFIX}"

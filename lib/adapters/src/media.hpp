@@ -1,5 +1,6 @@
 #pragma once
 
+#include "stillflow/application/media.hpp"
 #include <opencv2/core.hpp>
 #include <filesystem>
 #include <functional>
@@ -11,14 +12,7 @@ extern "C" {
 }
 
 namespace stillflow {
-struct VideoInfo {
-    int width = 0, height = 0;
-    int rotation = 0;
-    double fps = 0;
-    std::string codec;
-    bool horizontal_scan = false;
-};
-struct VideoFrame {
+struct DecodedFrame {
     cv::Mat bgr;
     int64_t pts_us = 0, duration_us = 0;
 };
@@ -29,7 +23,7 @@ public:
     ~Reader();
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
-    bool next(VideoFrame& frame);
+    bool next(DecodedFrame& frame);
     [[nodiscard]] const VideoInfo& info() const;
     [[nodiscard]] AVFormatContext* context() const;
     void set_audio_callback(std::function<void(const AVPacket*)> callback);

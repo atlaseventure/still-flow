@@ -17,6 +17,31 @@ cmake --build build
 
 构建时自动检测 CUDA Toolkit；GPU 运行需要兼容的 NVIDIA 驱动。自定义工具包位置可通过 `CUDACXX` 指定 `nvcc`。使用 `-DSTILLFLOW_WITH_CUDA=OFF` 构建纯 CPU 版本。
 
+## 库集成
+
+核心库按 Clean Architecture 分为领域算法与应用用例，通过接口接入媒体、图像、输出和运行时服务。CLI 负责组装桌面适配器；Android 和嵌入式宿主可提供自己的适配器。
+
+使用已安装的 Eigen 单独构建、安装核心库：
+
+```sh
+cmake -S . -B build-lib -G Ninja -DSTILLFLOW_SUPERBUILD=OFF \
+  -DSTILLFLOW_BUILD_CLI=OFF -DSTILLFLOW_BUILD_ADAPTERS=OFF
+cmake --build build-lib
+cmake --install build-lib --prefix /path/to/sdk
+```
+
+交叉编译时传入目标平台的 `CMAKE_TOOLCHAIN_FILE`。使用方通过 `find_package(StillFlow CONFIG REQUIRED)` 导入并链接 `StillFlow::application`，实现应用层端口后调用 `stillflow::stabilize`。核心库需要支持 C++20、文件系统和异常的标准库。
+
+## 合成素材
+
+需安装 FFmpeg，以及 `scripts/requirements.txt` 中的 Python 依赖。生成带抖动与卷帘快门效应的视频、稳定参考视频和参数记录：
+
+```sh
+python3 scripts/generate_video.py --output .local/synthetic --frames 60
+```
+
+使用 `--overwrite` 替换已有素材。
+
 ## 使用
 
 处理视频并生成前后对比：
