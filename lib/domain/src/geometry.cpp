@@ -3,6 +3,15 @@
 #include <stdexcept>
 
 namespace stillflow {
+Matrix3 interpolate_similarity(const Matrix3& matrix, Point center, double fraction) {
+    const auto shift = transform(matrix, center) - center;
+    const double angle = std::atan2(matrix(1, 0), matrix(0, 0)) * fraction;
+    const double scale = std::pow(std::hypot(matrix(0, 0), matrix(1, 0)), fraction);
+    const double a = scale * std::cos(angle), b = scale * std::sin(angle);
+    return {a, -b, (1 - a) * center.x + b * center.y + fraction * shift.x,
+            b, a,  -b * center.x + (1 - a) * center.y + fraction * shift.y,
+            0, 0,  1};
+}
 Matrix3 Matrix3::inv() const {
     using Matrix = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>;
     const Eigen::Map<const Matrix> input(values.data());

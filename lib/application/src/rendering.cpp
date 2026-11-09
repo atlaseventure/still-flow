@@ -39,6 +39,7 @@ class CropRenderer {
                 if (attempt > 4)
                     throw std::runtime_error("Cannot construct a valid crop");
                 warp.strength = attempt < 3 ? warp.strength * 0.75 : 0;
+                warp.crop_strength = std::min(warp.crop_strength, warp.strength);
             }
         }
         ScopeTimer timer(profile, stage + ".download");

@@ -26,4 +26,7 @@ inline Point transform(const Matrix3& m, Point p) {
     const double w = m(2, 0) * p.x + m(2, 1) * p.y + m(2, 2);
     return {(m(0, 0) * p.x + m(0, 1) * p.y + m(0, 2)) / w, (m(1, 0) * p.x + m(1, 1) * p.y + m(1, 2)) / w};
 }
+// Identity at zero and the supplied similarity at one, using center displacement,
+// rotation and log scale. Intermediate transforms remain invertible.
+Matrix3 interpolate_similarity(const Matrix3& matrix, Point center, double fraction);
 } // namespace stillflow

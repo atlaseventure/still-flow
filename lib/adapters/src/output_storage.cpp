@@ -54,7 +54,8 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
     std::ofstream file(path);
     file.exceptions(std::ios::badbit | std::ios::failbit);
     file << "frame,time_s,segment,reset,tracks,confidence,rs_confidence,fit_residual_px,step_x_px,step_y_px,step_angle_"
-            "rad,warp_x_px,warp_y_px,row_correction_rms_px,strength,invalid_fraction\n";
+            "rad,warp_x_px,warp_y_px,row_correction_rms_px,strength,invalid_fraction,motion_state,failure_reason,"
+            "fit_confidence,coverage,crop_strength,tracking_strength\n";
     file << std::setprecision(9);
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& f = frames[i];
@@ -67,7 +68,9 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
              << f.motion.confidence << ',' << f.motion.rs_confidence << ',' << f.motion.residual_px << ','
              << f.motion.step(0, 2) << ',' << f.motion.step(1, 2) << ','
              << std::atan2(f.motion.step(1, 0), f.motion.step(0, 0)) << ',' << w.global(0, 2) << ',' << w.global(1, 2)
-             << ',' << rms << ',' << w.strength << ',' << w.invalid_fraction << '\n';
+             << ',' << rms << ',' << w.strength << ',' << w.invalid_fraction << ',' << motion_state_name(f.motion.state)
+             << ',' << f.motion.failure << ',' << f.motion.fit_confidence << ',' << f.motion.coverage << ','
+             << w.crop_strength << ',' << w.tracking_strength << '\n';
     }
 }
 
@@ -133,9 +136,20 @@ class LocalOutputStorage final : public OutputStorage {
         const double duration = frames.back().seconds + frames.back().duration;
         const auto resets = std::count_if(frames.begin(), frames.end(), [](const auto& f) { return f.motion.reset; });
         const auto limited =
-            std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.strength < 0.999; });
+            std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.crop_strength < 0.999; });
+        const auto tracking_limited =
+            std::count_if(warps.begin(), warps.end(), [](const auto& w) { return w.tracking_strength < 0.999; });
+        auto states = nlohmann::json::object(), failures = nlohmann::json::object();
+        for (const auto& frame : frames) {
+            const std::string state = motion_state_name(frame.motion.state);
+            states[state] = states.value(state, 0) + 1;
+            if (!frame.motion.failure.empty()) {
+                const auto& reason = frame.motion.failure;
+                failures[reason] = failures.value(reason, 0) + 1;
+            }
+        }
         nlohmann::json report{
-            {"schema_version", 3},
+            {"schema_version", 4},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -179,6 +193,9 @@ class LocalOutputStorage final : public OutputStorage {
             {"diagnostics",
              {{"tracking_resets", resets},
               {"crop_limited_frames", limited},
+              {"tracking_limited_frames", tracking_limited},
+              {"motion_states", states},
+              {"tracking_failure_reasons", failures},
               {"note", "Motion residuals are fit diagnostics, not ground-truth image quality metrics."}}},
             {"build",
              {{"compiler", __VERSION__},

@@ -24,7 +24,8 @@ struct RunReport {
     const std::vector<Warp>& warps;
     const Profile& profile;
     RenderingReport rendering;
-    // Keyed by stream: analysis_decoder, render_decoder, encoder, comparison_encoder.
+    // Keyed by stream: analysis_decoder, recovery_decoder (when needed), render_decoder,
+    // encoder, comparison_encoder.
     std::vector<std::pair<std::string, CodecReport>> codecs;
     RunSummary summary;
     double analysis_ms;

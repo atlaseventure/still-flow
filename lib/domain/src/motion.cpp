@@ -39,7 +39,7 @@ Eigen::MatrixXd smooth(const Eigen::MatrixXd& path, const std::vector<double>& t
     entries.reserve(static_cast<size_t>(n) * 10);
     Eigen::MatrixXd rhs = path;
     for (int i = 0; i < n; ++i) {
-        const double weight = std::max(0.15, confidence[i]);
+        const double weight = std::max(0.001, confidence[i]);
         entries.emplace_back(i, i, weight);
         rhs.row(i) *= weight;
     }
@@ -66,13 +66,7 @@ Eigen::MatrixXd smooth(const Eigen::MatrixXd& path, const std::vector<double>& t
 
 Matrix3 scaled_global(const Warp& warp, Size size, double strength) {
     const Point center((size.width - 1) * 0.5, (size.height - 1) * 0.5);
-    const auto shift = transform(warp.global, center) - center;
-    const double angle = std::atan2(warp.global(1, 0), warp.global(0, 0)) * strength;
-    const double scale = std::pow(std::hypot(warp.global(0, 0), warp.global(1, 0)), strength);
-    const double a = scale * std::cos(angle), b = scale * std::sin(angle);
-    return {a, -b, (1 - a) * center.x + b * center.y + strength * shift.x,
-            b, a,  -b * center.x + (1 - a) * center.y + strength * shift.y,
-            0, 0,  1};
+    return interpolate_similarity(warp.global, center, strength);
 }
 
 Point inverse_point(Point target, const Matrix3& inverse, const Warp& warp, Size size, bool horizontal,
@@ -113,7 +107,6 @@ bool fits(const Warp& warp, Size size, double crop, bool horizontal, double stre
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, const StabilizationSettings& options,
                              bool horizontal) {
     std::vector<Warp> output(frames.size());
-    const Point center((size.width - 1) * 0.5, (size.height - 1) * 0.5);
     for (size_t first = 0; first < frames.size();) {
         size_t last = first + 1;
         while (last < frames.size() && frames[last].segment == frames[first].segment)
@@ -122,21 +115,24 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         std::vector<Matrix3> cameras(n);
         Eigen::MatrixXd paths = Eigen::MatrixXd::Zero(n, 4);
         Eigen::MatrixXd rows = Eigen::MatrixXd::Zero(n, static_cast<Eigen::Index>(options.bands) * 2);
-        std::vector<double> times(n), confidence(n);
+        std::vector<double> times(n), confidence(n), row_strength(n, 1);
         auto camera = Matrix3::eye();
-        double last_angle = 0;
         for (int i = 0; i < n; ++i) {
             const auto& frame = frames[first + i];
             times[i] = frame.seconds;
             confidence[i] = i == 0 ? 1.0 : frame.motion.confidence;
+            if (frame.motion.state == MotionState::missing)
+                confidence[i] = 0;
+            if (frame.motion.state == MotionState::missing || frame.motion.state == MotionState::global_fallback ||
+                frame.motion.state == MotionState::descriptor_fallback || frame.motion.state == MotionState::bridged)
+                row_strength[i] = 0;
             if (i)
                 camera = frame.motion.step * camera;
             cameras[i] = camera;
-            const auto position = transform(camera, center) - center;
-            double angle = std::atan2(camera(1, 0), camera(0, 0));
-            angle = last_angle + std::remainder(angle - last_angle, 2 * std::numbers::pi);
-            last_angle = angle;
-            paths.row(i) << position.x, position.y, angle, std::log(std::hypot(camera(0, 0), camera(1, 0)));
+            // Smooth the similarity coefficients together. This linear operation
+            // commutes with changing the reference camera; separately smoothing
+            // angle/log-scale and translation amplifies drift in long shots.
+            paths.row(i) << camera(0, 2), camera(1, 2), camera(0, 0), camera(1, 0);
             if (i) {
                 rows.row(i) = rows.row(i - 1);
                 const auto inverse = camera.inv();
@@ -149,12 +145,15 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         }
         const auto stable = smooth(paths, times, confidence, options.smooth_seconds);
         const auto stable_rows = smooth(rows, times, confidence, options.rs_seconds);
+        // Global-only recovery also fades the scanline correction on either side
+        // of the gap, so switching models cannot introduce a local deformation jump.
+        for (int i = 1; i < n; ++i)
+            row_strength[i] = std::min(row_strength[i], row_strength[i - 1] + (times[i] - times[i - 1]) / 0.15);
+        for (int i = n - 1; i > 0; --i)
+            row_strength[i - 1] = std::min(row_strength[i - 1], row_strength[i] + (times[i] - times[i - 1]) / 0.15);
         for (int i = 0; i < n; ++i) {
-            const double scale = std::exp(stable(i, 3));
-            const double a = scale * std::cos(stable(i, 2)), b = scale * std::sin(stable(i, 2));
-            const Matrix3 desired{a, -b, (1 - a) * center.x + b * center.y + stable(i, 0),
-                                  b, a,  -b * center.x + (1 - a) * center.y + stable(i, 1),
-                                  0, 0,  1};
+            const double a = stable(i, 2), b = stable(i, 3);
+            const Matrix3 desired{a, -b, stable(i, 0), b, a, stable(i, 1), 0, 0, 1};
             auto& warp = output[first + i];
             warp.global = desired * cameras[i].inv();
             if (options.rolling_shutter) {
@@ -162,7 +161,8 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 for (Eigen::Index band = 0; band < options.bands; ++band) {
                     const double dx = stable_rows(i, band * 2) - rows(i, band * 2);
                     const double dy = stable_rows(i, band * 2 + 1) - rows(i, band * 2 + 1);
-                    warp.row_offset[band] = Point(a * dx - b * dy, b * dx + a * dy) * options.rs_strength;
+                    warp.row_offset[band] =
+                        Point(a * dx - b * dy, b * dx + a * dy) * (options.rs_strength * row_strength[i]);
                 }
             }
             if (!fits(warp, size, options.crop, horizontal, 1)) {
@@ -174,16 +174,24 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                     else
                         high = middle;
                 }
-                warp.strength = low;
+                warp.crop_strength = low;
             }
+            // Unrecoverable tracking loss fades to the original view. The same
+            // bidirectional envelope used for crop limits eases out and back in.
+            if (frames[first + i].motion.state == MotionState::missing)
+                warp.tracking_strength = 0;
         }
         // A bounded envelope eases into crop constraints without zoom breathing.
-        for (size_t i = first + 1; i < last; ++i)
-            output[i].strength = std::min(output[i].strength,
-                                          output[i - 1].strength + (frames[i].seconds - frames[i - 1].seconds) / 0.25);
-        for (size_t i = last - 1; i > first; --i)
-            output[i - 1].strength = std::min(output[i - 1].strength,
-                                              output[i].strength + (frames[i].seconds - frames[i - 1].seconds) / 0.25);
+        for (auto member : {&Warp::crop_strength, &Warp::tracking_strength}) {
+            for (size_t i = first + 1; i < last; ++i)
+                output[i].*member = std::min(output[i].*member, output[i - 1].*member +
+                                                                    (frames[i].seconds - frames[i - 1].seconds) / 0.25);
+            for (size_t i = last - 1; i > first; --i)
+                output[i - 1].*member = std::min(
+                    output[i - 1].*member, output[i].*member + (frames[i].seconds - frames[i - 1].seconds) / 0.25);
+        }
+        for (size_t i = first; i < last; ++i)
+            output[i].strength = std::min(output[i].crop_strength, output[i].tracking_strength);
         first = last;
     }
     return output;
