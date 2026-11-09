@@ -24,6 +24,7 @@ Usage: stillflow INPUT OUTPUT [options]
   --rs-strength N         Scanline correction gain, 0..1 (default 1)
   --crop FRACTION         Fixed crop on EACH edge, 0..0.25 (default 0.08)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
+  --gpu auto|cuda|off      Rendering backend (default auto)
   --crf N                 H.264 quality, 0..51 (default 18)
   --preset NAME           x264 encoding preset (default fast)
   --no-audio              Omit audio instead of stream copying
@@ -60,7 +61,11 @@ int integer(const std::string& text, const std::string& option, int low, int hig
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--version") {
-            std::cout << "stillflow " << STILLFLOW_VERSION << " (C++20, OpenCV " << CV_VERSION << ")\n";
+            std::cout << "stillflow " << STILLFLOW_VERSION << " (C++20, OpenCV " << CV_VERSION
+#ifdef STILLFLOW_CUDA_VERSION
+                      << ", CUDA " << STILLFLOW_CUDA_VERSION
+#endif
+                      << ")\n";
             return EXIT_SUCCESS;
         }
         if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--help")) {
@@ -88,6 +93,11 @@ int main(int argc, char** argv) {
             else if (option == "--rs-strength") o.rs_strength = bounded(value, option, 0, 1);
             else if (option == "--crop") o.crop = bounded(value, option, 0, 0.25);
             else if (option == "--preset") o.preset = value;
+            else if (option == "--gpu") {
+                if (value != "auto" && value != "cuda" && value != "off")
+                    throw std::runtime_error("--gpu must be auto, cuda or off");
+                o.gpu = value;
+            }
             else if (option == "--scan-axis") {
                 if (value != "auto" && value != "x" && value != "y")
                     throw std::runtime_error("--scan-axis must be auto, x or y");

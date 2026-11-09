@@ -129,12 +129,22 @@ ExternalProject_Add(dep_opencv ${common}
         -DWITH_OPENJPEG:BOOL=OFF -DWITH_JASPER:BOOL=OFF -DWITH_OPENEXR:BOOL=OFF -DWITH_AVIF:BOOL=OFF
     BUILD_COMMAND ${build_command})
 
+string(REPLACE ";" "|" cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+set(cuda_args "-DSTILLFLOW_WITH_CUDA:BOOL=${STILLFLOW_WITH_CUDA}")
+if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
+    list(APPEND cuda_args "-DCMAKE_CUDA_COMPILER:FILEPATH=${CMAKE_CUDA_COMPILER}"
+        "-DCMAKE_CUDA_ARCHITECTURES:STRING=${cuda_architectures}")
+    if(CMAKE_CUDA_HOST_COMPILER)
+        list(APPEND cuda_args "-DCMAKE_CUDA_HOST_COMPILER:FILEPATH=${CMAKE_CUDA_HOST_COMPILER}")
+    endif()
+endif()
 ExternalProject_Add(stillflow
     DEPENDS dep_opencv dep_ffmpeg dep_json
     SOURCE_DIR "${CMAKE_SOURCE_DIR}"
     BINARY_DIR "${CMAKE_BINARY_DIR}/app"
     DOWNLOAD_COMMAND ""
-    CMAKE_ARGS ${cmake_args}
+    LIST_SEPARATOR "|"
+    CMAKE_ARGS ${cmake_args} ${cuda_args}
         "-DSTILLFLOW_DEPS_ROOT:PATH=${prefix}"
         "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY:PATH=${CMAKE_BINARY_DIR}"
         "-DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_INSTALL_PREFIX}"

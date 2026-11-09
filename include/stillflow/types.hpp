@@ -20,6 +20,7 @@ struct Options {
     double rs_strength = 1.0;
     std::string scan_axis = "auto";
     std::string preset = "fast";
+    std::string gpu = "auto";
     bool rolling_shutter = true;
     bool audio = true;
     bool overwrite = false;

@@ -2,11 +2,11 @@
 
 [English](README.md) | 简体中文
 
-无需训练的离线视频防抖与卷帘快门晃动抑制，提供命令行处理、前后对比视频和分阶段性能报告。主机版本使用 CPU，适合验证效果和定位计算瓶颈。
+无需训练的离线视频防抖与卷帘快门晃动抑制，提供命令行处理、前后对比视频和分阶段性能报告。支持使用 NVIDIA GPU 加速坐标映射、边界检查和图像重采样。
 
 ## 构建
 
-Linux 环境需具备 C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。首次构建下载固定版本的源码、校验完整性，并在本地构建全部依赖库。
+Linux 环境需具备 C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。首次构建下载固定版本的源码、校验完整性，并在本地构建媒体与数值计算依赖。
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -15,6 +15,8 @@ cmake --build build
 
 每个依赖默认使用 12 个编译任务，可通过 `-DSTILLFLOW_BUILD_JOBS=N` 调整。增量构建复用已下载的源码和已编译的依赖。
 
+构建时自动检测 CUDA Toolkit；GPU 运行需要兼容的 NVIDIA 驱动。自定义工具包位置可通过 `CUDACXX` 指定 `nvcc`。使用 `-DSTILLFLOW_WITH_CUDA=OFF` 构建纯 CPU 版本。
+
 ## 使用
 
 处理视频并生成前后对比：
@@ -22,6 +24,8 @@ cmake --build build
 ```sh
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
+
+默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--gpu off` 强制使用 CPU，`--gpu cuda` 要求 CUDA 可用，失败时退出。性能报告记录实际后端、设备、处理帧数和回退原因；GPU 阶段耗时包含数据传输与同步。运动估计、轨迹优化和视频编解码使用 CPU。
 
 使用相同裁剪量对照扫描行修正效果；`--rs off` 保留相同运动估计，仅关闭扫描行补偿。性能比较时省略对比视频：
 

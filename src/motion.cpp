@@ -340,49 +340,61 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, cv::Size si
     return output;
 }
 
-void build_maps(const Warp& warp, cv::Size size, cv::Size output, double crop,
-    bool horizontal, cv::Mat& map_x, cv::Mat& map_y) {
-    map_x.create(output, CV_32F);
-    map_y.create(output, CV_32F);
+MapParameters prepare_map(const Warp& warp, cv::Size size, cv::Size output,
+    double crop, bool horizontal) {
+    MapParameters p;
+    p.horizontal = horizontal;
+    p.bands = static_cast<int>(warp.row_offset.size());
+    if (p.bands == 1 || p.bands > 32)
+        throw std::runtime_error("Scanline mapping requires zero or 2..32 bands");
     const auto inverse = scaled_global(warp, size, warp.strength).inv();
     const double sx = static_cast<double>(output.width - 1) / (size.width - 1);
     const double sy = static_cast<double>(output.height - 1) / (size.height - 1);
     // In global-inverse coordinates, the scan coordinate is a monotone piecewise
     // linear function. Invert that scalar function exactly, then subtract its
     // two-dimensional offset. No per-pixel iterative solver is needed.
-    const int bands = static_cast<int>(warp.row_offset.size());
-    std::vector<double> scan(bands);
-    std::vector<cv::Point2d> offsets(bands);
-    for (int i = 0; i < bands; ++i) {
+    for (int i = 0; i < p.bands; ++i) {
         const auto r = warp.row_offset[i] * warp.strength;
-        offsets[i] = {inverse(0, 0) * r.x + inverse(0, 1) * r.y,
-                      inverse(1, 0) * r.x + inverse(1, 1) * r.y};
-        scan[i] = static_cast<double>((horizontal ? size.width : size.height) - 1) * i / (bands - 1)
-            + (horizontal ? offsets[i].x : offsets[i].y);
-        if (i && scan[i] <= scan[i - 1]) throw std::runtime_error("Scanline mapping is not invertible");
+        p.offset_x[i] = (inverse(0, 0) * r.x + inverse(0, 1) * r.y) * sx;
+        p.offset_y[i] = (inverse(1, 0) * r.x + inverse(1, 1) * r.y) * sy;
+        p.scan[i] = static_cast<double>((horizontal ? output.width : output.height) - 1) * i / (p.bands - 1)
+            + (horizontal ? p.offset_x[i] : p.offset_y[i]);
+        if (i && p.scan[i] <= p.scan[i - 1]) throw std::runtime_error("Scanline mapping is not invertible");
     }
     const double dx = (1 - 2 * crop) * (size.width - 1) / (output.width - 1);
-    const double tx = crop * (size.width - 1);
+    const double dy = (1 - 2 * crop) * (size.height - 1) / (output.height - 1);
+    const auto origin = transform(inverse, {crop * (size.width - 1), crop * (size.height - 1)});
+    p.origin_x = origin.x * sx; p.origin_y = origin.y * sy;
+    p.xx = inverse(0, 0) * dx * sx; p.xy = inverse(0, 1) * dy * sx;
+    p.yx = inverse(1, 0) * dx * sy; p.yy = inverse(1, 1) * dy * sy;
+    return p;
+}
+
+void build_maps(const Warp& warp, cv::Size size, cv::Size output, double crop,
+    bool horizontal, cv::Mat& map_x, cv::Mat& map_y) {
+    map_x.create(output, CV_32F);
+    map_y.create(output, CV_32F);
+    const auto m = prepare_map(warp, size, output, crop, horizontal);
     cv::parallel_for_(cv::Range(0, output.height), [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
             auto* mx = map_x.ptr<float>(y);
             auto* my = map_y.ptr<float>(y);
-            const double ty = (crop + static_cast<double>(y) / (output.height - 1) * (1 - 2 * crop)) * (size.height - 1);
-            auto u = transform(inverse, {tx, ty});
+            cv::Point2d u(m.origin_x + y * m.xy, m.origin_y + y * m.yy);
             int band = 0;
             for (int x = 0; x < output.width; ++x) {
                 auto p = u;
-                if (bands) {
+                if (m.bands) {
                     const double coordinate = horizontal ? u.x : u.y;
-                    while (band < bands - 2 && coordinate > scan[band + 1]) ++band;
-                    while (band > 0 && coordinate < scan[band]) --band;
-                    const double t = std::clamp((coordinate - scan[band]) / (scan[band + 1] - scan[band]), 0.0, 1.0);
-                    p -= offsets[band] * (1 - t) + offsets[band + 1] * t;
+                    while (band < m.bands - 2 && coordinate > m.scan[band + 1]) ++band;
+                    while (band > 0 && coordinate < m.scan[band]) --band;
+                    const double t = std::clamp((coordinate - m.scan[band]) / (m.scan[band + 1] - m.scan[band]), 0.0, 1.0);
+                    p.x -= m.offset_x[band] * (1 - t) + m.offset_x[band + 1] * t;
+                    p.y -= m.offset_y[band] * (1 - t) + m.offset_y[band + 1] * t;
                 }
-                mx[x] = static_cast<float>(p.x * sx);
-                my[x] = static_cast<float>(p.y * sy);
-                u.x += inverse(0, 0) * dx;
-                u.y += inverse(1, 0) * dx;
+                mx[x] = static_cast<float>(p.x);
+                my[x] = static_cast<float>(p.y);
+                u.x += m.xx;
+                u.y += m.yx;
             }
         }
     });

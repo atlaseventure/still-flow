@@ -2,6 +2,7 @@
 #include "stillflow/media.hpp"
 #include "stillflow/motion.hpp"
 #include "stillflow/profile.hpp"
+#include "stillflow/renderer.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -58,11 +59,6 @@ cv::Mat gray_proxy(const cv::Mat& image, cv::Size size) {
     return small;
 }
 
-double invalid_fraction(const cv::Mat& x, const cv::Mat& y, cv::Size size) {
-    cv::Mat bad = (x < 0) | (x > size.width - 1) | (y < 0) | (y > size.height - 1);
-    return static_cast<double>(cv::countNonZero(bad)) / size.area();
-}
-
 void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, const std::vector<Warp>& warps) {
     std::ofstream file(path);
     file.exceptions(std::ios::badbit | std::ios::failbit);
@@ -92,6 +88,9 @@ int run(const Options& options) {
     cv::setRNGSeed(42);
     av_log_set_level(AV_LOG_WARNING);
     Profile profile;
+    const auto backend_start = Clock::now();
+    FrameRenderer renderer(options.gpu);
+    profile.add("render.backend_init", milliseconds(backend_start));
     VideoInfo info;
     cv::Size analysis_size;
     std::vector<FrameMotion> frames;
@@ -159,7 +158,7 @@ int run(const Options& options) {
             if (compare_writer) compare_writer->audio(packet);
         });
         VideoFrame frame;
-        cv::Mat map_x, map_y, stabilized;
+        cv::Mat stabilized;
         std::unique_ptr<cv::FontFace> label_font;
         if (compare_writer) label_font = std::make_unique<cv::FontFace>("sans");
         for (;;) {
@@ -169,21 +168,7 @@ int run(const Options& options) {
             if (rendered >= frames.size() || std::abs((frame.pts_us - origin) / 1000000.0 - frames[rendered].seconds) > 0.000001)
                 throw std::runtime_error("Input changed between analysis and render passes");
             auto& warp = warps[rendered];
-            {
-                ScopeTimer timer(profile, "render.map");
-                for (int attempt = 0; ; ++attempt) {
-                    build_maps(warp, analysis_size, size, options.crop, horizontal, map_x, map_y);
-                    warp.invalid_fraction = invalid_fraction(map_x, map_y, size);
-                    if (warp.invalid_fraction == 0) break;
-                    // Dense validation is the final authority after sparse crop planning.
-                    warp.strength = attempt < 3 ? warp.strength * 0.75 : 0;
-                    if (attempt > 4) throw std::runtime_error("Cannot construct a valid crop");
-                }
-            }
-            {
-                ScopeTimer timer(profile, "render.remap");
-                cv::remap(frame.bgr, stabilized, map_x, map_y, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
-            }
+            renderer.render(frame.bgr, stabilized, warp, analysis_size, options.crop, horizontal, profile);
             const auto duration = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
             { ScopeTimer timer(profile, "render.encode"); writer.video(stabilized, frame.pts_us, duration); }
             if (compare_writer) {
@@ -214,6 +199,7 @@ int run(const Options& options) {
         {"schema_version", 1}, {"version", STILLFLOW_VERSION},
         {"input", fs::absolute(options.input).string()}, {"output", fs::absolute(options.output).string()},
         {"frames_csv", fs::absolute(frames_path).string()},
+        {"acceleration", renderer.report()},
         {"video", {{"width", info.width}, {"height", info.height}, {"nominal_fps", info.fps},
             {"frames", frames.size()}, {"duration_s", duration}, {"input_codec", info.codec},
             {"display_rotation_applied", info.rotation}, {"analysis_width", analysis_size.width}, {"analysis_height", analysis_size.height}}},

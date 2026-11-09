@@ -2,11 +2,11 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Offline video stabilization and rolling shutter wobble suppression without training. Includes a command-line interface, comparison videos, and performance reports by processing stage. The host version runs on the CPU for quality evaluation and profiling.
+Offline video stabilization and rolling shutter wobble suppression without training. Includes a command-line interface, comparison videos, and performance reports by processing stage. NVIDIA GPUs can accelerate coordinate mapping, boundary checks, and image resampling.
 
 ## Build
 
-On Linux, provide a C++20 compiler, CMake, Ninja, Make, pkg-config, Python, and Perl. The first build downloads verified, pinned sources and builds all library dependencies locally.
+On Linux, provide a C++20 compiler, CMake, Ninja, Make, pkg-config, Python, and Perl. The first build downloads verified, pinned sources and builds media and numerical dependencies locally.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -15,6 +15,8 @@ cmake --build build
 
 Dependencies use 12 compilation jobs each; adjust with `-DSTILLFLOW_BUILD_JOBS=N`. Incremental builds reuse downloaded sources and compiled libraries.
 
+The build detects the CUDA Toolkit automatically; GPU execution requires a compatible NVIDIA driver. Set `CUDACXX` to `nvcc` for a custom toolkit location. Use `-DSTILLFLOW_WITH_CUDA=OFF` for a CPU-only build.
+
 ## Usage
 
 Process a video and generate a side-by-side comparison:
@@ -22,6 +24,8 @@ Process a video and generate a side-by-side comparison:
 ```sh
 ./build/stillflow input.mp4 output.mp4 --compare comparison.mp4
 ```
+
+CUDA is selected automatically, with CPU fallback when unavailable or if execution fails. `--gpu off` forces CPU rendering; `--gpu cuda` requires CUDA and exits on failure. Reports record the actual backend, device, frame counts, and fallback reason; GPU timings include transfers and synchronization. Motion estimation, trajectory optimization, and video codecs run on the CPU.
 
 Compare scanline correction with the same crop. `--rs off` keeps the same motion estimation and disables scanline compensation. Omit the comparison video when benchmarking:
 

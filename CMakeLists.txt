@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.28)
 project(still_flow VERSION 0.1.0 LANGUAGES C CXX)
 
+option(STILLFLOW_WITH_CUDA "Build CUDA rendering when a toolkit is available" ON)
+if(STILLFLOW_WITH_CUDA)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA architectures" FORCE)
+    endif()
+    include(CheckLanguage)
+    check_language(CUDA)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -45,7 +54,17 @@ target_link_options(stillflow_ffmpeg INTERFACE ${FFMPEG_STATIC_LDFLAGS_OTHER})
 add_library(stillflow_core
     src/media.cpp
     src/motion.cpp
+    src/renderer.cpp
     src/stabilizer.cpp)
+if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    target_sources(stillflow_core PRIVATE src/renderer_cuda.cu)
+    target_compile_definitions(stillflow_core PRIVATE STILLFLOW_HAVE_CUDA)
+    target_compile_definitions(stillflow_core PUBLIC
+        STILLFLOW_CUDA_VERSION="${CMAKE_CUDA_COMPILER_VERSION}")
+    set_target_properties(stillflow_core PROPERTIES CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
+endif()
 target_include_directories(stillflow_core PUBLIC include ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(stillflow_core PUBLIC ${OpenCV_LIBS} Eigen3::Eigen
     nlohmann_json::nlohmann_json stillflow_ffmpeg)
@@ -55,7 +74,7 @@ add_executable(stillflow src/main.cpp)
 target_link_libraries(stillflow PRIVATE stillflow_core)
 foreach(target stillflow_core stillflow)
     target_compile_options(${target} PRIVATE
-        $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 endforeach()
 
 include(GNUInstallDirs)
