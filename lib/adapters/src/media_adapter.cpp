@@ -1,6 +1,7 @@
 #include "image.hpp"
 #include "media.hpp"
 #include "stillflow/adapters/backends.hpp"
+#include <mutex>
 #include <stdexcept>
 
 namespace stillflow {
@@ -24,6 +25,29 @@ class FfmpegAudioPacket final : public AudioPacket {
   private:
     AVPacket* owned_ = nullptr;
 };
+// A decoded frame left in device memory. Host mappings convert it once, on
+// first use, with the same conversion the reader applies to host frames.
+class DecodedDeviceImage final : public ImageData {
+  public:
+    DecodedDeviceImage(std::shared_ptr<const DeviceFrame> frame, Size size) : frame_(std::move(frame)), size_(size) {}
+    Size size() const override { return size_; }
+    PixelFormat format() const override { return PixelFormat::bgr8; }
+    HostImageView map_read() const override {
+        std::call_once(converted_, [&] { host_ = image(frame_->download()); });
+        return host_->map_read();
+    }
+    std::optional<NativeImageView> native_read(std::string_view api) const override {
+        if (api != cuda_image_api)
+            return std::nullopt;
+        return NativeImageView{std::string(api), &frame_->descriptor(), frame_};
+    }
+
+  private:
+    std::shared_ptr<const DeviceFrame> frame_;
+    Size size_;
+    mutable std::once_flag converted_;
+    mutable Image host_;
+};
 class FfmpegReader final : public VideoReader {
   public:
     FfmpegReader(const std::filesystem::path& path, int threads, const CodecRequest& decoder, HardwareDevices& devices)
@@ -35,7 +59,10 @@ class FfmpegReader final : public VideoReader {
         DecodedFrame decoded;
         if (!reader.next(decoded))
             return false;
-        frame = {image(std::move(decoded.bgr)), decoded.pts_us, decoded.duration_us};
+        const Size size(reader.info().width, reader.info().height);
+        auto pixels = decoded.device ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size)
+                                     : image(std::move(decoded.bgr));
+        frame = {std::move(pixels), decoded.pts_us, decoded.duration_us};
         return true;
     }
     const VideoInfo& info() const override { return reader.info(); }
@@ -55,6 +82,15 @@ class FfmpegWriter final : public VideoWriter {
         : writer_(path, {size.width, size.height}, fps, dynamic_cast<FfmpegReader&>(source).reader.context(), origin,
                   options.threads, options.crf, options.preset, options.audio, encoder, devices) {}
     void video(const Image& input, int64_t pts, int64_t duration) override {
+        if (!input)
+            throw std::invalid_argument("Missing video frame");
+        if (auto native = input->native_read(cuda_image_api); native && native->handle && native->lifetime) {
+            const auto& device = *static_cast<const CudaImage*>(native->handle);
+            if (writer_.accepts(device)) {
+                writer_.video(device, std::move(native->lifetime), pts, duration);
+                return;
+            }
+        }
         auto view = read_pixels(input);
         if (view.mapping.format != PixelFormat::bgr8)
             throw std::invalid_argument("Video writer requires BGR8 input");

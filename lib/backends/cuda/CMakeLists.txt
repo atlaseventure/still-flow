@@ -1,4 +1,4 @@
-add_library(stillflow_backend_cuda STATIC src/renderer.cu)
+add_library(stillflow_backend_cuda STATIC src/frames.cu src/renderer.cu src/image_processing.cu)
 add_library(StillFlow::backend_cuda ALIAS stillflow_backend_cuda)
 set_target_properties(
     stillflow_backend_cuda

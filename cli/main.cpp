@@ -196,6 +196,9 @@ int main(int argc, char** argv) {
             o.report = o.output.string() + ".profile.json";
         auto media = stillflow::make_media_factory();
         auto images = stillflow::make_image_processing();
+#ifdef STILLFLOW_CLI_CUDA
+        images = stillflow::make_cuda_image_processing(std::move(images));
+#endif
         std::vector<stillflow::BackendProvider> providers;
 #ifdef STILLFLOW_CLI_CUDA
         providers.push_back({"cuda", stillflow::make_cuda_backend, true});

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "stillflow/application/cuda_image.hpp"
 #include "stillflow/application/media.hpp"
 #include <filesystem>
 #include <functional>
@@ -14,25 +15,54 @@ extern "C" {
 
 namespace stillflow {
 // One CUDA device context, created on first use and shared by every reader and
-// writer of a media factory so NVDEC and NVENC sessions share one context.
+// writer of a media factory so NVDEC and NVENC sessions share one context. It is
+// the device's primary context, which the CUDA runtime also uses, so decoded
+// and rendered frames can be exchanged as device pointers.
 class HardwareDevices {
   public:
-    HardwareDevices() = default;
+    HardwareDevices();
     ~HardwareDevices();
     HardwareDevices(const HardwareDevices&) = delete;
     HardwareDevices& operator=(const HardwareDevices&) = delete;
     // Returns a new reference, or nullptr with the reason in error.
     AVBufferRef* cuda(std::string& error);
+    // Waits for copies FFmpeg queued on the device context's stream.
+    void synchronize();
 
   private:
+    struct Driver;
     std::mutex mutex_;
+    std::unique_ptr<Driver> driver_;
     AVBufferRef* cuda_ = nullptr;
     bool attempted_ = false;
     std::string error_;
 };
 
+// Converts decoded frames (host or CUDA) to packed, display-rotated BGR. Safe
+// to call from several threads; conversions are serialized.
+class HostConverter;
+
+// An NVDEC frame kept in device memory. download() produces the same BGR image
+// the host path would have and may run on any thread.
+class DeviceFrame {
+  public:
+    // References (does not take) frame.
+    DeviceFrame(const AVFrame* frame, std::shared_ptr<HostConverter> converter, int rotation);
+    ~DeviceFrame();
+    DeviceFrame(const DeviceFrame&) = delete;
+    DeviceFrame& operator=(const DeviceFrame&) = delete;
+    [[nodiscard]] const CudaImage& descriptor() const { return descriptor_; }
+    [[nodiscard]] cv::Mat download() const;
+
+  private:
+    AVFrame* frame_;
+    std::shared_ptr<HostConverter> converter_;
+    CudaImage descriptor_;
+};
+
 struct DecodedFrame {
-    cv::Mat bgr;
+    cv::Mat bgr;                               // Host frames.
+    std::shared_ptr<const DeviceFrame> device; // NVDEC frames left on the GPU.
     int64_t pts_us = 0, duration_us = 0;
 };
 
@@ -62,6 +92,10 @@ class Writer {
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
     void video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us);
+    // Whether video(image, ...) can encode this device image without a copy.
+    [[nodiscard]] bool accepts(const CudaImage& image) const;
+    // Encodes device memory in place; lifetime is held until NVENC has read it.
+    void video(const CudaImage& image, std::shared_ptr<const void> lifetime, int64_t pts_us, int64_t duration_us);
     void audio(const AVPacket* packet);
     void finish();
     [[nodiscard]] const CodecReport& codec() const;

@@ -73,7 +73,7 @@ python3 scripts/generate_video.py --output .local/synthetic --frames 60
 
 默认自动使用 CUDA，不可用或执行失败时回退到 CPU。`--backend cpu` 强制使用 CPU，`--backend cuda` 要求 CUDA 可用，失败时退出。性能报告按后端记录设备、能力、处理帧数和失败原因；渲染阶段耗时包含数据传输与同步。运动估计和轨迹优化使用 CPU。
 
-使用 CUDA 渲染时，`--decoder auto` 和 `--encoder auto` 采用 NVDEC 和 NVENC；硬件不可用或不支持某路视频流时（例如 H.264 4:4:4，或宽度超过 4096 像素的对比视频），该路流单独回退到 CPU 编解码。`--decoder nvdec` 和 `--encoder nvenc` 要求使用硬件，失败时退出；`cpu` 和 `x264` 强制使用软件编解码。NVDEC 与 CPU 解码得到相同的帧，因此分析和渲染结果不变。NVENC 使用恒定质量 VBR：`--crf` 设置 CQ 级别，x264 的 `--preset` 名称映射到 NVENC 的 `p1`..`p7`，也可直接指定 `p1`..`p7`。相同数值下码率与 x264 不同。性能报告列出每路流的编解码器、硬件处理帧数和回退原因。
+使用 CUDA 渲染时，`--decoder auto` 和 `--encoder auto` 采用 NVDEC 和 NVENC；硬件不可用或不支持某路视频流时（例如 H.264 4:4:4，或宽度超过 4096 像素的对比视频），该路流单独回退到 CPU 编解码。`--decoder nvdec` 和 `--encoder nvenc` 要求使用硬件，失败时退出；`cpu` 和 `x264` 强制使用软件编解码。NVDEC 解码的帧保留在显存中：分析阶段只下载缩小后的亮度平面，CUDA 渲染直接采样 NV12 平面，NVENC 原地读取渲染结果（对比视频也在 GPU 上合成）。只有 CPU 渲染或 x264 编码等需要主机像素的阶段才会在主机上转换。GPU 颜色转换的舍入方式与 swscale 不同，分析使用亮度而非 BGR 灰度，因此输出与 CPU 路径非常接近但不逐字节一致。CPU 渲染配合 CPU 解码和 x264 的输出保持不变。NVENC 使用恒定质量 VBR：`--crf` 设置 CQ 级别，x264 的 `--preset` 名称映射到 NVENC 的 `p1`..`p7`，也可直接指定 `p1`..`p7`。相同数值下码率与 x264 不同。性能报告列出每路流的编解码器、硬件处理帧数和回退原因。
 
 使用相同裁剪量对照扫描行修正效果；`--rs off` 保留相同运动估计，仅关闭扫描行补偿。性能比较时省略对比视频：
 

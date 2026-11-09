@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
@@ -13,9 +14,19 @@ extern "C" {
 #include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
+// nv-codec-headers ship only with NVIDIA codec support; they load the driver
+// API at runtime, so builds still need no CUDA Toolkit.
+#if __has_include(<ffnvcodec/dynlink_loader.h>)
+#define STILLFLOW_CUDA_DRIVER 1
+#define FFNV_LOG_FUNC(logctx, msg, ...) av_log(logctx, AV_LOG_ERROR, msg, __VA_ARGS__)
+#define FFNV_DEBUG_LOG_FUNC(logctx, msg, ...) av_log(logctx, AV_LOG_DEBUG, msg, __VA_ARGS__)
+#include <ffnvcodec/dynlink_loader.h>
+#include <libavutil/hwcontext_cuda.h>
+#endif
 }
 
 namespace stillflow {
@@ -112,7 +123,50 @@ SwsContext* make_scaler(int width, int height, AVPixelFormat source, AVPixelForm
     }
     return sws;
 }
+// Colour matrix and chroma siting of a decoded frame, as the device descriptor states them.
+void describe_colour(const AVFrame* frame, CudaImage& image) {
+    switch (frame->colorspace) {
+    case AVCOL_SPC_BT709:
+        image.kr = 0.2126f, image.kb = 0.0722f;
+        break;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL:
+        image.kr = 0.2627f, image.kb = 0.0593f;
+        break;
+    case AVCOL_SPC_FCC:
+        image.kr = 0.30f, image.kb = 0.11f;
+        break;
+    default: // Matches colorspace(): everything else converts as BT.601.
+        image.kr = 0.299f, image.kb = 0.114f;
+    }
+    image.full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    switch (frame->chroma_location) {
+    case AVCHROMA_LOC_CENTER:
+        image.chroma_x = 0.5f, image.chroma_y = 0.5f;
+        break;
+    case AVCHROMA_LOC_TOPLEFT:
+        image.chroma_x = 0, image.chroma_y = 0;
+        break;
+    case AVCHROMA_LOC_TOP:
+        image.chroma_x = 0.5f, image.chroma_y = 0;
+        break;
+    case AVCHROMA_LOC_BOTTOMLEFT:
+        image.chroma_x = 0, image.chroma_y = 1;
+        break;
+    case AVCHROMA_LOC_BOTTOM:
+        image.chroma_x = 0.5f, image.chroma_y = 1;
+        break;
+    default: // Left, the H.264/HEVC default when unspecified.
+        image.chroma_x = 0, image.chroma_y = 0.5f;
+    }
+}
+AVPixelFormat software_format(const AVFrame* frame) {
+    if (frame->format == AV_PIX_FMT_CUDA && frame->hw_frames_ctx)
+        return reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data)->sw_format;
+    return static_cast<AVPixelFormat>(frame->format);
+}
 void keep_pixels(void*, uint8_t*) {}
+void release_lifetime(void* lifetime, uint8_t*) { delete static_cast<std::shared_ptr<const void>*>(lifetime); }
 // References caller-owned packed pixels without copying; swscale requires
 // reference-counted frames and would otherwise duplicate the image.
 void borrow(AVFrame* frame, uint8_t* data, size_t stride, int width, int height, AVPixelFormat format) {
@@ -128,14 +182,66 @@ void borrow(AVFrame* frame, uint8_t* data, size_t stride, int width, int height,
 }
 } // namespace
 
+#ifdef STILLFLOW_CUDA_DRIVER
+struct HardwareDevices::Driver {
+    CudaFunctions* cu = nullptr;
+    CUdevice device = 0;
+    CUcontext context = nullptr;
+    ~Driver() {
+        if (context)
+            cu->cuDevicePrimaryCtxRelease(device);
+        cuda_free_functions(&cu);
+    }
+    void push() const {
+        if (const auto result = cu->cuCtxPushCurrent(context))
+            throw std::runtime_error("Activate CUDA context: driver error " + std::to_string(result));
+    }
+    void pop() const {
+        CUcontext popped = nullptr;
+        cu->cuCtxPopCurrent(&popped);
+    }
+};
+#else
+struct HardwareDevices::Driver {};
+#endif
+
+HardwareDevices::HardwareDevices() : driver_(std::make_unique<Driver>()) {}
 HardwareDevices::~HardwareDevices() { av_buffer_unref(&cuda_); }
 AVBufferRef* HardwareDevices::cuda(std::string& error) {
     std::lock_guard lock(mutex_);
     if (!attempted_) {
         attempted_ = true;
-        const int created = av_hwdevice_ctx_create(&cuda_, AV_HWDEVICE_TYPE_CUDA, "0", nullptr, 0);
-        if (created < 0)
-            error_ = "CUDA device unavailable for video codecs: " + error_text(created);
+#ifdef STILLFLOW_CUDA_DRIVER
+        // FFmpeg's own primary-context mode rejects a context the CUDA runtime
+        // already activated with other flags, so retain it here and hand it
+        // over as the current context instead.
+        auto& d = *driver_;
+        const auto failed = [](const char* operation, int result) {
+            return std::string("CUDA device unavailable for video codecs: ") + operation + " failed (driver error " +
+                   std::to_string(result) + ")";
+        };
+        if (cuda_load_functions(&d.cu, nullptr) < 0)
+            error_ = "CUDA driver unavailable for video codecs";
+        else if (const auto init = d.cu->cuInit(0))
+            error_ = failed("cuInit", init);
+        else if (const auto get = d.cu->cuDeviceGet(&d.device, 0))
+            error_ = failed("cuDeviceGet", get);
+        else if (const auto retain = d.cu->cuDevicePrimaryCtxRetain(&d.context, d.device)) {
+            d.context = nullptr;
+            error_ = failed("cuDevicePrimaryCtxRetain", retain);
+        } else {
+            AVDictionary* options = nullptr;
+            av_dict_set(&options, "current_ctx", "1", 0);
+            d.push();
+            const int created = av_hwdevice_ctx_create(&cuda_, AV_HWDEVICE_TYPE_CUDA, "0", options, 0);
+            d.pop();
+            av_dict_free(&options);
+            if (created < 0)
+                error_ = "CUDA device unavailable for video codecs: " + error_text(created);
+        }
+#else
+        error_ = "FFmpeg was built without NVIDIA codec support";
+#endif
     }
     if (!cuda_) {
         error = error_;
@@ -146,31 +252,138 @@ AVBufferRef* HardwareDevices::cuda(std::string& error) {
         throw std::bad_alloc();
     return reference;
 }
+void HardwareDevices::synchronize() {
+#ifdef STILLFLOW_CUDA_DRIVER
+    if (!cuda_)
+        return;
+    const auto& d = *driver_;
+    const auto* device =
+        static_cast<const AVCUDADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(cuda_->data)->hwctx);
+    d.push();
+    const auto result = d.cu->cuStreamSynchronize(device->stream);
+    d.pop();
+    if (result)
+        throw std::runtime_error("Complete CUDA frame copy: driver error " + std::to_string(result));
+#endif
+}
+
+class HostConverter {
+  public:
+    HostConverter(int threads, int rotation) : threads_(threads), rotation_(rotation) {
+        converted_ = av_frame_alloc();
+        transferred_ = av_frame_alloc();
+        planar_ = av_frame_alloc();
+        if (!converted_ || !transferred_ || !planar_) {
+            release();
+            throw std::bad_alloc();
+        }
+    }
+    ~HostConverter() { release(); }
+    HostConverter(const HostConverter&) = delete;
+    HostConverter& operator=(const HostConverter&) = delete;
+    cv::Mat convert(const AVFrame* frame);
+
+  private:
+    void release() {
+        sws_freeContext(scaler_);
+        av_frame_free(&planar_);
+        av_frame_free(&transferred_);
+        av_frame_free(&converted_);
+    }
+    std::mutex mutex_;
+    AVFrame* converted_ = nullptr;
+    AVFrame* transferred_ = nullptr; // NVDEC frame copied to host memory.
+    AVFrame* planar_ = nullptr;      // transferred with chroma split into planes.
+    SwsContext* scaler_ = nullptr;
+    int scaler_format_ = AV_PIX_FMT_NONE;
+    int threads_, rotation_;
+};
+
+// frame carries colour metadata; pixels is the host image to convert.
+cv::Mat HostConverter::convert(const AVFrame* frame) {
+    std::lock_guard lock(mutex_);
+    const AVFrame* pixels = frame;
+    if (frame->format == AV_PIX_FMT_CUDA) {
+        av_frame_unref(transferred_);
+        check(av_hwframe_transfer_data(transferred_, frame, 0), "Download NVDEC frame");
+        pixels = transferred_;
+        const auto planar =
+            planar_equivalent(static_cast<AVPixelFormat>(pixels->format), frame->color_range == AVCOL_RANGE_JPEG);
+        if (planar != AV_PIX_FMT_NONE) {
+            if (planar_->format != planar || planar_->width != pixels->width || planar_->height != pixels->height) {
+                av_frame_unref(planar_);
+                planar_->format = planar;
+                planar_->width = pixels->width;
+                planar_->height = pixels->height;
+                check(av_frame_get_buffer(planar_, 0), "Allocate NVDEC conversion frame");
+            }
+            deinterleave(pixels, planar_);
+            pixels = planar_;
+        }
+    }
+    // Frame dimensions are fixed by the reader; only the pixel format may change.
+    if (!scaler_ || scaler_format_ != pixels->format) {
+        sws_freeContext(scaler_);
+        scaler_ = nullptr;
+        scaler_ = make_scaler(pixels->width, pixels->height, static_cast<AVPixelFormat>(pixels->format),
+                              AV_PIX_FMT_BGR24, SWS_BILINEAR, threads_, "Create decoder color converter");
+        scaler_format_ = pixels->format;
+    }
+    const int* coefficients = sws_getCoefficients(colorspace(frame->colorspace));
+    check(sws_setColorspaceDetails(scaler_, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0,
+                                   1 << 16, 1 << 16),
+          "Set input colorspace");
+    cv::Mat raw(frame->height, frame->width, CV_8UC3), output;
+    borrow(converted_, raw.data, raw.step, raw.cols, raw.rows, AV_PIX_FMT_BGR24);
+    const int converted = sws_scale_frame(scaler_, converted_, pixels);
+    av_frame_unref(converted_);
+    check(converted, "Convert decoded frame");
+    switch (rotation_) {
+    case 90:
+        cv::rotate(raw, output, cv::ROTATE_90_CLOCKWISE);
+        return output;
+    case 180:
+        cv::rotate(raw, output, cv::ROTATE_180);
+        return output;
+    case 270:
+        cv::rotate(raw, output, cv::ROTATE_90_COUNTERCLOCKWISE);
+        return output;
+    default:
+        return raw;
+    }
+}
+
+DeviceFrame::DeviceFrame(const AVFrame* frame, std::shared_ptr<HostConverter> converter, int rotation)
+    : frame_(av_frame_clone(frame)), converter_(std::move(converter)) {
+    if (!frame_)
+        throw std::bad_alloc();
+    descriptor_.coded = {frame_->width, frame_->height};
+    descriptor_.rotation = rotation;
+    descriptor_.luma = frame_->data[0];
+    descriptor_.chroma = frame_->data[1];
+    descriptor_.luma_pitch = static_cast<size_t>(frame_->linesize[0]);
+    descriptor_.chroma_pitch = static_cast<size_t>(frame_->linesize[1]);
+    describe_colour(frame_, descriptor_);
+}
+DeviceFrame::~DeviceFrame() { av_frame_free(&frame_); }
+cv::Mat DeviceFrame::download() const { return converter_->convert(frame_); }
 
 struct Reader::Impl {
     AVFormatContext* format = nullptr;
     AVCodecContext* decoder = nullptr;
     AVFrame* frame = nullptr;
-    AVFrame* converted = nullptr;
-    AVFrame* transferred = nullptr; // NVDEC frame copied to host memory.
-    AVFrame* planar = nullptr;      // transferred with chroma split into planes.
+    std::shared_ptr<HostConverter> converter;
+    HardwareDevices* devices = nullptr;
     CodecReport codec;
     bool require_hardware = false, reported_software = false;
     AVPacket* packet = nullptr;
-    SwsContext* scaler = nullptr;
-    int scaler_format = AV_PIX_FMT_NONE;
-    int threads = 1;
     int video_stream = -1;
     bool draining = false;
     int64_t last_pts = AV_NOPTS_VALUE;
     VideoInfo info;
     std::function<void(const AVPacket*)> audio_callback;
     ~Impl() {
-        sws_freeContext(scaler);
         av_packet_free(&packet);
-        av_frame_free(&planar);
-        av_frame_free(&transferred);
-        av_frame_free(&converted);
         av_frame_free(&frame);
         avcodec_free_context(&decoder);
         avformat_close_input(&format);
@@ -191,7 +404,7 @@ Reader::Reader(const std::filesystem::path& path, int threads, const CodecReques
         throw std::bad_alloc();
     check(avcodec_parameters_to_context(s.decoder, stream->codecpar), "Set decoder parameters");
     s.decoder->thread_count = threads;
-    s.threads = threads;
+    s.devices = &devices;
     s.decoder->err_recognition = AV_EF_CAREFUL | AV_EF_EXPLODE;
     s.codec.request = request;
     s.codec.implementation = codec->name;
@@ -242,12 +455,10 @@ Reader::Reader(const std::filesystem::path& path, int threads, const CodecReques
         std::swap(s.info.width, s.info.height);
         s.info.horizontal_scan = true;
     }
+    s.converter = std::make_shared<HostConverter>(threads, s.info.rotation);
     s.frame = av_frame_alloc();
-    s.converted = av_frame_alloc();
-    s.transferred = av_frame_alloc();
-    s.planar = av_frame_alloc();
     s.packet = av_packet_alloc();
-    if (!s.frame || !s.converted || !s.transferred || !s.planar || !s.packet)
+    if (!s.frame || !s.packet)
         throw std::bad_alloc();
 }
 
@@ -299,29 +510,11 @@ bool Reader::next(DecodedFrame& output) {
             av_packet_unref(s.packet);
         }
     }
-    // frame carries timing and colour metadata; pixels is the host image to convert.
     const AVFrame* frame = s.frame;
-    const AVFrame* pixels = frame;
     ++s.codec.frames;
-    if (frame->format == AV_PIX_FMT_CUDA) {
+    if (frame->format == AV_PIX_FMT_CUDA)
         ++s.codec.hardware_frames;
-        av_frame_unref(s.transferred);
-        check(av_hwframe_transfer_data(s.transferred, frame, 0), "Download NVDEC frame");
-        pixels = s.transferred;
-        const auto planar =
-            planar_equivalent(static_cast<AVPixelFormat>(pixels->format), frame->color_range == AVCOL_RANGE_JPEG);
-        if (planar != AV_PIX_FMT_NONE) {
-            if (s.planar->format != planar || s.planar->width != pixels->width || s.planar->height != pixels->height) {
-                av_frame_unref(s.planar);
-                s.planar->format = planar;
-                s.planar->width = pixels->width;
-                s.planar->height = pixels->height;
-                check(av_frame_get_buffer(s.planar, 0), "Allocate NVDEC conversion frame");
-            }
-            deinterleave(pixels, s.planar);
-            pixels = s.planar;
-        }
-    } else if (s.decoder->hw_device_ctx && !s.reported_software) {
+    else if (s.decoder->hw_device_ctx && !s.reported_software) {
         if (s.require_hardware)
             throw std::runtime_error("NVDEC cannot decode this stream (unsupported profile, chroma format or size)");
         s.codec.fallbacks.push_back("NVDEC rejected the stream; decoding in software");
@@ -331,7 +524,8 @@ bool Reader::next(DecodedFrame& output) {
     if (frame->width != (transposed ? s.info.height : s.info.width) ||
         frame->height != (transposed ? s.info.width : s.info.height))
         throw std::runtime_error("Changing video resolution is not supported");
-    const auto* description = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(pixels->format));
+    const auto format = software_format(frame);
+    const auto* description = av_pix_fmt_desc_get(format);
     if (!description || description->comp[0].depth > 8 || frame->color_trc == AVCOL_TRC_SMPTE2084 ||
         frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
         throw std::runtime_error(
@@ -347,35 +541,14 @@ bool Reader::next(DecodedFrame& output) {
     s.last_pts = output.pts_us;
     output.duration_us = frame->duration > 0 ? av_rescale_q(frame->duration, time_base, microseconds)
                                              : static_cast<int64_t>(std::llround(1000000 / s.info.fps));
-    // Frame dimensions are fixed (checked above); only the pixel format may change.
-    if (!s.scaler || s.scaler_format != pixels->format) {
-        sws_freeContext(s.scaler);
-        s.scaler = nullptr;
-        s.scaler = make_scaler(pixels->width, pixels->height, static_cast<AVPixelFormat>(pixels->format),
-                               AV_PIX_FMT_BGR24, SWS_BILINEAR, s.threads, "Create decoder color converter");
-        s.scaler_format = pixels->format;
-    }
-    const int* coefficients = sws_getCoefficients(colorspace(frame->colorspace));
-    check(sws_setColorspaceDetails(s.scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0,
-                                   1 << 16, 1 << 16),
-          "Set input colorspace");
-    cv::Mat raw(frame->height, frame->width, CV_8UC3);
-    borrow(s.converted, raw.data, raw.step, raw.cols, raw.rows, AV_PIX_FMT_BGR24);
-    const int converted = sws_scale_frame(s.scaler, s.converted, pixels);
-    av_frame_unref(s.converted);
-    check(converted, "Convert decoded frame");
-    switch (s.info.rotation) {
-    case 90:
-        cv::rotate(raw, output.bgr, cv::ROTATE_90_CLOCKWISE);
-        break;
-    case 180:
-        cv::rotate(raw, output.bgr, cv::ROTATE_180);
-        break;
-    case 270:
-        cv::rotate(raw, output.bgr, cv::ROTATE_90_COUNTERCLOCKWISE);
-        break;
-    default:
-        output.bgr = std::move(raw);
+    if (frame->format == AV_PIX_FMT_CUDA && format == AV_PIX_FMT_NV12) {
+        // NV12 stays on the GPU; consumers that need host pixels convert lazily.
+        s.devices->synchronize();
+        output.device = std::make_shared<const DeviceFrame>(frame, s.converter, s.info.rotation);
+        output.bgr.release();
+    } else {
+        output.device.reset();
+        output.bgr = s.converter->convert(frame);
     }
     av_frame_unref(s.frame);
     return true;
@@ -386,10 +559,12 @@ struct Writer::Impl {
     std::vector<AVRational> source_time_base; // Copied so audio muxing never reads the live demuxer.
     AVCodecContext* encoder = nullptr;
     AVStream* video = nullptr;
-    AVFrame* frame = nullptr;
+    AVFrame* frame = nullptr;    // Host frame in the encoder's software format.
+    AVFrame* hardware = nullptr; // CUDA frame submitted to NVENC.
     AVFrame* source_frame = nullptr;
     AVPacket* packet = nullptr;
     SwsContext* scaler = nullptr;
+    HardwareDevices* devices = nullptr;
     std::vector<int> stream_map;
     std::map<int64_t, int64_t> durations;
     int64_t origin_us = 0;
@@ -399,6 +574,7 @@ struct Writer::Impl {
         sws_freeContext(scaler);
         av_packet_free(&packet);
         av_frame_free(&source_frame);
+        av_frame_free(&hardware);
         av_frame_free(&frame);
         avcodec_free_context(&encoder);
         if (format) {
@@ -406,6 +582,21 @@ struct Writer::Impl {
                 avio_closep(&format->pb);
             avformat_free_context(format);
         }
+    }
+    void submit(AVFrame* input, int64_t pts_us, int64_t duration_us) {
+        input->color_range = encoder->color_range;
+        input->colorspace = encoder->colorspace;
+        input->color_primaries = encoder->color_primaries;
+        input->color_trc = encoder->color_trc;
+        input->chroma_location = encoder->chroma_sample_location;
+        input->pts = pts_us - origin_us;
+        input->duration = duration_us;
+        durations[input->pts] = duration_us;
+        ++codec.frames;
+        if (!codec.device.empty())
+            ++codec.hardware_frames;
+        check(avcodec_send_frame(encoder, input), "Submit output frame");
+        drain();
     }
     void drain() {
         for (;;) {
@@ -467,8 +658,9 @@ EncoderContext open_x264(const EncoderSettings& settings) {
     check(avcodec_open2(encoder.get(), encoder->codec, nullptr), "Open encoder");
     return encoder;
 }
-// Uploads host YUV 4:2:0 frames. CRF maps to VBR constant quality (CQ) with
-// no bitrate cap; CQ follows the same 0..51 QP scale but is not size-equivalent.
+// Encodes CUDA NV12 frames, so rendered frames are read in place and host frames
+// are uploaded first. CRF maps to VBR constant quality (CQ) with no bitrate cap;
+// CQ follows the same 0..51 QP scale but is not size-equivalent.
 EncoderContext open_nvenc(const EncoderSettings& settings, AVBufferRef* device) {
     EncoderContext encoder;
     try {
@@ -478,6 +670,18 @@ EncoderContext open_nvenc(const EncoderSettings& settings, AVBufferRef* device) 
         throw;
     }
     encoder->hw_device_ctx = device;
+    encoder->hw_frames_ctx = av_hwframe_ctx_alloc(device);
+    if (!encoder->hw_frames_ctx)
+        throw std::bad_alloc();
+    auto* frames = reinterpret_cast<AVHWFramesContext*>(encoder->hw_frames_ctx->data);
+    frames->format = AV_PIX_FMT_CUDA;
+    frames->sw_format = AV_PIX_FMT_NV12;
+    frames->width = settings.size.width;
+    frames->height = settings.size.height;
+    check(av_hwframe_ctx_init(encoder->hw_frames_ctx), "Create NVENC frame pool");
+    encoder->pix_fmt = AV_PIX_FMT_CUDA;
+    encoder->sw_pix_fmt = AV_PIX_FMT_NV12;
+    encoder->chroma_sample_location = AVCHROMA_LOC_LEFT;
     encoder->bit_rate = 0;
     auto* options = encoder->priv_data;
     check(av_opt_set(options, "preset", nvenc_preset(settings.preset), 0), "Set NVENC preset");
@@ -505,6 +709,7 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     for (unsigned i = 0; i < source->nb_streams; ++i)
         s.source_time_base.push_back(source->streams[i]->time_base);
     s.origin_us = origin_us;
+    s.devices = &devices;
     check(avformat_alloc_output_context2(&s.format, nullptr, nullptr, path.c_str()), "Create output container");
     if (!s.format)
         throw std::runtime_error("Unrecognized output container");
@@ -542,6 +747,10 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     s.video->time_base = s.encoder->time_base;
     s.video->avg_frame_rate = s.encoder->framerate;
     check(avcodec_parameters_from_context(s.video->codecpar, s.encoder), "Copy encoder parameters");
+    const bool cuda_input = s.encoder->pix_fmt == AV_PIX_FMT_CUDA;
+    const auto software = cuda_input ? s.encoder->sw_pix_fmt : s.encoder->pix_fmt;
+    if (cuda_input)
+        s.video->codecpar->format = AV_PIX_FMT_YUV420P; // What decoders of the stream produce.
     s.stream_map.assign(source->nb_streams, -1);
     if (audio) {
         for (unsigned i = 0; i < source->nb_streams; ++i) {
@@ -565,19 +774,16 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
         check(avio_open(&s.format->pb, path.c_str(), AVIO_FLAG_WRITE), "Open output file");
     check(avformat_write_header(s.format, nullptr), "Write output header");
     s.frame = av_frame_alloc();
+    s.hardware = av_frame_alloc();
     s.source_frame = av_frame_alloc();
     s.packet = av_packet_alloc();
-    if (!s.frame || !s.source_frame || !s.packet)
+    if (!s.frame || !s.hardware || !s.source_frame || !s.packet)
         throw std::bad_alloc();
-    s.frame->format = s.encoder->pix_fmt;
+    s.frame->format = software;
     s.frame->width = size.width;
     s.frame->height = size.height;
-    s.frame->color_range = s.encoder->color_range;
-    s.frame->colorspace = s.encoder->colorspace;
-    s.frame->color_primaries = s.encoder->color_primaries;
-    s.frame->color_trc = s.encoder->color_trc;
     check(av_frame_get_buffer(s.frame, 32), "Allocate encoder frame");
-    s.scaler = make_scaler(size.width, size.height, AV_PIX_FMT_BGR24, s.encoder->pix_fmt, SWS_BICUBIC, threads,
+    s.scaler = make_scaler(size.width, size.height, AV_PIX_FMT_BGR24, software, SWS_BICUBIC, threads,
                            "Create encoder color converter");
     const int* coefficients = sws_getCoefficients(SWS_CS_ITU709);
     check(sws_setColorspaceDetails(s.scaler, coefficients, 1, coefficients, 0, 0, 1 << 16, 1 << 16),
@@ -593,14 +799,55 @@ void Writer::video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us) {
     const int converted = sws_scale_frame(s.scaler, s.frame, s.source_frame);
     av_frame_unref(s.source_frame);
     check(converted, "Convert output frame");
-    s.frame->pts = pts_us - s.origin_us;
-    s.frame->duration = duration_us;
-    s.durations[s.frame->pts] = duration_us;
-    ++s.codec.frames;
-    if (!s.codec.device.empty())
-        ++s.codec.hardware_frames;
-    check(avcodec_send_frame(s.encoder, s.frame), "Submit output frame");
-    s.drain();
+    if (s.encoder->pix_fmt != AV_PIX_FMT_CUDA) {
+        s.submit(s.frame, pts_us, duration_us);
+        return;
+    }
+    av_frame_unref(s.hardware);
+    check(av_hwframe_get_buffer(s.encoder->hw_frames_ctx, s.hardware, 0), "Allocate NVENC input frame");
+    check(av_hwframe_transfer_data(s.hardware, s.frame, 0), "Upload NVENC input frame");
+    s.devices->synchronize(); // NVENC reads the frame outside FFmpeg's stream.
+    s.submit(s.hardware, pts_us, duration_us);
+    av_frame_unref(s.hardware);
+}
+
+bool Writer::accepts(const CudaImage& image) const {
+    const auto& s = *impl_;
+    // The descriptor must match what NVENC is told: unrotated BT.709 limited
+    // range NV12 with left-sited chroma, chroma directly after a pitched luma plane.
+    return s.encoder->pix_fmt == AV_PIX_FMT_CUDA && image.device == 0 && image.rotation == 0 &&
+           image.coded.width == s.encoder->width && image.coded.height == s.encoder->height && !image.full_range &&
+           image.kr == 0.2126f && image.kb == 0.0722f && image.chroma_x == 0 && image.chroma_y == 0.5f &&
+           image.luma_pitch == image.chroma_pitch &&
+           image.luma_pitch <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
+           image.chroma == image.luma + image.luma_pitch * image.coded.height;
+}
+
+void Writer::video(const CudaImage& image, std::shared_ptr<const void> lifetime, int64_t pts_us, int64_t duration_us) {
+    auto& s = *impl_;
+    if (!accepts(image) || !lifetime)
+        throw std::invalid_argument("Device frame layout does not match the NVENC input");
+    auto* hardware = s.hardware;
+    av_frame_unref(hardware);
+    hardware->format = AV_PIX_FMT_CUDA;
+    hardware->width = image.coded.width;
+    hardware->height = image.coded.height;
+    hardware->data[0] = const_cast<uint8_t*>(image.luma);
+    hardware->data[1] = const_cast<uint8_t*>(image.chroma);
+    hardware->linesize[0] = hardware->linesize[1] = static_cast<int>(image.luma_pitch);
+    hardware->hw_frames_ctx = av_buffer_ref(s.encoder->hw_frames_ctx);
+    auto* owner = new std::shared_ptr<const void>(std::move(lifetime));
+    // NVENC keeps a reference until it has finished reading; releasing it drops the lease.
+    hardware->buf[0] = av_buffer_create(hardware->data[0], image.luma_pitch * image.coded.height * 3 / 2,
+                                        release_lifetime, owner, AV_BUFFER_FLAG_READONLY);
+    if (!hardware->buf[0])
+        delete owner;
+    if (!hardware->buf[0] || !hardware->hw_frames_ctx) {
+        av_frame_unref(hardware);
+        throw std::bad_alloc();
+    }
+    s.submit(hardware, pts_us, duration_us);
+    av_frame_unref(hardware);
 }
 
 void Writer::audio(const AVPacket* packet) {
