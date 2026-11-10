@@ -1,12 +1,14 @@
 # Android SDK
 
-Kotlin/Java bindings for two-pass frame stabilization, GPU rendering and Android hardware codecs. Build from the repository root with `./api/android/gradlew -p api/android assembleRelease`, then add the generated AAR to your app:
+Kotlin implementation with Java-callable bindings for two-pass frame stabilization, GPU rendering and Android hardware codecs. Build from the repository root with `./api/android/gradlew -p api/android assembleRelease`, then add the generated AAR to your app:
 
 ```kotlin
 dependencies {
     implementation(files("libs/stillflow-release.aar"))
 }
 ```
+
+The consuming app needs the Kotlin standard library, supplied by Kotlin-enabled Android projects.
 
 Run processing on a worker thread. Analyze decoded frames in presentation order, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
 
