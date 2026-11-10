@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -44,11 +45,18 @@ def cmake_file(name):
 
 
 def verify_tools():
-    requirements = ROOT / "scripts/requirements-quality.txt"
-    for requirement in requirements.read_text(encoding="utf-8").splitlines():
+    configuration = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    for requirement in configuration["dependency-groups"]["quality"]:
         name, version = requirement.split("==")
-        if importlib.metadata.version(name) != version:
-            raise RuntimeError(f"Install the pinned tools: {sys.executable} -m pip install -r {requirements}")
+        try:
+            installed = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            installed = "missing"
+        if installed != version:
+            raise RuntimeError(
+                f"Expected {name}=={version}, found {installed}; "
+                "run with: uv run --locked --group quality python scripts/quality.py <command>"
+            )
 
 
 def format_files(files, check):

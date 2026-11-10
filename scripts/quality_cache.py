@@ -46,8 +46,8 @@ class TidyCache:
                 "environment": environment,
                 "tool": [str(binary), package.version, self.file_digest(binary)],
                 "runner": [
-                    self.file_digest(root / "scripts" / name)
-                    for name in ("quality.py", "quality_cache.py", "requirements-quality.txt")
+                    self.file_digest(root / name)
+                    for name in ("scripts/quality.py", "scripts/quality_cache.py", "pyproject.toml", "uv.lock")
                 ],
             }
         )

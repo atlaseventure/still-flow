@@ -21,13 +21,11 @@ FFmpeg 通过只含头文件的 NVIDIA 编解码接口启用 NVDEC/NVENC，不�
 
 ## 代码质量
 
-使用 Python 3.14 运行质量工具：
+安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，由其管理 Python 和锁定版本的脚本依赖：
 
 ```sh
-python3.14 -m venv .local/quality-venv
-.local/quality-venv/bin/python -m pip install -r scripts/requirements-quality.txt
-.local/quality-venv/bin/python scripts/quality.py format
-.local/quality-venv/bin/python scripts/quality.py check --build-dir build
+uv run --locked --group quality python scripts/quality.py format
+uv run --locked --group quality python scripts/quality.py check --build-dir build
 ```
 
 `format --check` 只检查格式；`lint` 执行静态分析。`check` 执行两者，需要先完成 CLI 构建。命令输出 JSON Lines，失败时返回非零退出码，排除 Git 忽略的文件。
@@ -55,10 +53,10 @@ cmake --install build-lib --prefix /path/to/sdk
 
 ## 合成素材
 
-需安装 FFmpeg，以及 `scripts/requirements.txt` 中的 Python 依赖。生成带抖动与卷帘快门效应的视频、稳定参考视频和参数记录：
+需安装 FFmpeg 和 uv。生成带抖动与卷帘快门效应的视频、稳定参考视频和参数记录：
 
 ```sh
-python3 scripts/generate_video.py --output .local/synthetic --frames 60
+uv run --locked --group video python scripts/generate_video.py --output .local/synthetic --frames 60
 ```
 
 使用 `--overwrite` 替换已有素材。

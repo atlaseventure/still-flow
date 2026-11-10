@@ -21,13 +21,11 @@ FFmpeg is built with NVDEC/NVENC support from header-only NVIDIA codec interface
 
 ## Code quality
 
-Use Python 3.14 for the quality tools:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/); it manages Python and the locked script dependencies:
 
 ```sh
-python3.14 -m venv .local/quality-venv
-.local/quality-venv/bin/python -m pip install -r scripts/requirements-quality.txt
-.local/quality-venv/bin/python scripts/quality.py format
-.local/quality-venv/bin/python scripts/quality.py check --build-dir build
+uv run --locked --group quality python scripts/quality.py format
+uv run --locked --group quality python scripts/quality.py check --build-dir build
 ```
 
 `format --check` checks formatting without writing; `lint` runs static analysis. `check` runs both and requires a completed CLI build. Commands emit JSON Lines and exit nonzero on failure. Git-ignored files are excluded.
@@ -55,10 +53,10 @@ To add a rendering backend, implement `RenderBackend`, register it with `make_re
 
 ## Synthetic footage
 
-Install FFmpeg and the Python dependencies in `scripts/requirements.txt`. Generate a shaky rolling-shutter clip, a stable reference and parameter metadata:
+Install FFmpeg and uv. Generate a shaky rolling-shutter clip, a stable reference and parameter metadata:
 
 ```sh
-python3 scripts/generate_video.py --output .local/synthetic --frames 60
+uv run --locked --group video python scripts/generate_video.py --output .local/synthetic --frames 60
 ```
 
 Use `--overwrite` to replace existing footage.

@@ -1,6 +1,0 @@
-clang-format==23.1.5
-clang-tidy==23.1.4
-cmakelang==0.6.13
-PyYAML==6.0.3
-ruff==0.17.4
-six==1.17.0

@@ -44,7 +44,7 @@ def main():
         import cv2
         import numpy as np
     except ImportError:
-        p.error("install the Python dependencies from scripts/requirements.txt")
+        p.error("run with: uv run --locked --group video python scripts/generate_video.py [options]")
     names = ("input.mp4", "reference.mp4", "truth.json")
     for name in names:
         target = args.output / name

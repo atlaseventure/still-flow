@@ -1,5 +1,6 @@
 /build*/
 /.local/
+/.venv/
 /CMakeUserPresets.json
 /compile_commands.json
 /scripts/__pycache__/
