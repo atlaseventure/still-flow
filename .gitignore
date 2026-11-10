@@ -9,3 +9,8 @@
 /api/android/.cxx/
 /api/android/build/
 /api/android/local.properties
+/tools/android/.gradle/
+/tools/android/.kotlin/
+/tools/android/.cxx/
+/tools/android/build/
+/tools/android/local.properties

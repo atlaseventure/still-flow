@@ -1,0 +1,5 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Still Flow runner" android:allowBackup="false" android:fullBackupContent="@xml/backup_rules" android:icon="@android:drawable/ic_menu_slideshow"
+        android:dataExtractionRules="@xml/data_extraction_rules" />
+    <instrumentation android:name="io.stillflow.runner.ExportRunner" android:targetPackage="io.stillflow.runner" />
+</manifest>

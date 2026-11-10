@@ -193,6 +193,10 @@ def lint_cpp(files, build_dir, require_cuda, extra_args, jobs, no_cache):
         return configuration.get(option, "ON").upper() not in {"OFF", "FALSE", "NO", "0", ""}
 
     def inactive(name):
+        if configuration.get("STILLFLOW_ANDROID_RUNNER") == "ON":
+            return not name.startswith("tools/android/")
+        if name.startswith("tools/android/"):
+            return True
         if name.startswith("api/android/"):
             return configuration.get("STILLFLOW_BUILD_ANDROID_JNI") != "ON"
         if name.startswith("lib/backends/gles/"):
