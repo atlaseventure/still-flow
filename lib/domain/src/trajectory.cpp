@@ -27,7 +27,7 @@ Point row_motion(const Motion& motion, double position) {
 // We use the demo's Gaussian fallback, gated by measured motion and confidence
 // instead of pretrained kernels. Positions are rebased to O_t after each input
 // displacement, so the result is directly M_t = S_t - O_t without large sums.
-class CausalPath {
+template <size_t Passes> class CausalPath {
   public:
     Point advance(Point delta, double time, double confidence, double seconds, double pixel_scale) {
         if (seconds <= 0)
@@ -78,10 +78,131 @@ class CausalPath {
         double confidence;
     };
     std::deque<Observation> observations_;
-    std::array<std::deque<Point>, trajectory_smoothing_passes> passes_;
+    std::array<std::deque<Point>, Passes> passes_;
 };
 
-std::vector<Point> initialize_rows(std::vector<CausalPath>& paths, const std::vector<FrameMotion>& frames, size_t start,
+using ScanlinePath = CausalPath<trajectory_smoothing_passes>;
+// Half of the cascade runs forward and half backward. Each pass applies the
+// same kernel, so |H_forward * H_backward| equals the causal |H_50| while the
+// opposite group delays cancel: offline planning keeps the full smoothing
+// strength without lagging behind intentional camera motion.
+using GlobalPath = CausalPath<trajectory_smoothing_passes / 2>;
+static_assert(trajectory_smoothing_passes % 2 == 0);
+
+// Confidence-weighted linear fit of one vertex path near a shot end, evaluated
+// at that end. Pivoting the reflection on the raw end sample would mirror its
+// shake into the padding and pull the boundary frames by twice that amount.
+Point fit_endpoint(const std::vector<double>& times, const std::vector<double>& weights,
+                   const std::vector<Point>& positions, size_t first, size_t last, size_t end) {
+    const double at = times[end];
+    double w = 0, t = 0, tt = 0;
+    Point x, tx;
+    for (size_t k = first; k < last; ++k) {
+        const double dt = times[k] - at;
+        w += weights[k];
+        t += weights[k] * dt;
+        tt += weights[k] * dt * dt;
+        x = x + positions[k] * weights[k];
+        tx = tx + positions[k] * (weights[k] * dt);
+    }
+    const double determinant = w * tt - t * t;
+    if (w <= 1e-9)
+        return positions[end];
+    if (std::abs(determinant) <= 1e-12 * std::max(1.0, w * tt))
+        return x * (1 / w);
+    // Intercept of x = a + b * (time - at).
+    return (x * tt - tx * t) * (1 / determinant);
+}
+
+// Zero-phase global trajectory for frames [first, last). Point reflection about
+// fitted shot ends extends constant-velocity motion linearly, so the symmetric
+// response neither lags nor bends a steady pan at the boundaries.
+void plan_global(std::vector<std::vector<Point>>& output, const std::vector<FrameMotion>& frames, size_t first,
+                 size_t last, Size size, int columns, int rows, double seconds, double pixel_scale) {
+    const size_t n = last - first, count = static_cast<size_t>(columns) * rows;
+    for (size_t i = first; i < last; ++i)
+        output[i].assign(count, Point{});
+    if (seconds <= 0 || n < 2)
+        return;
+    // Observation into each frame; the shot's first frame has none.
+    std::vector<double> times(n), confidence(n);
+    std::vector<std::vector<Point>> positions(count, std::vector<Point>(n));
+    for (size_t k = 0; k < n; ++k) {
+        const auto& frame = frames[first + k];
+        times[k] = frame.seconds;
+        confidence[k] = k == 0 ? 1 : std::clamp(frame.motion.confidence, 0.0, 1.0);
+        const bool observed = k > 0 && frame.motion.state != MotionState::missing;
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < columns; ++x) {
+                const size_t vertex = static_cast<size_t>(y) * columns + x;
+                Point delta;
+                if (observed) {
+                    const Point p(static_cast<double>(x) * (size.width - 1) / (columns - 1),
+                                  static_cast<double>(y) * (size.height - 1) / (rows - 1));
+                    delta = transform(frame.motion.step, p) - p;
+                    if (!finite(delta))
+                        throw std::runtime_error("Nonfinite observed mesh motion");
+                }
+                positions[vertex][k] = k ? positions[vertex][k - 1] + delta : Point{};
+            }
+    }
+    // The cascade's exact support is six observations per pass.
+    const size_t pad = std::min(n - 1, size_t{6} * (trajectory_smoothing_passes / 2));
+    // About three times the cascade's effective half width.
+    const double fit_seconds = 3 * seconds;
+    size_t head = 1, tail = n - 1;
+    while (head < n && times[head] - times[0] <= fit_seconds)
+        ++head;
+    while (tail > 0 && times[n - 1] - times[tail - 1] <= fit_seconds)
+        --tail;
+    // Extended sample k maps to original index source[k], mirrored when outside
+    // the shot. The confidence of a step is that of the observation it spans.
+    const size_t total = n + 2 * pad;
+    std::vector<double> time(total), step_confidence(total);
+    for (size_t k = 0; k < total; ++k) {
+        if (k < pad) {
+            const size_t j = pad - k;
+            time[k] = 2 * times[0] - times[j];
+            step_confidence[k] = k == 0 ? 1 : confidence[j + 1];
+        } else if (k < pad + n) {
+            time[k] = times[k - pad];
+            step_confidence[k] = k == pad ? (pad ? confidence[1] : 1) : confidence[k - pad];
+        } else {
+            const size_t j = n - 1 - (k - pad - n + 1);
+            time[k] = 2 * times[n - 1] - times[j];
+            step_confidence[k] = confidence[j + 1];
+        }
+    }
+    std::vector<Point> extended(total), forward(total);
+    for (size_t vertex = 0; vertex < count; ++vertex) {
+        const auto& x = positions[vertex];
+        const Point begin = fit_endpoint(times, confidence, x, 0, head, 0);
+        const Point end = fit_endpoint(times, confidence, x, tail, n, n - 1);
+        for (size_t k = 0; k < total; ++k)
+            extended[k] = k < pad       ? begin * 2 - x[pad - k]
+                          : k < pad + n ? x[k - pad]
+                                        : end * 2 - x[n - 1 - (k - pad - n + 1)];
+        GlobalPath path;
+        for (size_t k = 0; k < total; ++k)
+            forward[k] = path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k],
+                                      seconds, pixel_scale);
+        // Smooth S_f = X + forward in reversed time. The step from k+1 to k is
+        // S_f[k] - S_f[k+1]; the result is relative to S_f, so both add up.
+        GlobalPath reverse;
+        for (size_t k = total; k-- > 0;) {
+            const bool last_sample = k + 1 == total;
+            const Point delta =
+                last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
+            const Point correction =
+                forward[k] + reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds,
+                                             pixel_scale);
+            if (k >= pad && k < pad + n)
+                output[first + k - pad][vertex] = correction;
+        }
+    }
+}
+
+std::vector<Point> initialize_rows(std::vector<ScanlinePath>& paths, const std::vector<FrameMotion>& frames, size_t start,
                                    int columns, int rows, bool horizontal, double seconds, double pixel_scale) {
     if (seconds <= 0 || frames[start].motion.state == MotionState::missing)
         return {};
@@ -134,7 +255,21 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
     const int columns = horizontal ? options.bands : 9, rows = horizontal ? 9 : options.bands;
     const int count = columns * rows;
     const double pixel_scale = std::max(size.width, size.height) / 960.0;
-    std::vector<CausalPath> global(count), local(count);
+    std::vector<ScanlinePath> local(count);
+    std::vector<std::vector<Point>> global(frames.size());
+    for (size_t first = 0; first < frames.size();) {
+        size_t last = first + 1;
+        if (!std::isfinite(frames[first].seconds))
+            throw std::invalid_argument("Trajectory timestamps must increase within a shot");
+        while (last < frames.size() && frames[last].segment == frames[last - 1].segment &&
+               !frames[last].motion.reset) {
+            if (!std::isfinite(frames[last].seconds) || frames[last].seconds <= frames[last - 1].seconds)
+                throw std::invalid_argument("Trajectory timestamps must increase within a shot");
+            ++last;
+        }
+        plan_global(global, frames, first, last, size, columns, rows, options.smooth_seconds, pixel_scale);
+        first = last;
+    }
     double missing_seconds = 0, row_strength = 0, previous_tracking = 1;
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& frame = frames[i];
@@ -144,8 +279,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
             throw std::invalid_argument("Trajectory timestamps must increase within a shot");
         std::vector<Point> initial_rows;
         if (start) {
-            global.assign(count, CausalPath{});
-            local.assign(count, CausalPath{});
+            local.assign(count, ScanlinePath{});
             missing_seconds = 0;
             row_strength = 0;
             previous_tracking = 1;
@@ -165,16 +299,12 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         for (int y = 0; y < rows; ++y)
             for (int x = 0; x < columns; ++x) {
                 const int vertex = y * columns + x;
-                const Point p(static_cast<double>(x) * (size.width - 1) / (columns - 1),
-                              static_cast<double>(y) * (size.height - 1) / (rows - 1));
-                const Point delta = start || missing ? Point{} : transform(motion.step, p) - p;
                 const Point residual = has_rows ? row_motion(motion, horizontal ? static_cast<double>(x) / (columns - 1)
                                                                                 : static_cast<double>(y) / (rows - 1))
                                                 : Point{};
-                if (!finite(delta) || !finite(residual))
+                if (!finite(residual))
                     throw std::runtime_error("Nonfinite observed mesh motion");
-                const auto g = global[vertex].advance(delta, frame.seconds, start ? 1 : motion.confidence,
-                                                      options.smooth_seconds, pixel_scale);
+                const auto g = global[i][vertex];
                 const auto local_correction =
                     initial_rows.empty()
                         ? local[vertex].advance(residual, frame.seconds, has_rows ? motion.rs_confidence : 0,

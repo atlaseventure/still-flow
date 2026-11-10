@@ -209,6 +209,8 @@ class LocalOutputStorage final : public OutputStorage {
             {"trajectory",
              {{"method", "lightstab_demo_causal_mesh"},
               {"kernel", "gaussian_motion_confidence"},
+              {"global", "zero_phase_forward_backward"},
+              {"global_boundary", "point_reflected_about_fitted_shot_ends"},
               {"initialization", "reflected_scanline_history"},
               {"passes", trajectory_smoothing_passes}}},
             {"performance",
