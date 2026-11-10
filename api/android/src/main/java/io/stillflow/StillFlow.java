@@ -27,10 +27,12 @@ public final class StillFlow implements AutoCloseable {
 
     public enum CropMode { AUTO, FIXED, ADAPTIVE }
     public enum Backend { AUTO, CPU, GLES }
+    public enum MotionEstimator { TRANSLATION, OPENCV }
 
     /** Settings are copied when the session is created. */
     public static final class Settings {
         public Backend backend = Backend.AUTO;
+        public MotionEstimator motionEstimator = MotionEstimator.OPENCV;
         public int analysisWidth;
         public int features;
         public int bands;
@@ -128,6 +130,7 @@ public final class StillFlow implements AutoCloseable {
         Objects.requireNonNull(settings, "settings");
         handle = nativeCreate(width, height, fps, horizontalScan,
                 Objects.requireNonNull(settings.backend, "backend").ordinal(),
+                Objects.requireNonNull(settings.motionEstimator, "motionEstimator").ordinal(),
                 settings.analysisWidth, settings.features, settings.bands,
                 Objects.requireNonNull(settings.cropMode, "cropMode").ordinal(), settings.rollingShutter,
                 settings.smoothSeconds, settings.rsSeconds, settings.crop, settings.rsStrength);
@@ -196,7 +199,7 @@ public final class StillFlow implements AutoCloseable {
 
     private static native double[] nativeDefaults();
     private static native long nativeCreate(int width, int height, double fps, boolean horizontalScan,
-            int backend,
+            int backend, int motionEstimator,
             int analysisWidth, int features, int bands, int cropMode, boolean rollingShutter,
             double smoothSeconds, double rsSeconds, double crop, double rsStrength);
     private static native void nativeAnalyze(long handle, int width, int height, int format,

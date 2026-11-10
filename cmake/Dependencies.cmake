@@ -1,4 +1,5 @@
 include(ExternalProject)
+include("${CMAKE_CURRENT_LIST_DIR}/OpenCVSource.cmake")
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_CROSSCOMPILING)
     message(FATAL_ERROR "The source dependency build currently supports native Linux builds")
@@ -169,8 +170,8 @@ if(STILLFLOW_BUILD_ADAPTERS)
     ExternalProject_Add(
         dep_opencv
         ${common}
-        URL https://github.com/opencv/opencv/archive/refs/tags/5.1.0.tar.gz
-        URL_HASH SHA256=638c1dae7e37e45afea21aa217dc667ad7cf57acc66cdf652c074f1e0e5ad6d2
+        URL ${STILLFLOW_OPENCV_URL}
+        URL_HASH SHA256=${STILLFLOW_OPENCV_SHA256}
         DEPENDS dep_eigen dep_zlib
         CMAKE_ARGS ${dependency_cmake_args}
                    -DCMAKE_CXX_STANDARD:STRING=20

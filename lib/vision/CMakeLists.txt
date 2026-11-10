@@ -1,4 +1,6 @@
-if(STILLFLOW_DEPS_ROOT)
+if(ANDROID AND NOT STILLFLOW_DEPS_ROOT)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/AndroidOpenCV.cmake")
+elseif(STILLFLOW_DEPS_ROOT)
     find_package(
         OpenCV 5.1 REQUIRED CONFIG
         COMPONENTS core

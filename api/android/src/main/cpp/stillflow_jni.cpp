@@ -114,16 +114,14 @@ JNIEXPORT jdoubleArray JNICALL Java_io_stillflow_StillFlow_nativeDefaults(JNIEnv
     return result;
 }
 
-JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(JNIEnv* env, jclass, jint width, jint height,
-                                                                 jdouble fps, jboolean horizontal_scan, jint backend,
-                                                                 jint analysis_width, jint features, jint bands,
-                                                                 jint crop_mode, jboolean rolling_shutter,
-                                                                 jdouble smooth_seconds, jdouble rs_seconds,
-                                                                 jdouble crop, jdouble rs_strength) {
+JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
+    JNIEnv* env, jclass, jint width, jint height, jdouble fps, jboolean horizontal_scan, jint backend,
+    jint motion_estimator, jint analysis_width, jint features, jint bands, jint crop_mode, jboolean rolling_shutter,
+    jdouble smooth_seconds, jdouble rs_seconds, jdouble crop, jdouble rs_strength) {
     jlong result = 0;
     boundary(env, [&] {
-        sf_settings settings{sizeof(sf_settings),   analysis_width, features,   bands, crop_mode,  rolling_shutter,
-                             SF_MOTION_TRANSLATION, smooth_seconds, rs_seconds, crop,  rs_strength};
+        sf_settings settings{sizeof(sf_settings), analysis_width, features,   bands, crop_mode,  rolling_shutter,
+                             motion_estimator,    smooth_seconds, rs_seconds, crop,  rs_strength};
         sf_video video{sizeof(sf_video), width, height, horizontal_scan, fps};
         sf_error error{sizeof(sf_error), {}};
         if (backend < 0 || backend > 2)

@@ -1,6 +1,9 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
 if(@STILLFLOW_WITH_OPENCV@ AND (NOT @STILLFLOW_C_API_SHARED@ OR "vision_opencv" IN_LIST StillFlow_FIND_COMPONENTS))
+    if(NOT OpenCV_DIR AND EXISTS "${PACKAGE_PREFIX_DIR}/lib/cmake/opencv5/OpenCVConfig.cmake")
+        set(OpenCV_DIR "${PACKAGE_PREFIX_DIR}/lib/cmake/opencv5")
+    endif()
     find_dependency(
         OpenCV
         5.1
