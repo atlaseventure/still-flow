@@ -59,7 +59,7 @@ cmake --install build-lib --prefix /path/to/sdk
 uv run --locked --group video python scripts/generate_video.py --output .local/synthetic --frames 60
 ```
 
-卷帘快门默认开启，使用 `--no-rolling-shutter` 关闭。使用 `--overwrite` 替换已有素材。
+默认生成平面场景，添加 `--type parallax` 生成带前后景视差的抖动。卷帘快门默认开启，使用 `--no-rolling-shutter` 关闭。使用 `--overwrite` 替换已有素材。
 
 ## 使用
 

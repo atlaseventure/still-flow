@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a reproducible shaky clip with optional rolling shutter and its stable reference."""
+"""Generate reproducible planar or parallax footage with optional rolling shutter and a stable reference."""
 
 import argparse
 import json
@@ -31,6 +31,7 @@ def main():
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--frames", type=int, default=180)
+    p.add_argument("--type", choices=("planar", "parallax"), default="planar", help="Scene type (default: planar)")
     p.add_argument(
         "--rolling-shutter",
         action=argparse.BooleanOptionalAction,
@@ -79,6 +80,27 @@ def main():
         )
     yy, xx = np.mgrid[:h, :w].astype(np.float32)
     scale = w / 1280
+    foreground_translation_scale = 2.5
+    foreground = None
+    if args.type == "parallax":
+        # Opaque textured panels on a nearer plane, with transparent space between them.
+        foreground = np.zeros((*canvas.shape[:2], 4), np.uint8)
+        foreground_rng = np.random.default_rng(43)
+        for center, top, bottom in ((0.18, 0.12, 0.88), (0.52, 0.3, 0.98), (0.86, 0.04, 0.7)):
+            left, right = 256 + int((center - 0.06) * w), 256 + int((center + 0.06) * w)
+            upper, lower = 256 + int(top * h), 256 + int(bottom * h)
+            cv2.rectangle(foreground, (left, upper), (right, lower), (45, 155, 235, 255), -1)
+            tile = max(3, int(24 * scale))
+            for y in range(upper + 2, lower - tile, tile):
+                for x in range(left + 2, right - tile, tile):
+                    shade = int(foreground_rng.integers(60, 230))
+                    cv2.rectangle(foreground, (x, y), (x + tile - 2, y + tile - 2), (shade, shade, shade, 255), -1)
+
+    def composite_foreground(background, map_x, map_y):
+        # Transparent pixels are black, so interpolated RGB is already premultiplied by alpha.
+        layer = cv2.remap(foreground, map_x.astype(np.float32), map_y.astype(np.float32), cv2.INTER_LINEAR)
+        alpha = layer[:, :, 3:4].astype(np.float32) / 255
+        return np.clip(np.rint(layer[:, :, :3] + background * (1 - alpha)), 0, 255).astype(np.uint8)
 
     def encoder(path):
         return subprocess.Popen(
@@ -150,6 +172,14 @@ def main():
                 my = np.sin(angle) * (xx - w / 2) + np.cos(angle) * (yy - h / 2) + h / 2 + 256 + dy
                 shaken = cv2.remap(canvas, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR)
                 stable = cv2.remap(canvas, xx + 256 + pan, yy + 256, cv2.INTER_LINEAR)
+                if foreground is not None:
+                    # Translation varies with inverse depth; image-plane rotation is shared by both planes.
+                    shaken = composite_foreground(
+                        shaken,
+                        mx + (foreground_translation_scale - 1) * (pan + dx),
+                        my + (foreground_translation_scale - 1) * dy,
+                    )
+                    stable = composite_foreground(stable, xx + 256 + foreground_translation_scale * pan, yy + 256)
                 source.stdin.write(shaken.tobytes())
                 reference.stdin.write(stable.tobytes())
         (temporary / "truth.json").write_text(
@@ -159,11 +189,21 @@ def main():
                     "height": h,
                     "frames": args.frames,
                     "fps": fps,
+                    "type": args.type,
                     "readout_seconds": readout_seconds,
+                    "layer_translation_scales": {
+                        "background": 1.0,
+                        **({"foreground": foreground_translation_scale} if foreground is not None else {}),
+                    },
                     "pan_pixels_per_second": 9 * scale,
                     "camera_jitter_hz": [6, 9.2, 42],
                     "seed": 42,
-                    "description": "Static textured scene; continuous camera pose sampled per row; reference retains deliberate pan.",
+                    "description": (
+                        "Static textured planes with foreground occlusion and depth-dependent translation; "
+                        "continuous camera pose sampled per row; reference retains deliberate pan and parallax."
+                        if foreground is not None
+                        else "Static textured scene; continuous camera pose sampled per row; reference retains deliberate pan."
+                    ),
                 },
                 indent=2,
             )
