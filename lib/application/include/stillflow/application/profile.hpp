@@ -1,19 +1,18 @@
 #pragma once
 
-#include <chrono>
+#include <functional>
 #include <map>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace stillflow {
-using Clock = std::chrono::steady_clock;
-inline double milliseconds(Clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-}
-
 class Profile {
   public:
+    using Timer = std::function<double()>;
+    explicit Profile(Timer timer = {}) : timer_(std::move(timer)) {}
+    double now() const { return timer_ ? timer_() : 0; }
+    const Timer& timer() const { return timer_; }
     void add(const std::string& stage, double ms) { samples_[stage].push_back(ms); }
     // Profiles are single-threaded; each pipeline thread records its own and merges after joining.
     void merge(const Profile& other) {
@@ -25,18 +24,19 @@ class Profile {
     [[nodiscard]] const std::map<std::string, std::vector<double>>& samples() const { return samples_; }
 
   private:
+    Timer timer_;
     std::map<std::string, std::vector<double>> samples_;
 };
 
 class ScopeTimer {
   public:
     ScopeTimer(Profile& profile, std::string stage)
-        : profile_(profile), stage_(std::move(stage)), start_(Clock::now()) {}
-    ~ScopeTimer() { profile_.add(stage_, milliseconds(start_)); }
+        : profile_(profile), stage_(std::move(stage)), start_(profile.now()) {}
+    ~ScopeTimer() { profile_.add(stage_, profile_.now() - start_); }
 
   private:
     Profile& profile_;
     std::string stage_;
-    Clock::time_point start_;
+    double start_;
 };
 } // namespace stillflow

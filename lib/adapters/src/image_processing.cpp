@@ -1,27 +1,18 @@
 #include "image.hpp"
-#include "motion.hpp"
 #include "stillflow/adapters/backends.hpp"
+#include "stillflow/vision/vision.hpp"
 #include <opencv2/imgproc.hpp>
 
 namespace stillflow {
 namespace {
-class OpenCvMotionAnalyzer final : public MotionAnalyzer {
-  public:
-    OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal) : estimator_(settings, horizontal) {}
-    Motion estimate(const Image& previous, const Image& current, Profile& profile) override {
-        auto before = read_pixels(previous), after = read_pixels(current);
-        return estimator_.estimate(before.pixels, after.pixels, profile);
-    }
-
-  private:
-    MotionEstimator estimator_;
-};
 class OpenCvProcessing final : public ImageProcessing {
   public:
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
-        return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal);
+        return make_opencv_analyzer(settings, horizontal);
     }
     Image gray_proxy(const Image& input, Size size) override {
+        if (input->format() != PixelFormat::bgr8)
+            return stillflow::gray_proxy(input, size);
         cv::Mat gray, small;
         auto view = read_pixels(input);
         if (view.mapping.format != PixelFormat::bgr8)
@@ -33,6 +24,7 @@ class OpenCvProcessing final : public ImageProcessing {
         cv::resize(gray, small, target, 0, 0, cv::INTER_AREA);
         return image(std::move(small));
     }
+
     Image comparison(const Image& input, const Image& stabilized) override {
         if (!font_)
             font_ = std::make_unique<cv::FontFace>("sans");

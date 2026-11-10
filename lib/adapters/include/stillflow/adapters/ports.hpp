@@ -1,5 +1,6 @@
 #pragma once
-#include "stillflow/application/report.hpp"
+#include "stillflow/adapters/report.hpp"
+#include "stillflow/vision/vision.hpp"
 #include <functional>
 #include <span>
 
@@ -39,18 +40,6 @@ class MediaFactory {
     virtual std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double fps,
                                                 VideoReader& source, int64_t origin_us,
                                                 const EncodingSettings& settings, const CodecRequest& encoder) = 0;
-};
-class MotionAnalyzer {
-  public:
-    virtual ~MotionAnalyzer() = default;
-    virtual Motion estimate(const Image& previous, const Image& current, Profile& profile) = 0;
-};
-class ImageProcessing {
-  public:
-    virtual ~ImageProcessing() = default;
-    virtual std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) = 0;
-    virtual Image gray_proxy(const Image& image, Size size) = 0;
-    virtual Image comparison(const Image& input, const Image& stabilized) = 0;
 };
 class OutputFile {
   public:

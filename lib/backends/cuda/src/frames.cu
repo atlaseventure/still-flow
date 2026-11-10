@@ -72,9 +72,9 @@ OutputFrame::OutputFrame(Size value) : size(value) {
     descriptor.luma = nv12;
     descriptor.chroma = nv12 + pitch * height;
     descriptor.luma_pitch = descriptor.chroma_pitch = pitch;
-    descriptor.kr = 0.2126f, descriptor.kb = 0.0722f;
-    descriptor.full_range = false;
-    descriptor.chroma_x = 0, descriptor.chroma_y = 0.5f;
+    descriptor.color.kr = 0.2126f, descriptor.color.kb = 0.0722f;
+    descriptor.color.full_range = false;
+    descriptor.color.chroma_x = 0, descriptor.color.chroma_y = 0.5f;
 }
 OutputFrame::~OutputFrame() {
     cudaFree(nv12);

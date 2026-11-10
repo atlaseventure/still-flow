@@ -1,5 +1,5 @@
 #pragma once
-#include "stillflow/domain/geometry.hpp"
+#include "stillflow/application/image.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -21,9 +21,6 @@ struct CudaImage {
     const uint8_t* luma = nullptr;
     const uint8_t* chroma = nullptr; // Cb, Cr pairs at half resolution.
     size_t luma_pitch = 0, chroma_pitch = 0;
-    float kr = 0.2126f, kb = 0.0722f; // Luma coefficients of the colour matrix.
-    bool full_range = false;
-    // Position of chroma sample (0, 0) in luma pixels: 0 or 0.5 per axis.
-    float chroma_x = 0, chroma_y = 0.5f;
+    ColorInfo color;
 };
 } // namespace stillflow

@@ -1,5 +1,5 @@
 #pragma once
-#include "stillflow/application/ports.hpp"
+#include "stillflow/adapters/ports.hpp"
 
 namespace stillflow {
 RunSummary stabilize(const Options& options, Services services);

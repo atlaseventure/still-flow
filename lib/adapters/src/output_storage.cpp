@@ -1,5 +1,6 @@
 #include "stillflow/adapters/backends.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -21,9 +22,10 @@ class LocalOutputFile final : public OutputFile {
     explicit LocalOutputFile(fs::path path) : target_(std::move(path)) {
         if (!target_.parent_path().empty())
             fs::create_directories(target_.parent_path());
-        temporary_ = target_.parent_path() /
-                     ("." + target_.stem().string() + ".tmp-" +
-                      std::to_string(Clock::now().time_since_epoch().count()) + target_.extension().string());
+        temporary_ =
+            target_.parent_path() / ("." + target_.stem().string() + ".tmp-" +
+                                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                     target_.extension().string());
     }
     ~LocalOutputFile() override {
         std::error_code ignored;

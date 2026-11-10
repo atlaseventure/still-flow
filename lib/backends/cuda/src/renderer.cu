@@ -88,7 +88,8 @@ class CudaBackend final : public RenderBackend {
             input_.reserve(bytes);
             staging_.reserve(bytes);
             for (int y = 0; y < size_.height; ++y)
-                std::memcpy(staging_.data() + y * stride, mapping.bytes.data() + y * mapping.row_stride, stride);
+                std::memcpy(staging_.data() + y * stride,
+                            mapping.planes[0].bytes.data() + y * mapping.planes[0].row_stride, stride);
             check(cudaMemcpyAsync(input_.data(), staging_.data(), bytes, cudaMemcpyHostToDevice, stream_.value),
                   "Upload CUDA frame");
             source_.bgr = input_.data();

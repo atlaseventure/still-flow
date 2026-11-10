@@ -7,6 +7,7 @@ project(
 option(BUILD_TESTING "Build regression tests" OFF)
 option(STILLFLOW_BUILD_CLI "Build the desktop command-line application" ON)
 option(STILLFLOW_BUILD_ADAPTERS "Build the FFmpeg/OpenCV and desktop adapters" ON)
+option(STILLFLOW_WITH_OPENCV "Build the full OpenCV motion estimator" ${STILLFLOW_BUILD_ADAPTERS})
 option(STILLFLOW_SUPERBUILD "Build pinned dependencies from source" ON)
 if(STILLFLOW_BUILD_CLI AND NOT STILLFLOW_BUILD_ADAPTERS)
     message(FATAL_ERROR "The CLI requires STILLFLOW_BUILD_ADAPTERS")
@@ -31,7 +32,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # The outer build owns every library dependency; the inner build compiles the app.
-if(STILLFLOW_SUPERBUILD AND NOT STILLFLOW_DEPS_ROOT)
+if(STILLFLOW_SUPERBUILD
+   AND NOT STILLFLOW_DEPS_ROOT
+   AND STILLFLOW_BUILD_ADAPTERS)
     include(cmake/Dependencies.cmake)
     return()
 endif()
@@ -52,7 +55,21 @@ if(STILLFLOW_DEPS_ROOT)
         "${STILLFLOW_DEPS_ROOT}"
         NO_DEFAULT_PATH)
 else()
-    find_package(Eigen3 5 REQUIRED CONFIG)
+    find_package(Eigen3 5 QUIET CONFIG)
+    if(NOT Eigen3_FOUND)
+        include(FetchContent)
+        set(BUILD_TESTING_SAVED ${BUILD_TESTING})
+        set(BUILD_TESTING OFF)
+        set(EIGEN_BUILD_DOC
+            OFF
+            CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            Eigen3
+            URL https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.tar.gz
+            URL_HASH SHA256=e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec)
+        FetchContent_MakeAvailable(Eigen3)
+        set(BUILD_TESTING ${BUILD_TESTING_SAVED})
+    endif()
 endif()
 
 include(GNUInstallDirs)

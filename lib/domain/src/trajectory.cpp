@@ -184,26 +184,26 @@ void plan_global(std::vector<std::vector<Point>>& output, const std::vector<Fram
                                         : end * 2 - x[n - 1 - (k - pad - n + 1)];
         GlobalPath path;
         for (size_t k = 0; k < total; ++k)
-            forward[k] = path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k],
-                                      seconds, pixel_scale);
+            forward[k] = path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k], seconds,
+                                      pixel_scale);
         // Smooth S_f = X + forward in reversed time. The step from k+1 to k is
         // S_f[k] - S_f[k+1]; the result is relative to S_f, so both add up.
         GlobalPath reverse;
         for (size_t k = total; k-- > 0;) {
             const bool last_sample = k + 1 == total;
-            const Point delta =
-                last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
+            const Point delta = last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
             const Point correction =
-                forward[k] + reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds,
-                                             pixel_scale);
+                forward[k] +
+                reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds, pixel_scale);
             if (k >= pad && k < pad + n)
                 output[first + k - pad][vertex] = correction;
         }
     }
 }
 
-std::vector<Point> initialize_rows(std::vector<ScanlinePath>& paths, const std::vector<FrameMotion>& frames, size_t start,
-                                   int columns, int rows, bool horizontal, double seconds, double pixel_scale) {
+std::vector<Point> initialize_rows(std::vector<ScanlinePath>& paths, const std::vector<FrameMotion>& frames,
+                                   size_t start, int columns, int rows, bool horizontal, double seconds,
+                                   double pixel_scale) {
     if (seconds <= 0 || frames[start].motion.state == MotionState::missing)
         return {};
     // Reflect a reliable prefix around the shot boundary. The original causal
@@ -261,8 +261,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         size_t last = first + 1;
         if (!std::isfinite(frames[first].seconds))
             throw std::invalid_argument("Trajectory timestamps must increase within a shot");
-        while (last < frames.size() && frames[last].segment == frames[last - 1].segment &&
-               !frames[last].motion.reset) {
+        while (last < frames.size() && frames[last].segment == frames[last - 1].segment && !frames[last].motion.reset) {
             if (!std::isfinite(frames[last].seconds) || frames[last].seconds <= frames[last - 1].seconds)
                 throw std::invalid_argument("Trajectory timestamps must increase within a shot");
             ++last;

@@ -8,7 +8,7 @@
 #include <cmath>
 
 TEST_CASE("CPU identity preserves pixels and downloaded images own their storage", "[backend]") {
-    std::vector<uint8_t> pixels(96 * 64 * 3);
+    std::vector<uint8_t> pixels(size_t{96} * 64 * 3);
     for (size_t i = 0; i < pixels.size(); ++i)
         pixels[i] = (i * 17) % 256;
     auto input = stillflow::make_host_image({96, 64}, stillflow::PixelFormat::bgr8, pixels);
@@ -22,7 +22,7 @@ TEST_CASE("CPU identity preserves pixels and downloaded images own their storage
     auto output = cpu->download();
     cpu.reset();
     auto view = stillflow::map_host_image(output);
-    REQUIRE(std::equal(pixels.begin(), pixels.end(), view.bytes.begin()));
+    REQUIRE(std::equal(pixels.begin(), pixels.end(), view.planes[0].bytes.begin()));
 }
 #ifdef STILLFLOW_TEST_CUDA
 TEST_CASE("CPU and CUDA agree on fractional mesh samples", "[backend][cuda]") {
@@ -32,7 +32,7 @@ TEST_CASE("CPU and CUDA agree on fractional mesh samples", "[backend][cuda]") {
     } catch (const stillflow::BackendError& e) {
         SKIP(e.what());
     }
-    std::vector<uint8_t> pixels(96 * 64 * 3);
+    std::vector<uint8_t> pixels(size_t{96} * 64 * 3);
     for (size_t i = 0; i < pixels.size(); ++i)
         pixels[i] = (i * 17) % 256;
     auto input = stillflow::make_host_image({96, 64}, stillflow::PixelFormat::bgr8, pixels);
@@ -51,7 +51,7 @@ TEST_CASE("CPU and CUDA agree on fractional mesh samples", "[backend][cuda]") {
     double sum = 0;
     int maximum = 0;
     for (size_t i = 0; i < pixels.size(); ++i) {
-        const int delta = std::abs(int(a.bytes[i]) - int(b.bytes[i]));
+        const int delta = std::abs(int(a.planes[0].bytes[i]) - int(b.planes[0].bytes[i]));
         sum += delta;
         maximum = std::max(maximum, delta);
     }

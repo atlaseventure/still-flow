@@ -114,9 +114,19 @@ struct DeviceSource {
     int full_range;
 };
 inline DeviceSource yuv_source(const CudaImage& image) {
-    return {nullptr,           image.luma,         image.chroma,    image.luma_pitch, image.chroma_pitch,
-            image.coded.width, image.coded.height, image.rotation,  image.kr,         image.kb,
-            image.chroma_x,    image.chroma_y,     image.full_range};
+    return {nullptr,
+            image.luma,
+            image.chroma,
+            image.luma_pitch,
+            image.chroma_pitch,
+            image.coded.width,
+            image.coded.height,
+            image.rotation,
+            image.color.kr,
+            image.color.kb,
+            image.color.chroma_x,
+            image.color.chroma_y,
+            image.color.full_range};
 }
 
 __device__ inline unsigned char to_byte(float value) {

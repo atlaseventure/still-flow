@@ -1,5 +1,5 @@
 #include "stillflow/adapters/backends.hpp"
-#include "stillflow/application/stabilize.hpp"
+#include "stillflow/adapters/stabilize.hpp"
 #include "stillflow/backends/cpu.hpp"
 #ifdef STILLFLOW_CLI_CUDA
 #include "stillflow/backends/cuda.hpp"
@@ -198,6 +198,8 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Unknown option: " + option);
         }
         o = stillflow::resolve_options(std::move(o));
+        auto executor = stillflow::make_thread_executor(o.threads);
+        o.execution.executor = executor.get();
         auto media = stillflow::make_media_factory();
         auto images = stillflow::make_image_processing();
 #ifdef STILLFLOW_CLI_CUDA
@@ -207,7 +209,7 @@ int main(int argc, char** argv) {
 #ifdef STILLFLOW_CLI_CUDA
         providers.push_back({"cuda", stillflow::make_cuda_backend, true});
 #endif
-        providers.push_back({"cpu", stillflow::make_cpu_backend});
+        providers.push_back({"cpu", [&] { return stillflow::make_cpu_backend(o.execution); }});
         auto renderers = stillflow::make_renderer_factory(std::move(providers));
         auto outputs = stillflow::make_output_storage();
         auto runtime = stillflow::make_runtime();

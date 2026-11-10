@@ -1,5 +1,6 @@
-#include "stillflow/application/stabilize.hpp"
+#include "stillflow/adapters/stabilize.hpp"
 #include "pipeline.hpp"
+#include "stillflow/application/engine.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <algorithm>
 #include <array>
@@ -12,6 +13,11 @@
 
 namespace stillflow {
 namespace {
+using Clock = std::chrono::steady_clock;
+double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+double milliseconds(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
 // Frames buffered between stages. Small depths keep memory bounded while
 // letting decode, rendering and each encoder run concurrently.
 constexpr size_t frame_queue_depth = 4;
@@ -109,12 +115,13 @@ void bridge_gaps(Analysis& analysis, const Options& options, Services& services,
     std::vector<Image> proxies;
     VideoFrame source;
     while (window < windows.size() && reader->next(source)) {
+        options.execution.check();
         const auto [begin, end] = windows[window];
         if (index >= frames.size() ||
             std::abs((source.pts_us - analysis.origin) / 1000000.0 - frames[index].seconds) > 0.000001)
             throw std::runtime_error("Input changed during tracking recovery");
         if (index >= begin)
-            proxies.push_back(services.images.gray_proxy(source.bgr, analysis.size));
+            proxies.push_back(services.images.gray_proxy(source.image, analysis.size));
         if (index == end) {
             std::vector<TemporalLink> links;
             for (size_t to = 2; to < proxies.size(); ++to)
@@ -184,18 +191,19 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
     analyzers.reserve(workers);
     for (int i = 0; i < workers; ++i)
         analyzers.push_back(services.images.analyzer(options, result.horizontal));
-    std::vector<Profile> worker_profiles(workers);
+    std::vector<Profile> worker_profiles(workers, Profile(now_ms));
     // Indexed by frame; owned separately so workers write through stable pointers.
     std::vector<std::unique_ptr<Motion>> estimated;
     Channel<VideoFrame> decoded(frame_queue_depth);
     Channel<Task> tasks(static_cast<size_t>(workers) * 2);
-    Profile decode_profile;
+    Profile decode_profile(now_ms);
     ThreadGroup group;
     group.watch(decoded);
     group.watch(tasks);
     group.spawn([&] {
         VideoFrame frame;
         for (;;) {
+            options.execution.check();
             {
                 ScopeTimer timer(decode_profile, "analysis.decode");
                 if (!reader->next(frame))
@@ -216,6 +224,7 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
     try {
         Image previous;
         while (auto decoded_frame = decoded.pop()) {
+            options.execution.check();
             renderer.poll(profile);
             const auto& source = *decoded_frame;
             if (frames.empty())
@@ -223,7 +232,7 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
             Image current;
             {
                 ScopeTimer timer(profile, "analysis.preprocess");
-                current = services.images.gray_proxy(source.bgr, result.size);
+                current = services.images.gray_proxy(source.image, result.size);
             }
             FrameMotion frame;
             frame.seconds = (source.pts_us - result.origin) / 1000000.0;
@@ -261,12 +270,12 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
             frames[i].motion = std::move(*estimated[i]);
     }
     bridge_gaps(result, options, services, profile);
-    int segment = 0;
-    for (size_t i = 0; i < frames.size(); ++i) {
-        if (i && frames[i].motion.reset)
-            ++segment;
-        frames[i].segment = segment;
-    }
+    Analyzer collector(options, result.size, info.fps, result.horizontal, nullptr, options.execution);
+    for (auto& frame : frames)
+        collector.push_observation(std::move(frame.motion),
+                                   result.origin + static_cast<int64_t>(std::llround(frame.seconds * 1000000)),
+                                   static_cast<int64_t>(std::llround(frame.duration * 1000000)));
+    result.frames = collector.finish_analysis().frames;
     services.progress.analyzed(frames.size(), true);
     services.progress.codec("analysis_decoder", result.decoder);
     return result;
@@ -304,6 +313,7 @@ void write_stream(Channel<EncodeItem>& queue, VideoWriter& writer, ImageProcessi
 
 RunSummary stabilize(const Options& request, Services services) {
     const auto options = resolve_options(request);
+    options.execution.check();
     const auto start = Clock::now();
     const auto frames_path = frames_report_path(options);
     const std::array outputs{options.output, options.compare, options.report, frames_path};
@@ -312,7 +322,7 @@ RunSummary stabilize(const Options& request, Services services) {
     if (!options.compare.empty())
         services.media.validate_output(options.compare);
     services.runtime.configure(options.threads);
-    Profile profile;
+    Profile profile(now_ms);
     PendingRenderer pending(services.renderers, options.backend, services.progress);
     auto analysis = analyze(options, services, pending, profile);
     const auto& info = analysis.info;
@@ -325,13 +335,15 @@ RunSummary stabilize(const Options& request, Services services) {
     // Actual PTS differences, rather than nominal FPS, define frame durations for VFR files.
     for (size_t i = 0; i + 1 < frames.size(); ++i)
         analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
-    std::vector<Warp> warps;
+    Plan plan;
     {
         ScopeTimer timer(profile, "plan.optimize");
-        warps = plan_warps(frames, analysis_size, options, horizontal);
+        plan = Planner::plan({analysis_size, horizontal, origin, frames}, options, options.execution);
     }
+    auto& warps = plan.warps;
     const auto analysis_ms = milliseconds(start);
     auto& renderer = pending.get(profile);
+    RenderSession session(plan, renderer, options.execution);
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())
@@ -354,7 +366,7 @@ RunSummary stabilize(const Options& request, Services services) {
                                                    *reader, origin, encoding, encoder);
         Channel<DecodedItem> decoded(frame_queue_depth);
         Channel<EncodeItem> encode(frame_queue_depth), compare(frame_queue_depth);
-        Profile decode_profile, encode_profile, compare_profile;
+        Profile decode_profile(now_ms), encode_profile(now_ms), compare_profile(now_ms);
         ThreadGroup group;
         group.watch(decoded);
         group.watch(encode);
@@ -363,6 +375,7 @@ RunSummary stabilize(const Options& request, Services services) {
             AudioPackets audio;
             reader->set_audio_callback([&](const AudioPacket& packet) { audio.push_back(packet.retain()); });
             for (;;) {
+                options.execution.check();
                 DecodedItem item;
                 bool available;
                 {
@@ -386,14 +399,14 @@ RunSummary stabilize(const Options& request, Services services) {
             });
         try {
             while (auto item = decoded.pop()) {
-                EncodeItem out{item->frame.bgr, nullptr, item->frame.pts_us, 0, std::move(item->audio)};
+                options.execution.check();
+                EncodeItem out{item->frame.image, nullptr, item->frame.pts_us, 0, std::move(item->audio)};
                 if (out.input) {
                     const auto pts = item->frame.pts_us;
                     if (rendered >= frames.size() ||
                         std::abs((pts - origin) / 1000000.0 - frames[rendered].seconds) > 0.000001)
                         throw std::runtime_error("Input changed between analysis and render passes");
-                    out.stabilized =
-                        renderer.render(out.input, warps[rendered], analysis_size, options.crop, horizontal, profile);
+                    out.stabilized = session.render(rendered, out.input, profile);
                     out.duration_us = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
                     ++rendered;
                     if (rendered % 120 == 0)
@@ -430,6 +443,7 @@ RunSummary stabilize(const Options& request, Services services) {
     services.outputs.write_report(report_file->temporary(), csv_file->temporary(),
                                   {options, frames_path, info, analysis_size, horizontal, frames, warps, profile,
                                    renderer.report(), std::move(codecs), summary, analysis_ms});
+    options.execution.check();
     output->publish();
     if (comparison)
         comparison->publish();

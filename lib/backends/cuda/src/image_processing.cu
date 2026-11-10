@@ -111,7 +111,7 @@ class CudaImageProcessing final : public ImageProcessing {
         staging_.reserve(bytes);
         const dim3 block(16, 16), grid((size.width + 15) / 16, (size.height + 15) / 16);
         luma_proxy_kernel<<<grid, block, 0, stream_->value>>>(
-            image.luma, image.luma_pitch, image.coded.width, image.coded.height, image.rotation, image.full_range,
+            image.luma, image.luma_pitch, image.coded.width, image.coded.height, image.rotation, image.color.full_range,
             logical.width, logical.height, output_.data(), size.width, size.height);
         check(cudaGetLastError(), "Launch CUDA analysis proxy");
         check(cudaMemcpyAsync(staging_.data(), output_.data(), bytes, cudaMemcpyDeviceToHost, stream_->value),
@@ -138,7 +138,8 @@ class CudaImageProcessing final : public ImageProcessing {
             for (int y = 0; y < combined.height; ++y)
                 for (int x = 0; x < combined.width; ++x)
                     coverage[static_cast<size_t>(y) * combined.width + x] =
-                        composite.bytes[static_cast<size_t>(y) * composite.row_stride + static_cast<size_t>(x) * 3];
+                        composite.planes[0].bytes[static_cast<size_t>(y) * composite.planes[0].row_stride +
+                                                  static_cast<size_t>(x) * 3];
             labels_.reserve(pixels);
             check(cudaMemcpy(labels_.data(), coverage.data(), pixels, cudaMemcpyHostToDevice), "Upload CUDA labels");
             label_size_ = combined;

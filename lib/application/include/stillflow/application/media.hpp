@@ -14,7 +14,7 @@ struct VideoInfo {
     bool horizontal_scan = false;
 };
 struct VideoFrame {
-    Image bgr;
+    Image image;
     int64_t pts_us = 0, duration_us = 0;
 };
 // Codec choice handed to media adapters. "auto" lets the adapter choose,

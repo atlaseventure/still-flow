@@ -19,7 +19,7 @@ class OpenCvImage final : public ImageData {
         auto owner = std::make_shared<const cv::Mat>(pixels_);
         const size_t bytes =
             pixels_.empty() ? 0 : (pixels_.rows - 1) * pixels_.step + pixels_.cols * pixels_.elemSize();
-        return {size(), format(), pixels_.step, {pixels_.data, bytes}, owner};
+        return {size(), format(), {{pixels_.step, {pixels_.data, bytes}}}, owner, {}};
     }
 
   private:
@@ -33,8 +33,8 @@ inline CvReadView read_pixels(const Image& image) {
     auto mapping = map_host_image(image);
     const int type = CV_MAKETYPE(CV_8U, static_cast<int>(pixel_bytes(mapping.format)));
     // OpenCV's input-only APIs accept a mutable Mat header; callers keep pixels read-only.
-    cv::Mat pixels(mapping.size.height, mapping.size.width, type, const_cast<uint8_t*>(mapping.bytes.data()),
-                   mapping.row_stride);
+    cv::Mat pixels(mapping.size.height, mapping.size.width, type, const_cast<uint8_t*>(mapping.planes[0].bytes.data()),
+                   mapping.planes[0].row_stride);
     return {std::move(mapping), std::move(pixels)};
 }
 inline Image image(cv::Mat pixels) { return std::make_shared<OpenCvImage>(std::move(pixels)); }

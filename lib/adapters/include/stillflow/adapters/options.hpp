@@ -1,4 +1,5 @@
 #pragma once
+#include "stillflow/application/runtime.hpp"
 #include "stillflow/domain/settings.hpp"
 #include <filesystem>
 #include <string>
@@ -6,6 +7,7 @@
 namespace stillflow {
 struct Options : StabilizationSettings {
     std::filesystem::path input, output, compare, report;
+    ExecutionSettings execution;
     int threads = 12;
     int crf = 18;
     std::string scan_axis = "auto";

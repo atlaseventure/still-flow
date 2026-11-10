@@ -127,37 +127,37 @@ SwsContext* make_scaler(int width, int height, AVPixelFormat source, AVPixelForm
 void describe_colour(const AVFrame* frame, CudaImage& image) {
     switch (frame->colorspace) {
     case AVCOL_SPC_BT709:
-        image.kr = 0.2126f, image.kb = 0.0722f;
+        image.color.kr = 0.2126f, image.color.kb = 0.0722f;
         break;
     case AVCOL_SPC_BT2020_NCL:
     case AVCOL_SPC_BT2020_CL:
-        image.kr = 0.2627f, image.kb = 0.0593f;
+        image.color.kr = 0.2627f, image.color.kb = 0.0593f;
         break;
     case AVCOL_SPC_FCC:
-        image.kr = 0.30f, image.kb = 0.11f;
+        image.color.kr = 0.30f, image.color.kb = 0.11f;
         break;
     default: // Matches colorspace(): everything else converts as BT.601.
-        image.kr = 0.299f, image.kb = 0.114f;
+        image.color.kr = 0.299f, image.color.kb = 0.114f;
     }
-    image.full_range = frame->color_range == AVCOL_RANGE_JPEG;
+    image.color.full_range = frame->color_range == AVCOL_RANGE_JPEG;
     switch (frame->chroma_location) {
     case AVCHROMA_LOC_CENTER:
-        image.chroma_x = 0.5f, image.chroma_y = 0.5f;
+        image.color.chroma_x = 0.5f, image.color.chroma_y = 0.5f;
         break;
     case AVCHROMA_LOC_TOPLEFT:
-        image.chroma_x = 0, image.chroma_y = 0;
+        image.color.chroma_x = 0, image.color.chroma_y = 0;
         break;
     case AVCHROMA_LOC_TOP:
-        image.chroma_x = 0.5f, image.chroma_y = 0;
+        image.color.chroma_x = 0.5f, image.color.chroma_y = 0;
         break;
     case AVCHROMA_LOC_BOTTOMLEFT:
-        image.chroma_x = 0, image.chroma_y = 1;
+        image.color.chroma_x = 0, image.color.chroma_y = 1;
         break;
     case AVCHROMA_LOC_BOTTOM:
-        image.chroma_x = 0.5f, image.chroma_y = 1;
+        image.color.chroma_x = 0.5f, image.color.chroma_y = 1;
         break;
     default: // Left, the H.264/HEVC default when unspecified.
-        image.chroma_x = 0, image.chroma_y = 0.5f;
+        image.color.chroma_x = 0, image.color.chroma_y = 0.5f;
     }
 }
 AVPixelFormat software_format(const AVFrame* frame) {
@@ -816,9 +816,9 @@ bool Writer::accepts(const CudaImage& image) const {
     // The descriptor must match what NVENC is told: unrotated BT.709 limited
     // range NV12 with left-sited chroma, chroma directly after a pitched luma plane.
     return s.encoder->pix_fmt == AV_PIX_FMT_CUDA && image.device == 0 && image.rotation == 0 &&
-           image.coded.width == s.encoder->width && image.coded.height == s.encoder->height && !image.full_range &&
-           image.kr == 0.2126f && image.kb == 0.0722f && image.chroma_x == 0 && image.chroma_y == 0.5f &&
-           image.luma_pitch == image.chroma_pitch &&
+           image.coded.width == s.encoder->width && image.coded.height == s.encoder->height &&
+           !image.color.full_range && image.color.kr == 0.2126f && image.color.kb == 0.0722f &&
+           image.color.chroma_x == 0 && image.color.chroma_y == 0.5f && image.luma_pitch == image.chroma_pitch &&
            image.luma_pitch <= static_cast<size_t>(std::numeric_limits<int>::max()) &&
            image.chroma == image.luma + image.luma_pitch * image.coded.height;
 }

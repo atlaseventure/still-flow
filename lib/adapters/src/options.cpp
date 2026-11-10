@@ -1,4 +1,4 @@
-#include "stillflow/application/options.hpp"
+#include "stillflow/adapters/options.hpp"
 #include <cmath>
 #include <stdexcept>
 
