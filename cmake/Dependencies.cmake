@@ -241,6 +241,7 @@ ExternalProject_Add(
     LIST_SEPARATOR "|"
     CMAKE_ARGS ${dependency_cmake_args}
                ${cuda_args}
+               "-DBUILD_TESTING:BOOL=${BUILD_TESTING}"
                "-DSTILLFLOW_BUILD_CLI:BOOL=${STILLFLOW_BUILD_CLI}"
                "-DSTILLFLOW_BUILD_ADAPTERS:BOOL=${STILLFLOW_BUILD_ADAPTERS}"
                "-DSTILLFLOW_DEPS_ROOT:PATH=${prefix}"

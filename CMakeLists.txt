@@ -4,6 +4,7 @@ project(
     VERSION 0.1.0
     LANGUAGES C CXX)
 
+option(BUILD_TESTING "Build regression tests" OFF)
 option(STILLFLOW_BUILD_CLI "Build the desktop command-line application" ON)
 option(STILLFLOW_BUILD_ADAPTERS "Build the FFmpeg/OpenCV and desktop adapters" ON)
 option(STILLFLOW_SUPERBUILD "Build pinned dependencies from source" ON)
@@ -63,6 +64,11 @@ endif()
 add_subdirectory(lib)
 if(STILLFLOW_BUILD_CLI)
     add_subdirectory(cli)
+endif()
+
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
 endif()
 
 include(CMakePackageConfigHelpers)
