@@ -74,7 +74,7 @@ if(STILLFLOW_BUILD_ADAPTERS)
         CMAKE_ARGS ${dependency_cmake_args} -DJSON_BuildTests:BOOL=OFF -DJSON_Install:BOOL=ON
         BUILD_COMMAND ${build_command})
 
-    # NASM is built locally so x264 and FFmpeg retain their x86 SIMD kernels.
+    # NASM preserves x86 SIMD kernels in media dependencies.
     ExternalProject_Add(
         dep_nasm
         ${common}
@@ -119,21 +119,21 @@ if(STILLFLOW_BUILD_ADAPTERS)
         INSTALL_COMMAND "${STILLFLOW_MAKE}" install)
 
     ExternalProject_Add(
-        dep_x264
+        dep_openh264
         ${common}
-        URL https://code.videolan.org/videolan/x264/-/archive/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee/x264-0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee.tar.gz
-        URL_HASH SHA256=d0967a1348c85dfde363bb52610403be898171493100561efa0dd05d5fd1ae50
+        URL https://github.com/cisco/openh264/archive/refs/tags/v2.7.0.tar.gz
+        URL_HASH SHA256=5178775c8b440073e70920e97d195efff721c0e56d0a78cc82c919e95d54924d
         DEPENDS dep_nasm
-        CONFIGURE_COMMAND ${build_env} "CC=${CMAKE_C_COMPILER}" <SOURCE_DIR>/configure "--prefix=${prefix}"
-                          --enable-static --enable-pic --disable-cli --disable-opencl
-        BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}"
-        INSTALL_COMMAND "${STILLFLOW_MAKE}" install-lib-static)
-
+        CONFIGURE_COMMAND ""
+        BUILD_IN_SOURCE TRUE
+        BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}" libraries "CC=${CMAKE_C_COMPILER}"
+                      "CXX=${CMAKE_CXX_COMPILER}" BUILDTYPE=Release
+        INSTALL_COMMAND "${STILLFLOW_MAKE}" install-static "PREFIX=${prefix}")
     # NVIDIA codec support is header-only: FFmpeg loads libcuda, libnvcuvid and
     # libnvidia-encode from the driver at runtime, so builds need no CUDA Toolkit
     # and binaries still run without an NVIDIA driver. 12.2 requires driver 550+.
     set(nvidia_codec_args --disable-ffnvcodec --disable-hwaccels)
-    set(ffmpeg_dependencies dep_x264 dep_dav1d dep_zlib)
+    set(ffmpeg_dependencies dep_openh264 dep_dav1d dep_zlib)
     if(STILLFLOW_WITH_NVCODEC)
         ExternalProject_Add(
             dep_nvcodec
@@ -158,12 +158,13 @@ if(STILLFLOW_BUILD_ADAPTERS)
         DEPENDS ${ffmpeg_dependencies}
         CONFIGURE_COMMAND
             ${build_env} <SOURCE_DIR>/configure "--prefix=${prefix}" "--cc=${CMAKE_C_COMPILER}"
-            "--cxx=${CMAKE_CXX_COMPILER}" --pkg-config-flags=--static --disable-autodetect --disable-shared
-            --enable-static --enable-pic --enable-gpl --enable-libx264 --enable-libdav1d --enable-zlib
-            --disable-programs --disable-doc --disable-debug --disable-avdevice --disable-avfilter --disable-swresample
-            --disable-network ${nvidia_codec_args}
+            "--cxx=${CMAKE_CXX_COMPILER}" --pkg-config-flags=--static --disable-autodetect --enable-shared
+            --disable-static --enable-rpath --enable-pic --disable-gpl --disable-nonfree --enable-libopenh264
+            --enable-libdav1d --enable-zlib --disable-programs --disable-doc --disable-debug --disable-avdevice
+            --disable-avfilter --disable-swresample --disable-network ${nvidia_codec_args}
         BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}"
-        INSTALL_COMMAND "${STILLFLOW_MAKE}" install)
+        INSTALL_COMMAND "${STILLFLOW_MAKE}" install
+        COMMAND "${CMAKE_COMMAND}" "-DPREFIX=${prefix}" -P "${CMAKE_SOURCE_DIR}/cmake/RelocateFFmpeg.cmake")
 
     ExternalProject_Add(
         dep_opencv
@@ -223,6 +224,78 @@ if(STILLFLOW_BUILD_ADAPTERS)
     list(APPEND stillflow_dependencies dep_opencv dep_ffmpeg dep_json)
 endif()
 
+# Copy dependency license notices into the install prefix.
+function(stillflow_dependency_notice target name)
+    ExternalProject_Get_Property(${target} SOURCE_DIR)
+    set(notice_dir "${prefix}/share/licenses/stillflow/${name}")
+    set(commands COMMAND "${CMAKE_COMMAND}" -E make_directory "${notice_dir}")
+    foreach(file IN LISTS ARGN)
+        list(
+            APPEND
+            commands
+            COMMAND
+            "${CMAKE_COMMAND}"
+            -E
+            copy_if_different
+            "${SOURCE_DIR}/${file}"
+            "${notice_dir}/")
+    endforeach()
+    ExternalProject_Add_Step(
+        ${target} license_${name}
+        DEPENDEES install ${commands}
+        ALWAYS TRUE)
+endfunction()
+stillflow_dependency_notice(
+    dep_eigen
+    eigen
+    COPYING.MPL2
+    COPYING.BSD
+    COPYING.APACHE
+    COPYING.MINPACK
+    COPYING.README)
+if(STILLFLOW_BUILD_ADAPTERS)
+    stillflow_dependency_notice(dep_ffmpeg ffmpeg COPYING.LGPLv2.1 LICENSE.md)
+    stillflow_dependency_notice(dep_openh264 openh264 LICENSE)
+    stillflow_dependency_notice(dep_dav1d dav1d COPYING)
+    stillflow_dependency_notice(dep_zlib zlib LICENSE)
+    stillflow_dependency_notice(dep_json nlohmann_json LICENSE.MIT)
+    stillflow_dependency_notice(dep_opencv opencv LICENSE)
+    stillflow_dependency_notice(dep_opencv harfbuzz 3rdparty/harfbuzz/COPYING)
+    stillflow_dependency_notice(dep_opencv flann modules/flann/include/opencv2/flann/defines.h)
+endif()
+
+if(STILLFLOW_BUILD_ADAPTERS)
+    set(media_sources dep_ffmpeg dep_openh264 dep_dav1d dep_zlib)
+    if(STILLFLOW_WITH_NVCODEC)
+        list(APPEND media_sources dep_nvcodec)
+    endif()
+    set(source_bundle "${prefix}/share/stillflow/media-sources")
+    set(source_commands COMMAND "${CMAKE_COMMAND}" -E make_directory "${source_bundle}")
+    set(source_manifest "")
+    foreach(dependency IN LISTS media_sources)
+        ExternalProject_Get_Property(${dependency} URL URL_HASH)
+        get_filename_component(archive "${URL}" NAME)
+        list(
+            APPEND
+            source_commands
+            COMMAND
+            "${CMAKE_COMMAND}"
+            -E
+            copy_if_different
+            "${deps}/downloads/${archive}"
+            "${source_bundle}/")
+        string(APPEND source_manifest "${dependency}: ${URL} ${URL_HASH}\n")
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/media-sources.txt" "${source_manifest}")
+    ExternalProject_Get_Property(dep_ffmpeg BINARY_DIR)
+    ExternalProject_Add_Step(
+        dep_ffmpeg source_bundle
+        DEPENDEES install ${source_commands}
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_BINARY_DIR}/media-sources.txt" "${BINARY_DIR}/config.h"
+                "${CMAKE_SOURCE_DIR}/cmake/RelocateFFmpeg.cmake" "${source_bundle}/"
+        ALWAYS TRUE)
+endif()
+
 string(REPLACE ";" "|" cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
 set(cuda_args "-DSTILLFLOW_WITH_CUDA:BOOL=${STILLFLOW_WITH_CUDA}")
 if(STILLFLOW_WITH_CUDA AND CMAKE_CUDA_COMPILER)
@@ -242,6 +315,10 @@ ExternalProject_Add(
     CMAKE_ARGS ${dependency_cmake_args}
                ${cuda_args}
                "-DBUILD_TESTING:BOOL=${BUILD_TESTING}"
+               "-DSTILLFLOW_WITH_OPENCV:BOOL=${STILLFLOW_WITH_OPENCV}"
+               "-DSTILLFLOW_BUILD_C_API:BOOL=${STILLFLOW_BUILD_C_API}"
+               "-DSTILLFLOW_C_API_SHARED:BOOL=${STILLFLOW_C_API_SHARED}"
+               "-DSTILLFLOW_BUILD_EXAMPLES:BOOL=${STILLFLOW_BUILD_EXAMPLES}"
                "-DSTILLFLOW_BUILD_CLI:BOOL=${STILLFLOW_BUILD_CLI}"
                "-DSTILLFLOW_BUILD_ADAPTERS:BOOL=${STILLFLOW_BUILD_ADAPTERS}"
                "-DSTILLFLOW_DEPS_ROOT:PATH=${prefix}"

@@ -26,22 +26,43 @@ find_package(PkgConfig REQUIRED)
 set(ENV{PKG_CONFIG_PATH} "")
 set(ENV{PKG_CONFIG_LIBDIR} "${STILLFLOW_DEPS_ROOT}/lib/pkgconfig")
 set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH FALSE)
+# Re-read metadata when the source build changes codec or license options.
+unset(__pkg_config_checked_FFMPEG CACHE)
 pkg_check_modules(FFMPEG REQUIRED libavformat>=62 libavcodec>=62 libavutil>=60 libswscale>=9)
 
-# Resolve static archives explicitly so a system shared library cannot win lookup.
+# FFmpeg stays replaceable as separate shared libraries.
 add_library(stillflow_ffmpeg INTERFACE)
-target_include_directories(stillflow_ffmpeg SYSTEM INTERFACE ${FFMPEG_STATIC_INCLUDE_DIRS})
-target_compile_options(stillflow_ffmpeg INTERFACE ${FFMPEG_STATIC_CFLAGS_OTHER})
-foreach(library IN LISTS FFMPEG_STATIC_LIBRARIES)
-    if(EXISTS "${STILLFLOW_DEPS_ROOT}/lib/lib${library}.a")
-        target_link_libraries(stillflow_ffmpeg INTERFACE "${STILLFLOW_DEPS_ROOT}/lib/lib${library}.a")
-    elseif(library MATCHES "^(m|pthread|dl|rt|atomic)$")
-        target_link_libraries(stillflow_ffmpeg INTERFACE "${library}")
-    else()
-        message(FATAL_ERROR "Unmanaged FFmpeg dependency: ${library}")
+target_include_directories(stillflow_ffmpeg SYSTEM INTERFACE ${FFMPEG_INCLUDE_DIRS})
+target_compile_options(stillflow_ffmpeg INTERFACE ${FFMPEG_CFLAGS_OTHER})
+foreach(library avformat avcodec swscale avutil)
+    set(shared_library
+        "${STILLFLOW_DEPS_ROOT}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}${library}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    if(NOT EXISTS "${shared_library}")
+        message(FATAL_ERROR "Shared FFmpeg library missing: ${shared_library}; rebuild the dependency prefix")
     endif()
+    add_library(stillflow_ffmpeg_${library} SHARED IMPORTED GLOBAL)
+    set_target_properties(stillflow_ffmpeg_${library} PROPERTIES IMPORTED_LOCATION "${shared_library}")
+    target_link_libraries(stillflow_ffmpeg INTERFACE stillflow_ffmpeg_${library})
+    file(GLOB runtime_libraries "${shared_library}*")
+    install(FILES ${runtime_libraries} DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endforeach()
-target_link_options(stillflow_ffmpeg INTERFACE ${FFMPEG_STATIC_LDFLAGS_OTHER})
+# Verify the actual shared library, including externally supplied prefixes.
+include(CheckCXXSourceRuns)
+set(CMAKE_REQUIRED_LIBRARIES stillflow_ffmpeg_avcodec)
+set(CMAKE_REQUIRED_INCLUDES ${FFMPEG_INCLUDE_DIRS})
+unset(STILLFLOW_FFMPEG_IS_LGPL CACHE)
+check_cxx_source_runs(
+    "#include <cstring>
+extern \"C\" {
+#include <libavcodec/avcodec.h>
+}
+int main() { return std::strncmp(avcodec_license(), \"LGPL\", 4); }"
+    STILLFLOW_FFMPEG_IS_LGPL)
+unset(CMAKE_REQUIRED_LIBRARIES)
+unset(CMAKE_REQUIRED_INCLUDES)
+if(NOT STILLFLOW_FFMPEG_IS_LGPL)
+    message(FATAL_ERROR "The desktop module requires LGPL FFmpeg shared libraries")
+endif()
 
 add_library(stillflow_media STATIC src/media.cpp src/media_adapter.cpp)
 add_library(stillflow_images STATIC src/image_processing.cpp)

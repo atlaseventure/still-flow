@@ -5,6 +5,7 @@ set_target_properties(stillflow_domain PROPERTIES EXPORT_NAME domain POSITION_IN
 target_compile_features(stillflow_domain PUBLIC cxx_std_20)
 target_include_directories(stillflow_domain PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/domain/include>
                                                    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(stillflow_domain PRIVATE EIGEN_MPL2_ONLY)
 target_link_libraries(stillflow_domain PRIVATE $<BUILD_INTERFACE:Eigen3::Eigen>)
 
 add_library(stillflow_application STATIC application/src/engine.cpp vision/src/portable.cpp application/src/image.cpp

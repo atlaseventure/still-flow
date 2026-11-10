@@ -79,7 +79,7 @@ void deinterleave(const AVFrame* semi, AVFrame* planar) {
         }
     }
 }
-// Maps x264 preset names onto NVENC's p1 (fastest) .. p7 (best) scale.
+// Maps speed preset names onto NVENC's p1 (fastest) .. p7 (best) scale.
 const char* nvenc_preset(const std::string& preset) {
     static const std::map<std::string, const char*> presets{
         {"ultrafast", "p1"}, {"superfast", "p1"}, {"veryfast", "p2"}, {"faster", "p3"},   {"fast", "p4"},
@@ -88,7 +88,7 @@ const char* nvenc_preset(const std::string& preset) {
         {"p6", "p6"},        {"p7", "p7"}};
     const auto found = presets.find(preset);
     if (found == presets.end())
-        throw std::invalid_argument("Preset " + preset + " has no NVENC equivalent; use an x264 preset or p1..p7");
+        throw std::invalid_argument("Preset " + preset + " has no NVENC equivalent; use a speed preset or p1..p7");
     return found->second;
 }
 int colorspace(AVColorSpace space) {
@@ -651,11 +651,13 @@ EncoderContext allocate_encoder(const char* name, const EncoderSettings& setting
         encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     return encoder;
 }
-EncoderContext open_x264(const EncoderSettings& settings) {
-    auto encoder = allocate_encoder("libx264", settings);
-    check(av_opt_set(encoder->priv_data, "preset", settings.preset.c_str(), 0), "Set encoder preset");
-    check(av_opt_set_int(encoder->priv_data, "crf", settings.crf, 0), "Set CRF");
-    check(avcodec_open2(encoder.get(), encoder->codec, nullptr), "Open encoder");
+EncoderContext open_openh264(const EncoderSettings& settings) {
+    auto encoder = allocate_encoder("libopenh264", settings);
+    encoder->profile = AV_PROFILE_H264_MAIN;
+    encoder->bit_rate = 0;
+    encoder->qmin = encoder->qmax = settings.crf;
+    check(av_opt_set(encoder->priv_data, "rc_mode", "off", 0), "Set OpenH264 quality mode");
+    check(avcodec_open2(encoder.get(), encoder->codec, nullptr), "Open OpenH264 encoder");
     return encoder;
 }
 // Encodes CUDA NV12 frames, so rendered frames are read in place and host frames
@@ -713,8 +715,8 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     check(avformat_alloc_output_context2(&s.format, nullptr, nullptr, path.c_str()), "Create output container");
     if (!s.format)
         throw std::runtime_error("Unrecognized output container");
-    if (request.name != "auto" && request.name != "x264" && request.name != "nvenc")
-        throw std::invalid_argument("Unknown encoder " + request.name + "; use auto, x264 or nvenc");
+    if (request.name != "auto" && request.name != "openh264" && request.name != "nvenc")
+        throw std::invalid_argument("Unknown encoder " + request.name + "; use auto, openh264 or nvenc");
     const bool global_header = (s.format->oformat->flags & AVFMT_GLOBALHEADER) != 0;
     const EncoderSettings settings{size, fps, threads, crf, preset, global_header};
     s.codec.request = request;
@@ -738,7 +740,7 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
         }
     }
     if (!encoder)
-        encoder = open_x264(settings);
+        encoder = open_openh264(settings);
     s.codec.implementation = encoder->codec->name;
     s.encoder = encoder.release();
     s.video = avformat_new_stream(s.format, nullptr);

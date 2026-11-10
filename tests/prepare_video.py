@@ -135,7 +135,11 @@ def main():
     streams = json.loads(probe.stdout)["streams"]
     audio = sum(s["codec_type"] == "audio" for s in streams)
     report = json.loads((args.output / "output.mp4.profile.json").read_text())
-    (args.output / "metrics.txt").write_text(f"{len(output)} {audio} {before} {after} {report['video']['frames']}\n")
+    lgpl = int(report["build"]["ffmpeg_license"].startswith("LGPL"))
+    encoder = report["codecs"]["encoder"]["implementation"]
+    (args.output / "metrics.txt").write_text(
+        f"{len(output)} {audio} {before} {after} {report['video']['frames']} {lgpl} {encoder}\n"
+    )
     print(f"Reference-relative jitter: {before:.6f} -> {after:.6f}")
 
 

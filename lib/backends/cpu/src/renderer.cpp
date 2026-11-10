@@ -52,7 +52,9 @@ class CpuBackend final : public RenderBackend {
                 }
             }
         });
-        output_ = make_host_image(size, mapping_.format, std::move(pixels));
+        auto output = map_host_image(make_host_image(size, mapping_.format, std::move(pixels)));
+        output.color = mapping_.color;
+        output_ = borrow_host_image(std::move(output));
         size_t count = 0;
         for (auto n : invalid)
             count += n;

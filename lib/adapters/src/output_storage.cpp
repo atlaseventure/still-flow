@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <thread>
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 }
 
@@ -236,6 +237,7 @@ class LocalOutputStorage final : public OutputStorage {
               {"cplusplus", __cplusplus},
               {"opencv", CV_VERSION},
               {"ffmpeg", av_version_info()},
+              {"ffmpeg_license", avcodec_license()},
               {"logical_cpus", std::thread::hardware_concurrency()},
 #ifdef NDEBUG
               {"configuration", "release"}

@@ -13,6 +13,9 @@ if(STILLFLOW_BUILD_CLI AND NOT STILLFLOW_BUILD_ADAPTERS)
     message(FATAL_ERROR "The CLI requires STILLFLOW_BUILD_ADAPTERS")
 endif()
 
+option(STILLFLOW_BUILD_EXAMPLES "Build the in-memory C example" ON)
+option(STILLFLOW_BUILD_C_API "Build the stable C interface" ON)
+option(STILLFLOW_C_API_SHARED "Build the C interface as a shared library" ON)
 option(STILLFLOW_WITH_CUDA "Build CUDA rendering when a toolkit is available" ON)
 option(STILLFLOW_WITH_NVCODEC "Build FFmpeg with runtime-loaded NVDEC/NVENC support" ON)
 if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_WITH_CUDA)
@@ -36,9 +39,16 @@ if(STILLFLOW_SUPERBUILD
    AND NOT STILLFLOW_DEPS_ROOT
    AND STILLFLOW_BUILD_ADAPTERS)
     include(cmake/Dependencies.cmake)
+    if(BUILD_TESTING)
+        enable_testing()
+        add_test(NAME application_regression COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${CMAKE_BINARY_DIR}/app"
+                                                     --output-on-failure --stop-on-failure)
+    endif()
     return()
 endif()
 
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -73,12 +83,23 @@ else()
 endif()
 
 include(GNUInstallDirs)
+if(WIN32)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 if(STILLFLOW_BUILD_ADAPTERS
    AND STILLFLOW_WITH_CUDA
    AND CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
 endif()
 add_subdirectory(lib)
+if(STILLFLOW_BUILD_C_API)
+    add_subdirectory(api/c)
+elseif(STILLFLOW_BUILD_CLI)
+    message(FATAL_ERROR "The CLI requires STILLFLOW_BUILD_C_API")
+endif()
+if(STILLFLOW_BUILD_EXAMPLES AND STILLFLOW_BUILD_C_API)
+    add_subdirectory(examples/memory)
+endif()
 if(STILLFLOW_BUILD_CLI)
     add_subdirectory(cli)
 endif()
@@ -102,3 +123,28 @@ install(
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/StillFlowConfig.cmake"
               "${CMAKE_CURRENT_BINARY_DIR}/StillFlowConfigVersion.cmake"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/StillFlow")
+
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow")
+
+if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_DEPS_ROOT)
+    install(
+        DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/licenses/stillflow/"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow"
+        OPTIONAL)
+endif()
+
+if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_DEPS_ROOT)
+    install(
+        DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/stillflow/media-sources"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/stillflow"
+        OPTIONAL)
+endif()
+
+install(DIRECTORY licenses/eigen/ DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/eigen")
+get_target_property(eigen_source_roots Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+foreach(eigen_source_root IN LISTS eigen_source_roots)
+    if(EXISTS "${eigen_source_root}/Eigen/Core")
+        install(DIRECTORY "${eigen_source_root}/Eigen" DESTINATION "${CMAKE_INSTALL_DATADIR}/stillflow/eigen-source")
+        break()
+    endif()
+endforeach()

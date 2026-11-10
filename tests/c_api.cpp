@@ -1,0 +1,138 @@
+#include "stillflow/stillflow.h"
+#include <array>
+#include <catch2/catch_test_macros.hpp>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+namespace {
+struct Api {
+    sf_settings settings{};
+    sf_video video{sizeof(sf_video), 64, 64, 0, 30};
+    sf_image image{};
+    sf_error error{};
+    std::vector<uint8_t> pixels = std::vector<uint8_t>(4096);
+    sf_analyzer* analyzer = nullptr;
+    sf_plan* plan = nullptr;
+    sf_renderer* renderer = nullptr;
+    sf_frame* frame = nullptr;
+    Api() {
+        settings.struct_size = sizeof(settings);
+        REQUIRE(sf_settings_default(&settings) == SF_OK);
+        image.struct_size = sizeof(image);
+        REQUIRE(sf_image_default(&image) == SF_OK);
+        error.struct_size = sizeof(error);
+        uint32_t seed = 42;
+        for (auto& p : pixels) {
+            seed = seed * 1664525 + 1013904223;
+            p = seed >> 24;
+        }
+        image.width = 64;
+        image.height = 64;
+        image.format = SF_GRAY8;
+        image.plane_count = 1;
+        image.planes[0] = {sizeof(sf_plane), pixels.data(), pixels.size(), 64};
+    }
+    ~Api() {
+        sf_frame_destroy(frame);
+        sf_renderer_destroy(renderer);
+        sf_plan_destroy(plan);
+        sf_analyzer_destroy(analyzer);
+    }
+    void create(const sf_runtime* runtime = nullptr) {
+        REQUIRE(sf_analyzer_create(&settings, &video, runtime, &analyzer, &error) == SF_OK);
+    }
+};
+} // namespace
+TEST_CASE("C ABI validates structure sizes and contains exceptions", "[c-api]") {
+    Api api;
+    auto bad = api.settings;
+    bad.struct_size = 1;
+    REQUIRE(sf_analyzer_create(&bad, &api.video, nullptr, &api.analyzer, &api.error) == SF_INVALID_ARGUMENT);
+    REQUIRE(api.analyzer == nullptr);
+    REQUIRE(std::strlen(api.error.message) > 0);
+    api.create();
+    auto invalid = api.image;
+    invalid.planes[0].row_stride = 1;
+    REQUIRE(sf_analyzer_push(api.analyzer, &invalid, 0, 33333, &api.error) == SF_INVALID_ARGUMENT);
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_OK);
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_INVALID_ARGUMENT);
+    REQUIRE(sf_analyzer_finish(api.analyzer, &api.plan, &api.error) == SF_OK);
+    sf_plan* extra = nullptr;
+    REQUIRE(sf_analyzer_finish(api.analyzer, &extra, &api.error) == SF_INVALID_STATE);
+    REQUIRE(extra == nullptr);
+    struct Extended {
+        sf_settings settings;
+        std::array<uint8_t, 16> tail;
+    } extended{};
+    extended.settings.struct_size = sizeof(extended);
+    extended.tail.fill(0xAB);
+    REQUIRE(sf_settings_default(&extended.settings) == SF_OK);
+    REQUIRE(extended.tail[0] == 0xAB);
+}
+TEST_CASE("C ABI retains input leases and renders independently owned output", "[c-api]") {
+    int leases = 0;
+    Api api;
+    api.image.kr = 0.299f;
+    api.image.kb = 0.114f;
+    api.image.full_range = 1;
+    api.image.user_data = &leases;
+    api.image.retain = [](void* p) { ++*static_cast<int*>(p); };
+    api.image.release = [](void* p) { --*static_cast<int*>(p); };
+    api.create();
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_OK);
+    REQUIRE(leases == 1);
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 33333, 33333, &api.error) == SF_OK);
+    REQUIRE(leases == 1);
+    REQUIRE(sf_analyzer_finish(api.analyzer, &api.plan, &api.error) == SF_OK);
+    REQUIRE(leases == 0);
+    sf_plan_info info{};
+    info.struct_size = sizeof(info);
+    REQUIRE(sf_plan_get_info(api.plan, &info, &api.error) == SF_OK);
+    REQUIRE(info.frames == 2);
+    REQUIRE(sf_renderer_create(nullptr, &api.renderer, &api.error) == SF_OK);
+    REQUIRE(sf_renderer_render(api.renderer, api.plan, 0, &api.image, &api.frame, &api.error) == SF_OK);
+    sf_image output{};
+    output.struct_size = sizeof(output);
+    REQUIRE(sf_frame_get_image(api.frame, &output, &api.error) == SF_OK);
+    REQUIRE(output.kr == api.image.kr);
+    REQUIRE(output.kb == api.image.kb);
+    REQUIRE(output.full_range == 1);
+    auto value = output.planes[0].data[0];
+    sf_renderer_destroy(api.renderer);
+    api.renderer = nullptr;
+    REQUIRE(output.planes[0].data[0] == value);
+    REQUIRE(leases == 0);
+}
+TEST_CASE("C ABI translates cancellation and invalid host scheduler behavior into status codes", "[c-api]") {
+    Api api;
+    bool stop = false;
+    sf_runtime runtime{sizeof(runtime), &stop, [](void* p) -> int32_t { return *static_cast<bool*>(p); }, nullptr,
+                       nullptr};
+    api.create(&runtime);
+    stop = true;
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_CANCELLED);
+    stop = false;
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_OK);
+    runtime.execute = [](void*, size_t, sf_work_fn, void*) {};
+    Api broken;
+    broken.create(&runtime);
+    REQUIRE(sf_analyzer_push(broken.analyzer, &broken.image, 0, 33333, &broken.error) == SF_OK);
+    REQUIRE(sf_analyzer_push(broken.analyzer, &broken.image, 33333, 33333, &broken.error) == SF_INVALID_ARGUMENT);
+}
+
+TEST_CASE("C ABI copies borrowed frames and validates YUV plane extents", "[c-api]") {
+    Api api;
+    api.create();
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_OK);
+    std::fill(api.pixels.begin(), api.pixels.end(), 0);
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 33333, 33333, &api.error) == SF_OK);
+    api.image.format = SF_NV12;
+    api.image.plane_count = 2;
+    std::vector<uint8_t> chroma(2048, 128);
+    api.image.planes[1] = {sizeof(sf_plane), chroma.data(), 10, 64};
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 66666, 33333, &api.error) == SF_INVALID_ARGUMENT);
+    api.image.planes[1].size_bytes = chroma.size();
+    REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 66666, 33333, &api.error) == SF_OK);
+    REQUIRE(sf_analyzer_finish(api.analyzer, &api.plan, &api.error) == SF_OK);
+}

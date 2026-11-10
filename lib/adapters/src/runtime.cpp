@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <sys/resource.h>
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/log.h>
 }
 
@@ -42,6 +43,8 @@ class ThreadExecutor final : public Executor {
 class HostRuntime final : public Runtime {
   public:
     void configure(int threads) override {
+        if (!std::string_view(avcodec_license()).starts_with("LGPL"))
+            throw std::runtime_error("Desktop processing requires LGPL FFmpeg");
         cv::setNumThreads(threads);
         cv::setRNGSeed(42);
         av_log_set_level(AV_LOG_WARNING);
@@ -57,5 +60,8 @@ class HostRuntime final : public Runtime {
 } // namespace
 std::unique_ptr<Executor> make_thread_executor(int workers) { return std::make_unique<ThreadExecutor>(workers); }
 std::unique_ptr<Runtime> make_runtime() { return std::make_unique<HostRuntime>(); }
-std::string build_description() { return "stillflow " STILLFLOW_VERSION " (C++20, OpenCV " CV_VERSION ")"; }
+std::string build_description() {
+    return "stillflow " STILLFLOW_VERSION " (C++20, OpenCV " CV_VERSION ", FFmpeg " + std::string(avcodec_license()) +
+           ")";
+}
 } // namespace stillflow

@@ -1,0 +1,156 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "core",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/core-sdk",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "STILLFLOW_BUILD_ADAPTERS": false,
+        "STILLFLOW_BUILD_CLI": false,
+        "BUILD_TESTING": true
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-gcc",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++",
+        "BUILD_TESTING": true
+      }
+    },
+    {
+      "name": "linux-clang",
+      "inherits": "linux-gcc",
+      "binaryDir": "${sourceDir}/build/linux-clang",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "STILLFLOW_WITH_CUDA": false
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "inherits": "core",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/windows-msvc"
+    },
+    {
+      "name": "macos",
+      "inherits": "core",
+      "binaryDir": "${sourceDir}/build/macos"
+    },
+    {
+      "name": "linux-aarch64-cross",
+      "inherits": "core",
+      "binaryDir": "${sourceDir}/build/linux-aarch64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-aarch64.cmake",
+      "cacheVariables": {
+        "BUILD_TESTING": false
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "core",
+      "configurePreset": "core",
+      "configuration": "Release",
+      "jobs": 12
+    },
+    {
+      "name": "linux-gcc",
+      "configurePreset": "linux-gcc",
+      "configuration": "Release",
+      "jobs": 12
+    },
+    {
+      "name": "linux-clang",
+      "configurePreset": "linux-clang",
+      "configuration": "Release",
+      "jobs": 12
+    },
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release",
+      "jobs": 12
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
+      "configuration": "Release",
+      "jobs": 12
+    },
+    {
+      "name": "linux-aarch64-cross",
+      "configurePreset": "linux-aarch64-cross",
+      "configuration": "Release",
+      "jobs": 12
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "core",
+      "configurePreset": "core",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "configurePreset": "linux-gcc",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    },
+    {
+      "name": "linux-clang",
+      "configurePreset": "linux-clang",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    },
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "stopOnFailure": true
+      }
+    }
+  ]
+}
