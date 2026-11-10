@@ -13,7 +13,15 @@ if(@STILLFLOW_WITH_OPENCV@ AND (NOT @STILLFLOW_C_API_SHARED@ OR "vision_opencv" 
         features)
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/StillFlowTargets.cmake")
-foreach(component domain application backend_cpu c desktop_c vision_opencv)
+foreach(
+    component
+    domain
+    application
+    backend_cpu
+    backend_gles
+    c
+    desktop_c
+    vision_opencv)
     if(TARGET StillFlow::${component})
         set(StillFlow_${component}_FOUND TRUE)
     endif()

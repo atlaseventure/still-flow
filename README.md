@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Offline video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine and a C API. CPU rendering is portable; CUDA and NVDEC/NVENC are optional. Targets are Linux amd64 and Android arm64-v8a; Android provides the core SDK, with Kotlin integration reserved.
+Offline video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine, a C API and an Android AAR for Kotlin/Java. Targets are Linux amd64 and Android arm64-v8a. Desktop GPU processing uses CUDA and NVDEC/NVENC; Android provides OpenGL ES compute rendering and hardware MediaCodec integration.
 
 ## Build and run
 
@@ -32,12 +32,22 @@ cmake --install build/core-sdk --prefix /path/to/sdk
 
 Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Frames can be pushed into an analyzer, planned, then rendered by index. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. C API structures, ownership and callbacks are documented in the installed headers.
 
-For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android, set `ANDROID_NDK_HOME` to an installed NDK directory, then build the core SDK (Android API 26 or later):
+For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android native consumers, set `ANDROID_NDK_HOME` to an installed NDK directory:
 
 ```sh
 cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
+
+## Android
+
+Build the Kotlin/Java AAR with an installed JDK, Android SDK/NDK and CMake. Set `ANDROID_HOME` to the SDK directory:
+
+```sh
+./api/android/gradlew -p api/android assembleRelease
+```
+
+Android requires API 26 or later. Rendering defaults to GPU with CPU fallback; hardware codec helpers select hardware implementations. Media input, output and scheduling belong to the host app. See [Android integration](api/android/README.md) for usage. Native build concurrency defaults to 12; override with `-Pstillflow.jobs=N`.
 
 ## Tests and quality
 

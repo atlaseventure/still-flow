@@ -4,3 +4,8 @@
 /CMakeUserPresets.json
 /compile_commands.json
 /scripts/__pycache__/
+/api/android/.gradle/
+/api/android/.kotlin/
+/api/android/.cxx/
+/api/android/build/
+/api/android/local.properties

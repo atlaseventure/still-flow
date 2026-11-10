@@ -86,6 +86,15 @@ SF_API void sf_analyzer_destroy(sf_analyzer*);
 SF_API sf_status sf_plan_get_info(const sf_plan*, sf_plan_info*, sf_error*);
 SF_API void sf_plan_destroy(sf_plan*);
 SF_API sf_status sf_renderer_create(const sf_runtime*, sf_renderer**, sf_error*);
+/* Explicit backend selection: "cpu", "gles" (Android), or "auto".
+   auto prefers the platform GPU and falls back to CPU on backend failures. */
+SF_API sf_status sf_renderer_create_backend(const char* backend, const sf_runtime*, sf_renderer**, sf_error*);
+typedef struct sf_renderer_info {
+    size_t struct_size;
+    char backend[32], device[256], fallback_reason[512];
+    int32_t gpu;
+} sf_renderer_info;
+SF_API sf_status sf_renderer_get_info(const sf_renderer*, sf_renderer_info*, sf_error*);
 /* Packed gray8/BGR8/RGBA8 render output. Feed YUV luma to analysis; convert
    chroma through a platform renderer when full-color YUV rendering is needed. */
 SF_API sf_status sf_renderer_render(sf_renderer*, sf_plan*, size_t index, const sf_image*, sf_frame**, sf_error*);

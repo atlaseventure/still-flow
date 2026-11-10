@@ -1,5 +1,8 @@
 #include "internal.hpp"
 #include "stillflow/backends/cpu.hpp"
+#ifdef STILLFLOW_C_GLES
+#include "stillflow/backends/gles.hpp"
+#endif
 #include <cmath>
 
 using namespace stillflow;
@@ -55,9 +58,14 @@ struct sf_plan {
 struct sf_renderer {
     c_api::Runtime runtime;
     std::unique_ptr<Renderer> renderer;
-    explicit sf_renderer(const sf_runtime* callbacks) : runtime(callbacks) {
-        auto factory = make_renderer_factory({{"cpu", [this] { return make_cpu_backend(runtime.settings()); }}});
-        renderer = factory->create("cpu");
+    explicit sf_renderer(const sf_runtime* callbacks, const std::string& backend) : runtime(callbacks) {
+        std::vector<BackendProvider> providers;
+#ifdef STILLFLOW_C_GLES
+        providers.push_back({"gles", [] { return make_gles_backend(); }, true});
+#endif
+        providers.push_back({"cpu", [this] { return make_cpu_backend(runtime.settings()); }});
+        auto factory = make_renderer_factory(std::move(providers));
+        renderer = factory->create(backend);
     }
 };
 struct sf_frame {
@@ -150,14 +158,38 @@ sf_status sf_plan_get_info(const sf_plan* plan, sf_plan_info* info, sf_error* er
 }
 void sf_plan_destroy(sf_plan* plan) { delete plan; }
 sf_status sf_renderer_create(const sf_runtime* callbacks, sf_renderer** out, sf_error* error) {
+    return sf_renderer_create_backend("cpu", callbacks, out, error);
+}
+sf_status sf_renderer_create_backend(const char* backend, const sf_runtime* callbacks, sf_renderer** out,
+                                     sf_error* error) {
     if (out)
         *out = nullptr;
     return c_api::boundary(error, [&] {
-        if (!out)
+        if (!out || !backend)
             throw std::invalid_argument("Missing renderer output");
-        auto result = std::make_unique<sf_renderer>(callbacks);
+        auto result = std::make_unique<sf_renderer>(callbacks, backend);
         result->runtime.settings().check();
         *out = result.release();
+    });
+}
+sf_status sf_renderer_get_info(const sf_renderer* renderer, sf_renderer_info* info, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!renderer)
+            throw std::invalid_argument("Missing renderer");
+        c_api::require(info);
+        const auto report = renderer->renderer->report();
+        const auto size = info->struct_size;
+        *info = {};
+        info->struct_size = size;
+        if (!report.backends.empty()) {
+            const auto& active = report.backends.back();
+            std::strncpy(info->backend, active.info.id.c_str(), sizeof(info->backend) - 1);
+            std::strncpy(info->device, active.info.device.c_str(), sizeof(info->device) - 1);
+            info->gpu = active.gpu;
+        }
+        if (!report.failures.empty())
+            std::strncpy(info->fallback_reason, report.failures.back().reason.c_str(),
+                         sizeof(info->fallback_reason) - 1);
     });
 }
 sf_status sf_renderer_render(sf_renderer* renderer, sf_plan* plan, size_t index, const sf_image* image, sf_frame** out,

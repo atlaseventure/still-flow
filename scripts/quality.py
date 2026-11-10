@@ -181,6 +181,38 @@ def lint_cpp(files, build_dir, require_cuda, extra_args, jobs, no_cache):
         raise RuntimeError(f"Missing {database}; configure and build the project first")
     entries = json.loads(database.read_text(encoding="utf-8"))
     sources = {str((ROOT / name).resolve()): name for name in files if Path(name).suffix in SOURCES}
+    configuration = {}
+    cache_file = build_dir / "CMakeCache.txt"
+    if cache_file.is_file():
+        for line in cache_file.read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"([^:#/][^:]*):[^=]+=(.*)", line)
+            if match:
+                configuration[match[1]] = match[2]
+
+    def enabled(option):
+        return configuration.get(option, "ON").upper() not in {"OFF", "FALSE", "NO", "0", ""}
+
+    def inactive(name):
+        if name.startswith("api/android/"):
+            return configuration.get("STILLFLOW_BUILD_ANDROID_JNI") != "ON"
+        if name.startswith("lib/backends/gles/"):
+            return configuration.get("STILLFLOW_TARGET_PLATFORM") != "Android"
+        if name.startswith(("lib/adapters/", "lib/backends/cuda/")) or name == "api/c/src/desktop.cpp":
+            return not enabled("STILLFLOW_BUILD_ADAPTERS")
+        if name.startswith("cli/") or name == "tests/video.cpp":
+            return not enabled("STILLFLOW_BUILD_CLI") or (name.startswith("tests/") and not enabled("BUILD_TESTING"))
+        if name == "tests/backends.cpp":
+            return not enabled("BUILD_TESTING") or not enabled("STILLFLOW_BUILD_ADAPTERS")
+        if name.startswith("api/c/") or name == "tests/c_api.cpp":
+            return not enabled("STILLFLOW_BUILD_C_API") or (name.startswith("tests/") and not enabled("BUILD_TESTING"))
+        if name.startswith("tests/"):
+            return not enabled("BUILD_TESTING")
+        if name.startswith("examples/"):
+            return not enabled("STILLFLOW_BUILD_EXAMPLES") or not enabled("STILLFLOW_BUILD_C_API")
+        if name in {"lib/vision/src/opencv.cpp", "lib/vision/src/motion.cpp"}:
+            return not enabled("STILLFLOW_WITH_OPENCV")
+        return False
+
     selected = []
     covered = set()
     for entry in entries:
@@ -193,7 +225,11 @@ def lint_cpp(files, build_dir, require_cuda, extra_args, jobs, no_cache):
         selected.append(entry)
         covered.add(source)
     missing = sorted(set(sources) - covered)
-    skipped = [sources[name] for name in missing if name.endswith(".cu") and not require_cuda]
+    skipped = [
+        sources[name]
+        for name in missing
+        if not (require_cuda and name.endswith(".cu")) and (inactive(sources[name]) or name.endswith(".cu"))
+    ]
     missing = [sources[name] for name in missing if sources[name] not in skipped]
     if missing:
         raise RuntimeError(f"Sources missing from compilation database: {', '.join(missing)}")

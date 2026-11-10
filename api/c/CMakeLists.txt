@@ -5,6 +5,10 @@ endif()
 add_library(stillflow_c ${api_kind} src/stillflow.cpp)
 add_library(StillFlow::c ALIAS stillflow_c)
 target_link_libraries(stillflow_c PRIVATE StillFlow::application StillFlow::backend_cpu)
+if(TARGET StillFlow::backend_gles)
+    target_link_libraries(stillflow_c PRIVATE StillFlow::backend_gles)
+    target_compile_definitions(stillflow_c PRIVATE STILLFLOW_C_GLES)
+endif()
 if(TARGET StillFlow::vision_opencv)
     target_link_libraries(stillflow_c PRIVATE StillFlow::vision_opencv)
     target_compile_definitions(stillflow_c PRIVATE STILLFLOW_C_OPENCV)
@@ -12,6 +16,7 @@ endif()
 set_target_properties(
     stillflow_c
     PROPERTIES EXPORT_NAME c
+               POSITION_INDEPENDENT_CODE ON
                VERSION ${PROJECT_VERSION}
                SOVERSION 1)
 target_compile_definitions(stillflow_c PRIVATE STILLFLOW_VERSION="${PROJECT_VERSION}")

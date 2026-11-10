@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-离线视频防抖与滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎和 C API。CPU 渲染可独立使用，CUDA 与 NVDEC/NVENC 可选。目标平台为 Linux amd64 与 Android arm64-v8a；Android 提供核心 SDK，Kotlin 集成保留占位。
+离线视频防抖与滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎、C API 和 Kotlin/Java Android AAR。支持 Linux amd64 与 Android arm64-v8a。桌面 GPU 处理使用 CUDA、NVDEC/NVENC；Android 提供 OpenGL ES 计算渲染与硬件 MediaCodec 集成。
 
 ## 构建与使用
 
@@ -32,12 +32,22 @@ cmake --install build/core-sdk --prefix /path/to/sdk
 
 通过 `find_package(StillFlow CONFIG REQUIRED)` 引入，C API 链接 `StillFlow::c`，C++ 接口链接 `StillFlow::application`。调用方推入帧、生成规划，再按索引渲染。可移植估计器处理平移，可选 OpenCV 估计器提供完整跟踪。CPU 渲染支持 gray8、BGR8、RGBA8，分析还支持 YUV 亮度平面。结构体、所有权和回调约定见安装后的头文件。
 
-静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。Android 构建需将 `ANDROID_NDK_HOME` 指向已安装的 NDK 目录，然后构建核心 SDK（Android API 26 及以上）：
+静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。Android 原生开发将 `ANDROID_NDK_HOME` 指向已安装的 NDK 目录：
 
 ```sh
 cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
+
+## Android
+
+构建 Kotlin/Java AAR 需要已安装的 JDK、Android SDK/NDK 和 CMake。将 `ANDROID_HOME` 指向 SDK 目录：
+
+```sh
+./api/android/gradlew -p api/android assembleRelease
+```
+
+Android 要求 API 26 及以上。渲染默认优先使用 GPU，失败时回退 CPU；编解码辅助接口选择硬件实现。媒体输入、输出与任务调度由宿主应用负责。用法见 [Android 集成](api/android/README.md)。原生构建默认并行数为 12，通过 `-Pstillflow.jobs=N` 修改。
 
 ## 测试与质量
 

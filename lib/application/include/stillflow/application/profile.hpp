@@ -32,7 +32,14 @@ class ScopeTimer {
   public:
     ScopeTimer(Profile& profile, std::string stage)
         : profile_(profile), stage_(std::move(stage)), start_(profile.now()) {}
-    ~ScopeTimer() { profile_.add(stage_, profile_.now() - start_); }
+    ~ScopeTimer() noexcept {
+        try {
+            profile_.add(stage_, profile_.now() - start_);
+        } catch (...) {
+            // Optional profiling must not terminate processing, including during unwinding.
+            return;
+        }
+    }
 
   private:
     Profile& profile_;

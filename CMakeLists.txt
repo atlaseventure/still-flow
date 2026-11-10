@@ -3,6 +3,9 @@ project(
     still_flow
     VERSION 0.1.0
     LANGUAGES C CXX)
+set(STILLFLOW_TARGET_PLATFORM
+    "${CMAKE_SYSTEM_NAME}"
+    CACHE INTERNAL "Platform used by quality tooling")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
    AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$"
