@@ -4,11 +4,27 @@ project(
     VERSION 0.1.0
     LANGUAGES C CXX)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$"
+   AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(stillflow_desktop_default ON)
+elseif(
+    CMAKE_SYSTEM_NAME STREQUAL "Android"
+    AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a"
+    AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(stillflow_desktop_default OFF)
+else()
+    message(FATAL_ERROR "Still Flow supports only Linux amd64 and Android arm64-v8a")
+endif()
+
 option(BUILD_TESTING "Build regression tests" OFF)
-option(STILLFLOW_BUILD_CLI "Build the desktop command-line application" ON)
-option(STILLFLOW_BUILD_ADAPTERS "Build the FFmpeg/OpenCV and desktop adapters" ON)
+option(STILLFLOW_BUILD_CLI "Build the desktop command-line application" ${stillflow_desktop_default})
+option(STILLFLOW_BUILD_ADAPTERS "Build the FFmpeg/OpenCV and desktop adapters" ${stillflow_desktop_default})
 option(STILLFLOW_WITH_OPENCV "Build the full OpenCV motion estimator" ${STILLFLOW_BUILD_ADAPTERS})
 option(STILLFLOW_SUPERBUILD "Build pinned dependencies from source" ON)
+if(ANDROID AND (STILLFLOW_BUILD_CLI OR STILLFLOW_BUILD_ADAPTERS))
+    message(FATAL_ERROR "Android builds support the core SDK; disable STILLFLOW_BUILD_CLI and STILLFLOW_BUILD_ADAPTERS")
+endif()
 if(STILLFLOW_BUILD_CLI AND NOT STILLFLOW_BUILD_ADAPTERS)
     message(FATAL_ERROR "The CLI requires STILLFLOW_BUILD_ADAPTERS")
 endif()
@@ -16,8 +32,8 @@ endif()
 option(STILLFLOW_BUILD_EXAMPLES "Build the in-memory C example" ON)
 option(STILLFLOW_BUILD_C_API "Build the stable C interface" ON)
 option(STILLFLOW_C_API_SHARED "Build the C interface as a shared library" ON)
-option(STILLFLOW_WITH_CUDA "Build CUDA rendering when a toolkit is available" ON)
-option(STILLFLOW_WITH_NVCODEC "Build FFmpeg with runtime-loaded NVDEC/NVENC support" ON)
+option(STILLFLOW_WITH_CUDA "Build CUDA rendering when a toolkit is available" ${stillflow_desktop_default})
+option(STILLFLOW_WITH_NVCODEC "Build FFmpeg with runtime-loaded NVDEC/NVENC support" ${stillflow_desktop_default})
 if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_WITH_CUDA)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES
@@ -83,9 +99,6 @@ else()
 endif()
 
 include(GNUInstallDirs)
-if(WIN32)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-endif()
 if(STILLFLOW_BUILD_ADAPTERS
    AND STILLFLOW_WITH_CUDA
    AND CMAKE_CUDA_COMPILER)

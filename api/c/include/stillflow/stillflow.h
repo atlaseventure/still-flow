@@ -2,17 +2,7 @@
 #define STILLFLOW_H
 #include <stddef.h>
 #include <stdint.h>
-#if defined(_WIN32) && defined(STILLFLOW_SHARED)
-#ifdef STILLFLOW_EXPORTS
-#define SF_API __declspec(dllexport)
-#else
-#define SF_API __declspec(dllimport)
-#endif
-#elif defined(__GNUC__)
 #define SF_API __attribute__((visibility("default")))
-#else
-#define SF_API
-#endif
 #ifdef __cplusplus
 extern "C" {
 #endif

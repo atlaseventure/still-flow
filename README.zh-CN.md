@@ -2,11 +2,11 @@
 
 [English](README.md) | 简体中文
 
-离线视频防抖与滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎和 C API。CPU 渲染可独立使用，CUDA 与 NVDEC/NVENC 可选。Android、Apple 集成仅保留目录占位。
+离线视频防抖与滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎和 C API。CPU 渲染可独立使用，CUDA 与 NVDEC/NVENC 可选。目标平台为 Linux amd64 与 Android arm64-v8a；Android 提供核心 SDK，Kotlin 集成保留占位。
 
 ## 构建与使用
 
-桌面源码构建需要 Linux、C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。依赖自动下载并校验。构建和桌面处理默认使用 12 个工作线程。
+桌面源码构建需要 Linux amd64、C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。依赖自动下载并校验。构建和桌面处理默认使用 12 个工作线程。
 
 ```sh
 cmake --preset linux-gcc
@@ -32,7 +32,12 @@ cmake --install build/core-sdk --prefix /path/to/sdk
 
 通过 `find_package(StillFlow CONFIG REQUIRED)` 引入，C API 链接 `StillFlow::c`，C++ 接口链接 `StillFlow::application`。调用方推入帧、生成规划，再按索引渲染。可移植估计器处理平移，可选 OpenCV 估计器提供完整跟踪。CPU 渲染支持 gray8、BGR8、RGBA8，分析还支持 YUV 亮度平面。结构体、所有权和回调约定见安装后的头文件。
 
-静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。`cmake --list-presets` 可查看桌面编译器以及 Windows、macOS、Linux AArch64 的核心构建配置。
+静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。Android 构建需将 `ANDROID_NDK_HOME` 指向已安装的 NDK 目录，然后构建核心 SDK（Android API 26 及以上）：
+
+```sh
+cmake --preset android-arm64
+cmake --build --preset android-arm64
+```
 
 ## 测试与质量
 

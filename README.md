@@ -2,11 +2,11 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Offline video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine and a C API. CPU rendering is portable; CUDA and NVDEC/NVENC are optional. Android and Apple integration directories are placeholders.
+Offline video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine and a C API. CPU rendering is portable; CUDA and NVDEC/NVENC are optional. Targets are Linux amd64 and Android arm64-v8a; Android provides the core SDK, with Kotlin integration reserved.
 
 ## Build and run
 
-The desktop source build requires Linux, a C++20 compiler, CMake, Ninja, Make, pkg-config, Python and Perl. Dependencies are downloaded and verified automatically. Builds and desktop processing default to 12 workers.
+The desktop source build requires Linux amd64, a C++20 compiler, CMake, Ninja, Make, pkg-config, Python and Perl. Dependencies are downloaded and verified automatically. Builds and desktop processing default to 12 workers.
 
 ```sh
 cmake --preset linux-gcc
@@ -32,7 +32,12 @@ cmake --install build/core-sdk --prefix /path/to/sdk
 
 Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Frames can be pushed into an analyzer, planned, then rendered by index. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. C API structures, ownership and callbacks are documented in the installed headers.
 
-For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. Desktop compiler and core-only Windows, macOS and Linux AArch64 configurations are available through `cmake --list-presets`.
+For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android, set `ANDROID_NDK_HOME` to an installed NDK directory, then build the core SDK (Android API 26 or later):
+
+```sh
+cmake --preset android-arm64
+cmake --build --preset android-arm64
+```
 
 ## Tests and quality
 

@@ -1,15 +1,7 @@
 #ifndef STILLFLOW_DESKTOP_H
 #define STILLFLOW_DESKTOP_H
 #include "stillflow/stillflow.h"
-#if defined(_WIN32)
-#ifdef STILLFLOW_DESKTOP_EXPORTS
-#define SF_DESKTOP_API __declspec(dllexport)
-#else
-#define SF_DESKTOP_API __declspec(dllimport)
-#endif
-#else
 #define SF_DESKTOP_API SF_API
-#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
