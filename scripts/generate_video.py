@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a reproducible rolling-shutter clip and its stable reference."""
+"""Generate a reproducible shaky clip with optional rolling shutter and its stable reference."""
 
 import argparse
 import json
@@ -31,6 +31,12 @@ def main():
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--frames", type=int, default=180)
+    p.add_argument(
+        "--rolling-shutter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Simulate rolling shutter (default: enabled)",
+    )
     p.add_argument("--output", type=Path, default=Path(".local/validation/720p"))
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
@@ -53,6 +59,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     cv2.setNumThreads(2)
     w, h, fps = args.width, args.height, 30
+    readout_seconds = 0.018 if args.rolling_shutter else 0.0
     rng = np.random.default_rng(42)
     canvas = np.full((h + 512, w + 512, 3), 65, np.uint8)
     for y in range(0, canvas.shape[0], 32):
@@ -130,7 +137,7 @@ def main():
             for i in range(args.frames):
                 t = i / fps
                 # Continuous camera pose sampled at the exposure time of each scanline.
-                row_time = t + (yy / (h - 1) - 0.5) * 0.018
+                row_time = t + (yy / (h - 1) - 0.5) * readout_seconds
                 pan = 9 * t * scale
                 dx = scale * (
                     7 * np.sin(2 * np.pi * 6 * row_time)
@@ -152,7 +159,7 @@ def main():
                     "height": h,
                     "frames": args.frames,
                     "fps": fps,
-                    "readout_seconds": 0.018,
+                    "readout_seconds": readout_seconds,
                     "pan_pixels_per_second": 9 * scale,
                     "camera_jitter_hz": [6, 9.2, 42],
                     "seed": 42,

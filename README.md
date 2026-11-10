@@ -59,7 +59,7 @@ Install FFmpeg and uv. Generate a shaky rolling-shutter clip, a stable reference
 uv run --locked --group video python scripts/generate_video.py --output .local/synthetic --frames 60
 ```
 
-Use `--overwrite` to replace existing footage.
+Rolling shutter is enabled by default; use `--no-rolling-shutter` to disable it. Use `--overwrite` to replace existing footage.
 
 ## Usage
 
