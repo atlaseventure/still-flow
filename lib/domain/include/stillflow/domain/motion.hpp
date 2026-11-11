@@ -9,6 +9,19 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size analys
 void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
                 const StabilizationSettings& options);
 
+// Stateful viewport follower. Two convex low-pass stages bound viewport
+// velocity and acceleration while preserving crop budget and image bounds.
+class StreamCrop {
+  public:
+    void apply(Warp& warp, std::span<const Warp> future, Size size, const StabilizationSettings& settings, double dt,
+               bool reset);
+
+  private:
+    CropWindow target_, window_;
+    double strength_ = 1;
+    bool initialized_ = false;
+};
+
 struct TemporalLink {
     size_t from = 0, to = 0;
     Motion motion;

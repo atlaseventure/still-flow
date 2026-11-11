@@ -119,7 +119,13 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
         return;
     // Observation into each frame; the shot's first frame has none.
     std::vector<double> times(n), confidence(n);
-    std::vector<std::vector<Point>> positions(count, std::vector<Point>(n));
+    // The temporal kernel is shared: affine global motion needs only three
+    // anchors, and scanline motion has one independent path per band.
+    const bool affine = std::all_of(frames.begin() + first, frames.begin() + last, [](const auto& f) {
+        return f.motion.step(2, 0) == 0 && f.motion.step(2, 1) == 0 && f.motion.step(2, 2) == 1;
+    });
+    const size_t paths = scanline ? static_cast<size_t>(horizontal ? columns : rows) : (affine ? 3 : count);
+    std::vector<std::vector<Point>> positions(paths, std::vector<Point>(n));
     for (size_t k = 0; k < n; ++k) {
         const auto& frame = frames[first + k];
         times[k] = frame.seconds;
@@ -127,21 +133,20 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
             k == 0 ? 1 : std::clamp(scanline ? frame.motion.rs_confidence : frame.motion.confidence, 0.0, 1.0);
         const bool observed = k > 0 && (scanline ? frame.motion.state == MotionState::tracked
                                                  : frame.motion.state != MotionState::missing);
-        for (int y = 0; y < rows; ++y)
-            for (int x = 0; x < columns; ++x) {
-                const size_t vertex = static_cast<size_t>(y) * columns + x;
-                Point delta;
-                if (observed) {
-                    const Point p(static_cast<double>(x) * (size.width - 1) / (columns - 1),
-                                  static_cast<double>(y) * (size.height - 1) / (rows - 1));
-                    delta = scanline ? row_motion(frame.motion, horizontal ? static_cast<double>(x) / (columns - 1)
-                                                                           : static_cast<double>(y) / (rows - 1))
-                                     : transform(frame.motion.step, p) - p;
-                    if (!finite(delta))
-                        throw std::runtime_error("Nonfinite observed mesh motion");
-                }
-                positions[vertex][k] = k ? positions[vertex][k - 1] + delta : Point{};
+        for (size_t vertex = 0; vertex < paths; ++vertex) {
+            Point delta;
+            if (observed) {
+                const size_t grid_row = vertex / columns;
+                const double x = affine ? (vertex == 1 ? 1.0 : 0.0) : double(vertex % columns) / (columns - 1);
+                const double y = affine ? (vertex == 2 ? 1.0 : 0.0) : double(grid_row) / (rows - 1);
+                const Point p(x * (size.width - 1), y * (size.height - 1));
+                delta = scanline ? row_motion(frame.motion, double(vertex) / (paths - 1))
+                                 : transform(frame.motion.step, p) - p;
+                if (!finite(delta))
+                    throw std::runtime_error("Nonfinite observed mesh motion");
             }
+            positions[vertex][k] = k ? positions[vertex][k - 1] + delta : Point{};
+        }
     }
     // The cascade's exact support is six observations per pass.
     const size_t pad = std::min(n - 1, size_t{6} * (trajectory_smoothing_passes / 2));
@@ -171,7 +176,7 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
         }
     }
     std::vector<Point> extended(total), forward(total);
-    for (size_t vertex = 0; vertex < count; ++vertex) {
+    for (size_t vertex = 0; vertex < paths; ++vertex) {
         const auto& x = positions[vertex];
         const Point begin = fit_endpoint(times, confidence, x, 0, head, 0);
         const Point end = fit_endpoint(times, confidence, x, tail, n, n - 1);
@@ -194,6 +199,19 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
             if (k >= pad && k < pad + n)
                 output[first + k - pad][vertex] = correction;
         }
+    }
+    for (size_t i = first; i < last; ++i) {
+        auto& mesh = output[i];
+        const auto anchors = mesh;
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < columns; ++x) {
+                const size_t vertex = static_cast<size_t>(y) * columns + x;
+                if (scanline)
+                    mesh[vertex] = anchors[horizontal ? x : y];
+                else if (affine)
+                    mesh[vertex] = anchors[0] + (anchors[1] - anchors[0]) * (double(x) / (columns - 1)) +
+                                   (anchors[2] - anchors[0]) * (double(y) / (rows - 1));
+            }
     }
 }
 

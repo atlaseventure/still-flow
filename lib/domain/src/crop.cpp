@@ -255,6 +255,54 @@ void plan_shot(std::span<const FrameMotion> frames, std::span<Warp> warps, Size 
 }
 } // namespace
 
+void StreamCrop::apply(Warp& warp, std::span<const Warp> future, Size size, const StabilizationSettings& settings,
+                       double dt, bool reset) {
+    const double minimum_scale = 1 - 2 * settings.crop;
+    CropWindow desired{settings.crop, settings.crop, minimum_scale};
+    if (settings.crop_mode != CropMode::fixed) {
+        std::vector<Edges> edges;
+        std::vector<double> strengths;
+        for (const auto& item : future) {
+            edges.push_back(measure_edges(item, size));
+            strengths.push_back(std::min(item.geometry_strength, item.tracking_strength));
+        }
+        desired = choose_window(edges, strengths, minimum_scale);
+    }
+    if (reset || !initialized_) {
+        target_ = window_ = desired;
+        strength_ = 1;
+        initialized_ = true;
+    }
+    // Range <= 2*crop on each coordinate: tau >= range / velocity,
+    // tau >= sqrt(2*range / acceleration). Convex updates cannot overshoot.
+    const double tau = std::max({0.5, 2 * settings.crop / 0.02, std::sqrt(4 * settings.crop / 0.04)});
+    const double alpha = dt / (tau + dt);
+    const auto blend = [alpha](CropWindow a, CropWindow b) {
+        return CropWindow{a.left + alpha * (b.left - a.left), a.top + alpha * (b.top - a.top),
+                          a.scale + alpha * (b.scale - a.scale)};
+    };
+    target_ = blend(target_, desired);
+    window_ = blend(window_, target_);
+    warp.window = window_;
+    const auto edges = measure_edges(warp, size);
+    const double base = std::min(warp.geometry_strength, warp.tracking_strength);
+    double low = 0, high = 1;
+    if (edges.at(base).contains(window_))
+        low = 1;
+    else
+        for (int iteration = 0; iteration < 20; ++iteration) {
+            const double middle = (low + high) * 0.5;
+            if (edges.at(base * middle).contains(window_))
+                low = middle;
+            else
+                high = middle;
+        }
+    warp.crop_strength = low;
+    // Safety reductions take effect immediately; recovery is rate limited.
+    strength_ = std::min(base * low, strength_ + dt / 0.25);
+    warp.strength = warp.planned_strength = strength_;
+}
+
 void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
                 const StabilizationSettings& options) {
     if (frames.size() != warps.size() || size.width < 2 || size.height < 2 || !std::isfinite(options.crop) ||
