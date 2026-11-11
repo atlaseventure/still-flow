@@ -30,10 +30,24 @@ if(STILLFLOW_BUILD_CLI)
                                                   "${PROJECT_SOURCE_DIR}")
     add_executable(stillflow_video_tests video.cpp)
     target_link_libraries(stillflow_video_tests PRIVATE Catch2::Catch2WithMain)
-    target_compile_definitions(stillflow_video_tests
-                               PRIVATE STILLFLOW_VIDEO_METRICS="${CMAKE_CURRENT_BINARY_DIR}/video/metrics.txt")
-    add_test(NAME video_regression COMMAND stillflow_video_tests --abort)
+    target_compile_definitions(
+        stillflow_video_tests PRIVATE STILLFLOW_VIDEO_METRICS="${CMAKE_CURRENT_BINARY_DIR}/video/metrics.txt"
+                                      STILLFLOW_RS_VIDEO_METRICS="${CMAKE_CURRENT_BINARY_DIR}/rolling-shutter")
+    add_test(NAME video_regression COMMAND stillflow_video_tests "[global]" --abort)
     set_tests_properties(video_regression PROPERTIES FIXTURES_REQUIRED video TIMEOUT 30)
+    add_test(
+        NAME prepare_rolling_shutter
+        COMMAND
+            "${UV_EXECUTABLE}" run --locked --group video python
+            "${CMAKE_CURRENT_SOURCE_DIR}/prepare_rolling_shutter.py" --cli $<TARGET_FILE:stillflow> --source
+            "${PROJECT_SOURCE_DIR}" --output "${CMAKE_CURRENT_BINARY_DIR}/rolling-shutter")
+    set_tests_properties(prepare_rolling_shutter PROPERTIES FIXTURES_SETUP rolling_shutter TIMEOUT 180
+                                                            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")
+    foreach(mode offline realtime)
+        add_test(NAME rolling_shutter_${mode}_regression COMMAND stillflow_video_tests "[rolling-shutter-${mode}]"
+                                                                 --abort)
+        set_tests_properties(rolling_shutter_${mode}_regression PROPERTIES FIXTURES_REQUIRED rolling_shutter TIMEOUT 30)
+    endforeach()
 endif()
 
 if(STILLFLOW_BUILD_C_API)
