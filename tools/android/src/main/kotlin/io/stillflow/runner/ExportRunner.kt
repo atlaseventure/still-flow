@@ -10,6 +10,7 @@ import android.media.MediaMuxer
 import android.os.Build
 import android.os.Bundle
 import io.stillflow.AndroidFrames
+import io.stillflow.StreamPlanner
 import io.stillflow.GpuFrames
 import android.media.ImageReader
 import android.graphics.ImageFormat
@@ -484,7 +485,7 @@ class ExportRunner : Instrumentation() {
                     encoder.start()
                     GpuFrames(width, height, settings.maxBufferedFrames, surface).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
-                            StillFlow(width, height, fps, config.getBoolean("horizontalScan"), settings).use { session ->
+                            StreamPlanner(width, height, fps, config.getBoolean("horizontalScan"), settings).use { planner ->
                                 data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame)
                                 val pending = java.util.ArrayDeque<Pending>()
                                 val stages = linkedMapOf<String, MutableList<Double>>()
@@ -497,13 +498,12 @@ class ExportRunner : Instrumentation() {
                                 val events = org.json.JSONArray()
                                 fun drain(flushing: Boolean) {
                                     while (true) {
-                                        val ready = session.takeReady() ?: break
+                                        val ready = planner.takeReady() ?: break
                                         val item = pending.removeFirst()
                                         check(ready.index == item.index && ready.index == rendered.toLong() && ready.ptsUs == item.pts)
-                                        val map = session.takeReadyMap()
                                         val start = System.nanoTime()
                                         sink.drain(0)
-                                        gpu.render(item.frame, map, ready.ptsUs - origin)
+                                        gpu.render(item.frame, ready, origin)
                                         sink.drain(0)
                                         mark("render.surface", start)
                                         events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
@@ -517,16 +517,19 @@ class ExportRunner : Instrumentation() {
                                     val start = System.nanoTime()
                                     val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
                                     mark("decode.capture_proxy", start)
-                                    check(session.tryPush(frame.luma, pts, duration))
                                     pending.addLast(Pending(received.toLong(), pts, frame))
+                                    while (!planner.trySubmit(frame.luma, pts, duration)) {
+                                        drain(false)
+                                        Thread.sleep(1)
+                                    }
                                     received++
                                     peak = maxOf(peak, pending.size)
                                     drain(false)
                                     if (received % 60 == 0) progress("gpu_stream", received)
                                 }
                                 val beforeFlush = rendered
-                                session.finishStream()
-                                drain(true)
+                                while (!planner.tryFinish()) { drain(false); Thread.sleep(1) }
+                                while (!planner.finished) { drain(true); Thread.sleep(1) }
                                 sink.finishSurface()
                                 check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
                                 val timings = JSONObject()
@@ -538,7 +541,7 @@ class ExportRunner : Instrumentation() {
                                 report.put("frames", received).put("width", width).put("height", height)
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
-                                    .put("native_profile", org.json.JSONArray(session.profile())).put("stages", timings).put("frame_events", events)
+                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timings).put("frame_events", events)
                                     .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
                                         .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
                             }

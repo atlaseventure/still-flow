@@ -21,7 +21,7 @@ class GpuFrames(
     private val capacity: Int,
     encoderSurface: Surface,
 ) : AutoCloseable {
-    class Frame internal constructor(internal val owner: GpuFrames, internal val texture: Int, val luma: StillFlow.Frame) {
+    class Frame internal constructor(internal val owner: GpuFrames, internal val texture: Int, internal val buffer: ByteBuffer, val luma: StillFlow.Frame) {
         internal var rendered = false
     }
     private val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
@@ -34,6 +34,7 @@ class GpuFrames(
     private val external = IntArray(1)
     private val proxy = IntArray(1)
     private val free = ConcurrentLinkedQueue<Int>()
+    private val proxies = ConcurrentLinkedQueue<ByteBuffer>()
     private val owned = mutableListOf<Int>()
     private var copyProgram = 0
     private var proxyProgram = 0
@@ -121,11 +122,13 @@ class GpuFrames(
                 source(proxyProgram)
                 GLES30.glUniform2f(GLES30.glGetUniformLocation(proxyProgram, "analysisSize"), analysisWidth.toFloat(), analysisHeight.toFloat())
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
-                val pixels = ByteBuffer.allocateDirect(packedWidth * analysisHeight * 4)
+                val bytes = packedWidth * analysisHeight * 4
+                val pixels = proxies.poll()?.takeIf { it.capacity() == bytes } ?: ByteBuffer.allocateDirect(bytes)
+                pixels.clear()
                 GLES30.glReadPixels(0, 0, packedWidth, analysisHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
                 checkGl()
                 // Readback orders both capture draws before the decoder buffer is released.
-                return Frame(this, texture, StillFlow.Frame(analysisWidth, analysisHeight, StillFlow.PixelFormat.GRAY8, packedWidth * 4, pixels))
+                return Frame(this, texture, pixels, StillFlow.Frame(analysisWidth, analysisHeight, StillFlow.PixelFormat.GRAY8, packedWidth * 4, pixels))
             } finally {
                 nativeRelease(imported)
             }
@@ -133,6 +136,8 @@ class GpuFrames(
             buffer.close()
         }
     }
+
+    fun render(frame: Frame, plan: StreamPlanner.PlannedFrame, originUs: Long) = render(frame, plan.map, plan.ptsUs - originUs)
 
     /** The map is an independent immutable snapshot obtained from takeReadyMap(). */
     fun render(frame: Frame, map: FloatArray, ptsUs: Long) {
@@ -158,6 +163,7 @@ class GpuFrames(
         check(EGL14.eglSwapBuffers(display, window))
         frame.rendered = true
         free.add(frame.texture)
+        proxies.add(frame.buffer)
     }
 
     private fun target(texture: Int, width: Int, height: Int) {

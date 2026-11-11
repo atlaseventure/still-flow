@@ -50,3 +50,5 @@ Set `settings.realtime = true` for streaming. Call `tryPush()` and drain `takeRe
 Use `StillFlow.mobileSettings()` for 640-pixel analysis with 600 features. Call `StillFlow.configureThreads(2)` before starting analysis workers; this setting is process-wide.
 
 For GPU-resident streaming on Android 10+ with `GL_EXT_YUV_target`, decode into an `ImageReader` Surface and use `GpuFrames.capture()` before closing each Image. Retain its texture by index, then use `takeReadyMap()` and `GpuFrames.render()` with the encoder input Surface. The GPU cache owns the delayed frames; only the reduced source-Y analysis image is read back. Keep all `GpuFrames` calls on its creating thread and drain the encoder while processing.
+
+`StreamPlanner` runs analysis and planning on a worker with bounded input/output queues. Retry rejected submissions while consuming `takeReady()` results, then call `tryFinish()` and drain until `finished`. Plans own independent maps and can be consumed by the GPU thread while analysis continues. Close the planner to cancel pending work and join its worker.

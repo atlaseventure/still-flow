@@ -258,7 +258,44 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     std::vector<FrameMotion> frames;
     std::vector<Warp> warps;
     StreamStatistics statistics;
-    size_t decoded = 0;
+    size_t decoded = 0, planned = 0;
+    struct RenderItem {
+        Pending input;
+        ReadyWarp plan;
+    };
+    Channel<RenderItem> render_queue(2);
+    Profile render_profile(now_ms);
+    ThreadGroup group;
+    group.watch(render_queue);
+    const auto render = [&] {
+        while (auto work = render_queue.pop()) {
+            options.execution.check();
+            auto& item = work->input;
+            auto& ready = work->plan;
+            Image stabilized =
+                renderer->render(item.frame.image, ready.warp, analysis_size, options.crop, horizontal, render_profile);
+            for (const auto& packet : item.audio) {
+                writer->audio(*packet);
+                if (compare_writer)
+                    compare_writer->audio(*packet);
+            }
+            {
+                ScopeTimer timer(render_profile, "render.encode");
+                writer->video(stabilized, ready.pts_us, ready.duration_us);
+            }
+            if (compare_writer) {
+                ScopeTimer timer(render_profile, "comparison.compose_and_encode");
+                compare_writer->video(services.images.comparison(item.frame.image, stabilized), ready.pts_us,
+                                      ready.duration_us);
+            }
+            render_profile.add("stream.residence", now_ms() - item.received_ms);
+            render_profile.add("stream.lookahead", ready.lookahead_seconds * 1000);
+            if (ready.lookahead_seconds + 2e-6 < options.stream.lookahead_seconds)
+                ++statistics.shortened_lookahead_frames;
+            frames.push_back(std::move(ready.observation));
+            warps.push_back(std::move(ready.warp));
+        }
+    };
     const auto drain = [&] {
         ReadyWarp ready;
         for (;;) {
@@ -266,80 +303,71 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
             if (!analyzer.take_ready(ready))
                 break;
             profile.add("stream.plan", now_ms() - plan_start);
-            if (delayed.empty() || ready.index != frames.size() || ready.pts_us != delayed.front().frame.pts_us)
+            if (delayed.empty() || ready.index != planned || ready.pts_us != delayed.front().frame.pts_us)
                 throw std::logic_error("Streaming frame and plan are out of order");
             auto item = std::move(delayed.front());
             delayed.pop_front();
-            Image stabilized =
-                renderer->render(item.frame.image, ready.warp, analysis_size, options.crop, horizontal, profile);
-            for (const auto& packet : item.audio) {
-                writer->audio(*packet);
-                if (compare_writer)
-                    compare_writer->audio(*packet);
-            }
-            {
-                ScopeTimer timer(profile, "render.encode");
-                writer->video(stabilized, ready.pts_us, ready.duration_us);
-            }
-            if (compare_writer) {
-                ScopeTimer timer(profile, "comparison.compose_and_encode");
-                compare_writer->video(services.images.comparison(item.frame.image, stabilized), ready.pts_us,
-                                      ready.duration_us);
-            }
-            profile.add("stream.residence", now_ms() - item.received_ms);
-            profile.add("stream.lookahead", ready.lookahead_seconds * 1000);
-            if (ready.lookahead_seconds + 1e-9 < options.stream.lookahead_seconds)
-                ++statistics.shortened_lookahead_frames;
-            frames.push_back(std::move(ready.observation));
-            warps.push_back(std::move(ready.warp));
-            if (frames.size() % 120 == 0)
-                services.progress.rendered(frames.size(), decoded, false);
+            if (!render_queue.push({std::move(item), std::move(ready)}))
+                return;
+            ready = {};
+            ++planned;
         }
     };
-    for (;;) {
-        options.execution.check();
-        const double work_start = now_ms();
-        VideoFrame frame;
-        {
-            ScopeTimer timer(profile, "stream.decode");
-            if (!reader->next(frame))
+    try {
+        for (;;) {
+            options.execution.check();
+            if (render_queue.cancelled())
                 break;
+            const double work_start = now_ms();
+            VideoFrame frame;
+            {
+                ScopeTimer timer(profile, "stream.decode");
+                if (!reader->next(frame))
+                    break;
+            }
+            if (!writer) {
+                const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
+                writer = services.media.writer(output->temporary(), size, info.fps, *reader, frame.pts_us, encoding,
+                                               {options.encoder, gpu});
+                if (comparison)
+                    compare_writer =
+                        services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps, *reader,
+                                              frame.pts_us, encoding, {options.encoder, gpu});
+                group.spawn(render);
+            }
+            Image proxy;
+            {
+                ScopeTimer timer(profile, "stream.proxy");
+                proxy = services.images.gray_proxy(frame.analysis_image ? frame.analysis_image : frame.image,
+                                                   analysis_size);
+            }
+            {
+                ScopeTimer timer(profile, "stream.analyze");
+                if (!analyzer.push(proxy, frame.pts_us, frame.duration_us, profile))
+                    throw std::logic_error("Streaming queue was not drained");
+            }
+            frame.analysis_image.reset();
+            delayed.push_back({std::move(frame), std::move(audio), work_start});
+            frame = {};
+            audio.clear();
+            ++decoded;
+            statistics.peak_buffered_frames = std::max(statistics.peak_buffered_frames, delayed.size());
+            drain();
+            const double work_ms = now_ms() - work_start;
+            profile.add("stream.frame_work", work_ms);
+            if (work_ms > 1000 / info.fps)
+                ++statistics.frame_budget_overruns;
         }
-        if (!writer) {
-            const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
-            writer = services.media.writer(output->temporary(), size, info.fps, *reader, frame.pts_us, encoding,
-                                           {options.encoder, gpu});
-            if (comparison)
-                compare_writer = services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps,
-                                                       *reader, frame.pts_us, encoding, {options.encoder, gpu});
-        }
-        Image proxy;
-        {
-            ScopeTimer timer(profile, "stream.proxy");
-            proxy =
-                services.images.gray_proxy(frame.analysis_image ? frame.analysis_image : frame.image, analysis_size);
-        }
-        {
-            ScopeTimer timer(profile, "stream.analyze");
-            if (!analyzer.push(proxy, frame.pts_us, frame.duration_us, profile))
-                throw std::logic_error("Streaming queue was not drained");
-        }
-        frame.analysis_image.reset();
-        delayed.push_back({std::move(frame), std::move(audio), work_start});
-        frame = {};
-        audio.clear();
-        ++decoded;
-        statistics.peak_buffered_frames = std::max(statistics.peak_buffered_frames, delayed.size());
+        if (!writer)
+            throw std::runtime_error("Input contains no decoded video frames");
+        analyzer.finish();
         drain();
-        const double work_ms = now_ms() - work_start;
-        profile.add("stream.frame_work", work_ms);
-        if (work_ms > 1000 / info.fps)
-            ++statistics.frame_budget_overruns;
+        render_queue.close();
+    } catch (...) {
+        group.fail(std::current_exception());
     }
-    if (!writer)
-        throw std::runtime_error("Input contains no decoded video frames");
-    analyzer.finish();
-    drain();
+    group.finish();
+    profile.merge(render_profile);
     for (const auto& packet : audio) {
         writer->audio(*packet);
         if (compare_writer)
