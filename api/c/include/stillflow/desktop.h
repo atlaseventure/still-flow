@@ -12,6 +12,9 @@ typedef struct sf_file_options {
     const char *input, *output, *compare, *report;
     const char *scan_axis, *preset, *backend, *decoder, *encoder;
     int32_t threads, crf, audio, overwrite;
+    int32_t realtime;
+    double lookahead_seconds;
+    size_t max_buffered_frames;
 } sf_file_options;
 typedef struct sf_run_summary {
     size_t struct_size;

@@ -25,8 +25,8 @@ class Planner {
     static Plan plan(AnalysisResult analysis, StabilizationSettings settings, ExecutionSettings execution = {});
 };
 // Push frames or measured observations in presentation order. Replay requested
-// recovery frames before finishing; at most 24 proxies are retained. take_ready() reserves
-// incremental plan delivery for future lookahead implementations.
+// recovery frames before finishing; at most 24 proxies are retained.
+// Use StreamAnalyzer for bounded incremental delivery.
 class Analyzer {
   public:
     Analyzer(StabilizationSettings settings, Size analysis_size, double fps, bool horizontal,

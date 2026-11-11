@@ -19,6 +19,9 @@ class StillFlow(
 
     /** Settings are copied when the session is created. Public fields also support Java callers. */
     class Settings {
+        @JvmField var realtime = false
+        @JvmField var lookaheadSeconds = 1.5
+        @JvmField var maxBufferedFrames = 120
         @JvmField var backend = Backend.AUTO
         @JvmField var motionEstimator = MotionEstimator.OPENCV
         @JvmField var analysisWidth: Int
@@ -86,6 +89,7 @@ class StillFlow(
         width, height, fps, horizontalScan, settings.backend.ordinal, settings.motionEstimator.ordinal,
         settings.analysisWidth, settings.features, settings.bands, settings.cropMode.ordinal,
         settings.rollingShutter, settings.smoothSeconds, settings.rsSeconds, settings.crop, settings.rsStrength,
+        settings.realtime, settings.lookaheadSeconds, settings.maxBufferedFrames,
     )
 
     constructor(width: Int, height: Int, fps: Double) : this(width, height, fps, false, Settings())
@@ -96,6 +100,39 @@ class StillFlow(
         requireOpen()
         nativeAnalyze(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
     }
+
+    class ReadyFrame internal constructor(values: LongArray) {
+        @JvmField val index = values[0]
+        @JvmField val ptsUs = values[1]
+        @JvmField val durationUs = values[2]
+    }
+
+    /** Copies the proxy during this call. Keep full frames until their ready index is returned.
+     * False means the bounded queue is full; drain or drop the incoming live frame. */
+    @Synchronized
+    fun tryPush(frame: Frame, ptsUs: Long, durationUs: Long): Boolean {
+        requireOpen()
+        return nativeStreamPush(handle, frame.width, frame.height, frame.format.nativeValue,
+            frame.rowStride, frame.pixels, ptsUs, durationUs)
+    }
+
+    /** Render each returned frame before requesting the next one. */
+    @Synchronized
+    fun takeReady(): ReadyFrame? {
+        requireOpen()
+        return nativeStreamReady(handle)?.let { ReadyFrame(it) }
+    }
+
+    /** Seals streaming input. Drain takeReady() until null after this call. */
+    @Synchronized
+    fun finishStream() {
+        requireOpen()
+        nativeStreamFinish(handle)
+    }
+
+    /** Render the last ready index using the corresponding retained full frame. */
+    @Synchronized
+    fun renderReady(frame: Frame, destination: ByteBuffer): Frame = render(0, frame, destination)
 
     class RecoveryFrame internal constructor(values: LongArray) {
         @JvmField val index = values[0]
@@ -162,7 +199,13 @@ class StillFlow(
             width: Int, height: Int, fps: Double, horizontalScan: Boolean, backend: Int, motionEstimator: Int,
             analysisWidth: Int, features: Int, bands: Int, cropMode: Int, rollingShutter: Boolean,
             smoothSeconds: Double, rsSeconds: Double, crop: Double, rsStrength: Double,
+            realtime: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int,
         ): Long
+        @JvmStatic private external fun nativeStreamPush(
+            handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
+        ): Boolean
+        @JvmStatic private external fun nativeStreamReady(handle: Long): LongArray?
+        @JvmStatic private external fun nativeStreamFinish(handle: Long)
         @JvmStatic private external fun nativeAnalyze(
             handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
         )

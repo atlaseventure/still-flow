@@ -9,6 +9,7 @@ namespace {
 template <class T, auto Destroy> using Handle = std::unique_ptr<T, decltype(Destroy)>;
 
 struct Session {
+    Handle<sf_stream, sf_stream_destroy> stream{nullptr, sf_stream_destroy};
     Handle<sf_analyzer, sf_analyzer_destroy> analyzer{nullptr, sf_analyzer_destroy};
     Handle<sf_plan, sf_plan_destroy> plan{nullptr, sf_plan_destroy};
     Handle<sf_renderer, sf_renderer_destroy> renderer{nullptr, sf_renderer_destroy};
@@ -117,7 +118,8 @@ JNIEXPORT jdoubleArray JNICALL Java_io_stillflow_StillFlow_nativeDefaults(JNIEnv
 JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
     JNIEnv* env, jclass, jint width, jint height, jdouble fps, jboolean horizontal_scan, jint backend,
     jint motion_estimator, jint analysis_width, jint features, jint bands, jint crop_mode, jboolean rolling_shutter,
-    jdouble smooth_seconds, jdouble rs_seconds, jdouble crop, jdouble rs_strength) {
+    jdouble smooth_seconds, jdouble rs_seconds, jdouble crop, jdouble rs_strength, jboolean realtime,
+    jdouble lookahead_seconds, jint max_buffered_frames) {
     jlong result = 0;
     boundary(env, [&] {
         sf_settings settings{sizeof(sf_settings), analysis_width, features,   bands, crop_mode,  rolling_shutter,
@@ -130,10 +132,21 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
         auto owner = std::make_unique<Session>();
         owner->width = width;
         owner->height = height;
-        sf_analyzer* analyzer = nullptr;
-        const auto status = sf_analyzer_create(&settings, &video, nullptr, &analyzer, &error);
-        owner->analyzer.reset(analyzer);
-        check(status, error);
+        if (realtime) {
+            if (max_buffered_frames < 2)
+                throw Failure(SF_INVALID_ARGUMENT, "Streaming capacity must be at least two frames");
+            sf_stream_settings streaming{sizeof(sf_stream_settings), lookahead_seconds,
+                                         static_cast<size_t>(max_buffered_frames)};
+            sf_stream* stream = nullptr;
+            const auto status = sf_stream_create(&settings, &streaming, &video, nullptr, &stream, &error);
+            owner->stream.reset(stream);
+            check(status, error);
+        } else {
+            sf_analyzer* analyzer = nullptr;
+            const auto status = sf_analyzer_create(&settings, &video, nullptr, &analyzer, &error);
+            owner->analyzer.reset(analyzer);
+            check(status, error);
+        }
         sf_renderer* renderer = nullptr;
         const auto renderer_status = sf_renderer_create_backend(backends[backend], nullptr, &renderer, &error);
         owner->renderer.reset(renderer);
@@ -143,13 +156,65 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
     return result;
 }
 
+JNIEXPORT jboolean JNICALL Java_io_stillflow_StillFlow_nativeStreamPush(JNIEnv* env, jclass, jlong handle, jint width,
+                                                                        jint height, jint format, jint stride,
+                                                                        jobject pixels, jlong pts, jlong duration) {
+    jboolean result = false;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (!owner.stream)
+            throw Failure(SF_INVALID_STATE, "Enable realtime in session settings");
+        auto input = image(env, owner, width, height, format, stride, pixels);
+        sf_error error{sizeof(sf_error), {}};
+        int32_t accepted = 0;
+        check(sf_stream_push(owner.stream.get(), &input, pts, duration, &accepted, &error), error);
+        result = accepted != 0;
+    });
+    return result;
+}
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeStreamFinish(JNIEnv* env, jclass, jlong handle) {
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (!owner.stream)
+            throw Failure(SF_INVALID_STATE, "Enable realtime in session settings");
+        sf_error error{sizeof(sf_error), {}};
+        check(sf_stream_finish(owner.stream.get(), &error), error);
+    });
+}
+JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeStreamReady(JNIEnv* env, jclass, jlong handle) {
+    jlongArray result = nullptr;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (!owner.stream || owner.plan)
+            throw Failure(SF_INVALID_STATE, "Streaming requires rendering each ready frame before taking another");
+        auto values = env->NewLongArray(3);
+        if (!values)
+            return;
+        sf_error error{sizeof(sf_error), {}};
+        sf_ready_frame frame{};
+        frame.struct_size = sizeof(frame);
+        sf_plan* plan = nullptr;
+        const auto status = sf_stream_take_ready(owner.stream.get(), &frame, &plan, &error);
+        owner.plan.reset(plan);
+        check(status, error);
+        if (!frame.available) {
+            env->DeleteLocalRef(values);
+            return;
+        }
+        const jlong fields[] = {static_cast<jlong>(frame.index), frame.pts_us, frame.duration_us};
+        env->SetLongArrayRegion(values, 0, 3, fields);
+        result = values;
+    });
+    return result;
+}
+
 JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeAnalyze(JNIEnv* env, jclass, jlong handle, jint width,
                                                                  jint height, jint format, jint stride, jobject pixels,
                                                                  jlong pts, jlong duration) {
     boundary(env, [&] {
         auto& owner = session(handle);
-        if (owner.plan)
-            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        if (owner.plan || owner.stream)
+            throw Failure(SF_INVALID_STATE, "Offline analysis is unavailable in this state");
         auto input = image(env, owner, width, height, format, stride, pixels);
         sf_error error{sizeof(sf_error), {}};
         check(sf_analyzer_push(owner.analyzer.get(), &input, pts, duration, &error), error);
@@ -160,8 +225,8 @@ JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeNextRecoveryFrame
     jlongArray result = nullptr;
     boundary(env, [&] {
         auto& owner = session(handle);
-        if (owner.plan)
-            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        if (owner.plan || owner.stream)
+            throw Failure(SF_INVALID_STATE, "Offline analysis is unavailable in this state");
         sf_error error{sizeof(sf_error), {}};
         sf_recovery_frame frame{sizeof(sf_recovery_frame), 0, 0, 0};
         check(sf_analyzer_next_recovery_frame(owner.analyzer.get(), &frame, &error), error);
@@ -180,8 +245,8 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeRecover(JNIEnv* env, jc
                                                                  jlong pts) {
     boundary(env, [&] {
         auto& owner = session(handle);
-        if (owner.plan)
-            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        if (owner.plan || owner.stream)
+            throw Failure(SF_INVALID_STATE, "Offline analysis is unavailable in this state");
         auto input = image(env, owner, width, height, format, stride, pixels);
         sf_error error{sizeof(sf_error), {}};
         check(sf_analyzer_recover(owner.analyzer.get(), &input, pts, &error), error);
@@ -192,8 +257,8 @@ JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeFinish(JNIEnv* en
     jlongArray result = nullptr;
     boundary(env, [&] {
         auto& owner = session(handle);
-        if (owner.plan)
-            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        if (owner.plan || owner.stream)
+            throw Failure(SF_INVALID_STATE, "Offline analysis is unavailable in this state");
         // Allocate the Java result before consuming the analyzer.
         result = env->NewLongArray(4);
         if (!result)
@@ -244,6 +309,8 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeRender(JNIEnv* env, jcl
         for (int row = 0; row < height; ++row)
             std::memcpy(data + static_cast<size_t>(row) * row_bytes,
                         output.planes[0].data + static_cast<size_t>(row) * output.planes[0].row_stride, row_bytes);
+        if (owner.stream)
+            owner.plan.reset();
     });
 }
 

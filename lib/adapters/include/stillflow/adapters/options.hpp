@@ -1,5 +1,6 @@
 #pragma once
 #include "stillflow/application/runtime.hpp"
+#include "stillflow/application/stream.hpp"
 #include "stillflow/domain/settings.hpp"
 #include <filesystem>
 #include <string>
@@ -15,6 +16,8 @@ struct Options : StabilizationSettings {
     std::string backend = "auto";
     // Media adapter codec names; "auto" prefers hardware with GPU rendering.
     std::string decoder = "auto", encoder = "auto";
+    bool realtime = false;
+    StreamSettings stream;
     bool audio = true;
     bool overwrite = false;
 };

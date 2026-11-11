@@ -64,7 +64,7 @@ class CudaImageProcessing final : public ImageProcessing {
         return host_->analyzer(settings, horizontal);
     }
     Image gray_proxy(const Image& input, Size size) override {
-        if (!disabled_ && input && input->format() == PixelFormat::gray8 && size.width > 0 && size.height > 0) {
+        if (!disabled_ && input && size.width > 0 && size.height > 0) {
             if (auto source = cuda::native_source(input)) {
                 try {
                     return device_proxy(source->image, input->size(), size);

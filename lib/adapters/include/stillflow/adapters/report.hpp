@@ -14,6 +14,9 @@ struct RunSummary {
     double wall_ms = 0;
     ResourceUsage resources;
 };
+struct StreamStatistics {
+    size_t peak_buffered_frames = 0, shortened_lookahead_frames = 0, frame_budget_overruns = 0;
+};
 struct RunReport {
     const Options& options;
     std::filesystem::path frames_path;
@@ -29,5 +32,6 @@ struct RunReport {
     std::vector<std::pair<std::string, CodecReport>> codecs;
     RunSummary summary;
     double analysis_ms;
+    StreamStatistics streaming;
 };
 } // namespace stillflow

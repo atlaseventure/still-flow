@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include "stillflow/application/stream.hpp"
 #include "stillflow/backends/cpu.hpp"
 #ifdef STILLFLOW_C_GLES
 #include "stillflow/backends/gles.hpp"
@@ -51,6 +52,14 @@ struct sf_analyzer {
     c_api::Runtime runtime;
     std::unique_ptr<Analyzer> analyzer;
     explicit sf_analyzer(const sf_runtime* callbacks) : runtime(callbacks) {}
+};
+struct sf_stream {
+    c_api::Runtime runtime;
+    std::unique_ptr<StreamAnalyzer> analyzer;
+    StabilizationSettings settings;
+    Size size;
+    bool horizontal = false;
+    explicit sf_stream(const sf_runtime* callbacks) : runtime(callbacks) {}
 };
 struct sf_plan {
     Plan plan;
@@ -181,6 +190,97 @@ sf_status sf_plan_get_info(const sf_plan* plan, sf_plan_info* info, sf_error* er
     });
 }
 void sf_plan_destroy(sf_plan* plan) { delete plan; }
+sf_status sf_stream_settings_default(sf_stream_settings* value) {
+    return c_api::boundary(nullptr, [&] {
+        c_api::require(value);
+        const auto size = value->struct_size;
+        *value = {size, 1.5, 120};
+    });
+}
+sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* stream, const sf_video* video,
+                           const sf_runtime* callbacks, sf_stream** out, sf_error* error) {
+    if (out)
+        *out = nullptr;
+    return c_api::boundary(error, [&] {
+        if (!out)
+            throw std::invalid_argument("Missing stream output");
+        c_api::require(stream);
+        c_api::require(video);
+        auto settings = c_api::settings(value);
+        if (video->width < 32 || video->height < 32)
+            throw std::invalid_argument("Invalid video dimensions");
+        const double scale = std::min(1.0, double(settings.analysis_width) / video->width);
+        const Size size{std::max(32, int(std::lround(video->width * scale))),
+                        std::max(32, int(std::lround(video->height * scale)))};
+        std::unique_ptr<MotionAnalyzer> motion;
+        if (value->motion_estimator == SF_MOTION_TRANSLATION)
+            motion = make_translation_analyzer(settings);
+#ifdef STILLFLOW_C_OPENCV
+        else if (value->motion_estimator == SF_MOTION_OPENCV)
+            motion = make_opencv_analyzer(settings, video->horizontal_scan != 0);
+#endif
+        else
+            throw BackendError("Requested motion estimator is unavailable");
+        auto result = std::make_unique<sf_stream>(callbacks);
+        result->settings = settings;
+        result->size = size;
+        result->horizontal = video->horizontal_scan != 0;
+        result->analyzer = std::make_unique<StreamAnalyzer>(
+            settings, StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames}, size, video->fps,
+            result->horizontal, std::move(motion), result->runtime.settings());
+        *out = result.release();
+    });
+}
+sf_status sf_stream_push(sf_stream* stream, const sf_image* image, int64_t pts, int64_t duration, int32_t* accepted,
+                         sf_error* error) {
+    if (accepted)
+        *accepted = 0;
+    return c_api::boundary(error, [&] {
+        if (!stream || !accepted)
+            throw std::invalid_argument("Missing stream push argument");
+        stream->runtime.settings().check();
+        Profile profile;
+        *accepted = stream->analyzer->push(import_image(image), pts, duration, profile);
+    });
+}
+sf_status sf_stream_finish(sf_stream* stream, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!stream)
+            throw std::invalid_argument("Missing stream");
+        stream->analyzer->finish();
+    });
+}
+sf_status sf_stream_take_ready(sf_stream* stream, sf_ready_frame* frame, sf_plan** out, sf_error* error) {
+    if (out)
+        *out = nullptr;
+    return c_api::boundary(error, [&] {
+        if (!stream || !out)
+            throw std::invalid_argument("Missing stream output");
+        c_api::require(frame);
+        frame->available = 0;
+        auto plan = std::make_unique<sf_plan>();
+        plan->plan.settings = stream->settings;
+        plan->plan.analysis.size = stream->size;
+        plan->plan.analysis.horizontal = stream->horizontal;
+        plan->plan.analysis.frames.resize(1);
+        plan->plan.warps.resize(1);
+        ReadyWarp ready;
+        if (!stream->analyzer->take_ready(ready))
+            return;
+        plan->plan.analysis.origin_us = ready.pts_us;
+        plan->plan.analysis.frames[0] = std::move(ready.observation);
+        plan->plan.analysis.frames[0].seconds = 0;
+        plan->plan.warps[0] = std::move(ready.warp);
+        frame->index = ready.index;
+        frame->pts_us = ready.pts_us;
+        frame->duration_us = ready.duration_us;
+        frame->lookahead_seconds = ready.lookahead_seconds;
+        frame->available = 1;
+        *out = plan.release();
+    });
+}
+void sf_stream_destroy(sf_stream* stream) { delete stream; }
+
 sf_status sf_renderer_create(const sf_runtime* callbacks, sf_renderer** out, sf_error* error) {
     return sf_renderer_create_backend("cpu", callbacks, out, error);
 }

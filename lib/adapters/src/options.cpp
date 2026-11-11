@@ -33,6 +33,7 @@ void validate_options(const Options& o) {
 
 Options resolve_options(Options options) {
     validate_options(options);
+    validate_stream_settings(options.stream);
     if (options.report.empty())
         options.report = options.output.string() + ".profile.json";
     return options;

@@ -379,6 +379,8 @@ struct Reader::Impl {
     AVFormatContext* format = nullptr;
     AVCodecContext* decoder = nullptr;
     AVFrame* frame = nullptr;
+    AVFrame* delayed = nullptr;
+    AVBufferRef* delay_pool = nullptr;
     std::shared_ptr<HostConverter> converter;
     HardwareDevices* devices = nullptr;
     CodecReport codec;
@@ -392,6 +394,8 @@ struct Reader::Impl {
     ~Impl() {
         av_packet_free(&packet);
         av_frame_free(&frame);
+        av_frame_free(&delayed);
+        av_buffer_unref(&delay_pool);
         avcodec_free_context(&decoder);
         avformat_close_input(&format);
     }
@@ -549,6 +553,28 @@ bool Reader::next(DecodedFrame& output, bool luma_only) {
     output.duration_us = frame->duration > 0 ? av_rescale_q(frame->duration, time_base, microseconds)
                                              : static_cast<int64_t>(std::llround(1000000 / s.info.fps));
     if (frame->format == AV_PIX_FMT_CUDA && format == AV_PIX_FMT_NV12) {
+        if (s.codec.request.independent_frames) {
+            if (!s.delay_pool) {
+                const auto* source = reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data);
+                s.delay_pool = av_hwframe_ctx_alloc(source->device_ref);
+                if (!s.delay_pool)
+                    throw std::bad_alloc();
+                auto* pool = reinterpret_cast<AVHWFramesContext*>(s.delay_pool->data);
+                pool->format = AV_PIX_FMT_CUDA;
+                pool->sw_format = format;
+                pool->width = frame->width;
+                pool->height = frame->height;
+                check(av_hwframe_ctx_init(s.delay_pool), "Initialize delayed frame pool");
+                s.delayed = av_frame_alloc();
+                if (!s.delayed)
+                    throw std::bad_alloc();
+            }
+            av_frame_unref(s.delayed);
+            check(av_hwframe_get_buffer(s.delay_pool, s.delayed, 0), "Allocate delayed device frame");
+            check(av_hwframe_transfer_data(s.delayed, frame, 0), "Copy delayed device frame");
+            check(av_frame_copy_props(s.delayed, frame), "Copy delayed frame properties");
+            frame = s.delayed;
+        }
         // NV12 stays on the GPU; consumers that need host pixels convert lazily.
         s.devices->synchronize();
         output.device = std::make_shared<const DeviceFrame>(frame, s.converter, s.info.rotation);

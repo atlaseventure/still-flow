@@ -23,6 +23,8 @@ struct VideoFrame {
 struct CodecRequest {
     std::string name = "auto";
     bool prefer_hardware = false;
+    // Copy decoder surfaces into a separate device pool for delayed consumption.
+    bool independent_frames = false;
 };
 struct EncodingSettings {
     int threads = 12;

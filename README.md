@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Offline video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine, a C API and an Android AAR for Kotlin/Java. Targets are Linux amd64 and Android arm64-v8a. Desktop GPU processing uses CUDA and NVDEC/NVENC; Android provides OpenGL ES compute rendering and hardware MediaCodec integration.
+Offline and fixed-lag streaming video stabilization and rolling shutter correction, with a desktop CLI, a frame-based C++ engine, a C API and an Android AAR for Kotlin/Java. Targets are Linux amd64 and Android arm64-v8a. Desktop GPU processing uses CUDA and NVDEC/NVENC; Android provides OpenGL ES compute rendering and hardware MediaCodec integration.
 
 ## Build and run
 
@@ -12,12 +12,15 @@ The desktop source build requires Linux amd64, a C++20 compiler, CMake, Ninja, M
 cmake --preset linux-gcc
 cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow input.mp4 output.mp4 --compare comparison.mp4
+./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.5
 ./build/linux-gcc/stillflow --help
 ```
 
 `--backend auto` prefers CUDA and falls back to CPU. Hardware codecs are selected when GPU rendering is used; `--backend cpu --decoder cpu --encoder openh264` forces software processing. Input must be progressive 8-bit SDR with square pixels and even dimensions. Output preserves presentation timestamps and copies compatible audio; use MKV or `--no-audio` for incompatible audio.
 
 The default crop budget is 8% per edge. `--crop-mode fixed` applies the exact centered crop; `auto` selects a fixed window per shot, and `adaptive` permits slow viewport motion. `--rs off` disables rolling shutter correction. `--crf` controls OpenH264 QP or NVENC CQ; values across encoders are not quality-equivalent. `--preset` applies to NVENC.
+
+Realtime mode decodes once, with 1.5 seconds of lookahead and a 120-frame buffer by default. `auto` and `adaptive` follow a slowly moving viewport; `fixed` keeps a centered crop. Capacity pressure, cuts and final draining shorten lookahead. Tracking recovery needs about 0.2 seconds plus two frames of context. Original PTS and audio synchronization are preserved. File processing keeps every frame; reports include throughput and per-frame timings. Live hosts use the streaming API's capacity feedback to drop incoming frames.
 
 ## Core SDK
 
@@ -38,6 +41,8 @@ For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android n
 cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
+
+Use C++ `StreamAnalyzer` or C `sf_stream_*` for streaming: push, drain ready plans, finish, then drain again. Hosts retain full-resolution frames until their index is ready. Each C plan is independently owned and renders its frame at index 0.
 
 ## Android
 

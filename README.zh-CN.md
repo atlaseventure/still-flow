@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-离线视频防抖与滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎、C API 和 Kotlin/Java Android AAR。支持 Linux amd64 与 Android arm64-v8a。桌面 GPU 处理使用 CUDA、NVDEC/NVENC；Android 提供 OpenGL ES 计算渲染与硬件 MediaCodec 集成。
+离线与固定前视流式视频防抖、滚动快门校正，提供桌面 CLI、按帧调用的 C++ 引擎、C API 和 Kotlin/Java Android AAR。支持 Linux amd64 与 Android arm64-v8a。桌面 GPU 处理使用 CUDA、NVDEC/NVENC；Android 提供 OpenGL ES 计算渲染与硬件 MediaCodec 集成。
 
 ## 构建与使用
 
@@ -12,12 +12,15 @@
 cmake --preset linux-gcc
 cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow input.mp4 output.mp4 --compare comparison.mp4
+./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.5
 ./build/linux-gcc/stillflow --help
 ```
 
 `--backend auto` 优先使用 CUDA，失败时回退 CPU。GPU 渲染默认优先使用硬件编解码；`--backend cpu --decoder cpu --encoder openh264` 强制软件处理。输入须为逐行扫描、方形像素、偶数尺寸的 8 位 SDR 视频。输出保留显示时间戳并复制兼容音轨；音频不兼容时使用 MKV 或 `--no-audio`。
 
 默认裁剪预算为每边 8%。`--crop-mode fixed` 使用精确居中裁剪，`auto` 为每个镜头选择固定窗口，`adaptive` 允许窗口缓慢移动。`--rs off` 关闭滚动快门校正。`--crf` 分别控制 OpenH264 QP 或 NVENC CQ，相同数值的画质并不等价。`--preset` 用于 NVENC。
+
+实时模式单遍解码，默认前视 1.5 秒、最多缓存 120 帧。`auto` 与 `adaptive` 使用缓慢调整的裁剪窗口，`fixed` 保持居中固定裁剪。容量耗尽、镜头切换及结束排空时会缩短前视；跟踪恢复至少需要约 0.2 秒及两帧上下文。输出保留原始 PTS 和音画同步。文件处理保留全部帧，实际吞吐与逐帧耗时见报告；直播宿主通过流式 API 的容量反馈决定丢帧。
 
 ## 核心 SDK
 
@@ -31,6 +34,8 @@ cmake --install build/core-sdk --prefix /path/to/sdk
 ```
 
 通过 `find_package(StillFlow CONFIG REQUIRED)` 引入，C API 链接 `StillFlow::c`，C++ 接口链接 `StillFlow::application`。调用方推入帧、按请求补送恢复帧、生成规划，再按索引渲染。可移植估计器处理平移，可选 OpenCV 估计器提供完整跟踪。CPU 渲染支持 gray8、BGR8、RGBA8，分析还支持 YUV 亮度平面。结构体、所有权和回调约定见安装后的头文件。
+
+流式调用使用 C++ `StreamAnalyzer` 或 C `sf_stream_*`：推帧后取出就绪规划，结束后排空。宿主持有全尺寸帧直到对应索引就绪；C 返回的单帧规划使用索引 0 渲染并独立销毁。
 
 静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。Android 原生开发将 `ANDROID_NDK_HOME` 指向已安装的 NDK 目录：
 

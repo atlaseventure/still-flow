@@ -1,5 +1,6 @@
 #pragma once
 #include "stillflow/application/engine.hpp"
+#include <deque>
 
 namespace stillflow {
 struct StreamSettings {
@@ -21,6 +22,9 @@ class StreamAnalyzer {
   public:
     StreamAnalyzer(StabilizationSettings settings, StreamSettings stream, Size size, double fps, bool horizontal,
                    std::unique_ptr<MotionAnalyzer> motion = {}, ExecutionSettings execution = {});
+    // Only reduced gray proxies are retained (at most 24); callers own the
+    // delayed full-resolution frames until take_ready returns their index.
+    bool push(const Image& image, int64_t pts_us, int64_t duration_us, Profile& profile);
     bool push_observation(Motion motion, int64_t pts_us, int64_t duration_us);
     bool take_ready(ReadyWarp& output);
     void finish();
@@ -37,5 +41,10 @@ class StreamAnalyzer {
     int64_t last_pts_ = 0;
     bool finished_ = false;
     StreamCrop crop_;
+    std::unique_ptr<MotionAnalyzer> motion_;
+    Image previous_;
+    std::deque<std::pair<size_t, Image>> proxies_;
+    size_t recovered_until_ = 0;
+    void recover_pending(Profile& profile, bool flush);
 };
 } // namespace stillflow

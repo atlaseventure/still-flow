@@ -8,10 +8,13 @@
 #include <string_view>
 
 namespace {
-constexpr std::string_view help = R"(stillflow - offline video stabilization with scanline wobble suppression
+constexpr std::string_view help = R"(stillflow - video stabilization with scanline wobble suppression
 
 Usage: stillflow INPUT OUTPUT [options]
 
+  --mode offline|realtime Single-pass fixed-lag streaming (default offline)
+  --lookahead SECONDS     Streaming lookahead, 0..10 (default 1.5)
+  --buffer-frames N       Maximum delayed frames, 2..600 (default 120)
   --compare PATH          Side-by-side input/output video (adds encoding cost)
   --report PATH           JSON profile; default OUTPUT.profile.json
   --rs on|off             Scanline correction (default on)
@@ -101,7 +104,18 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc)
                 throw std::runtime_error("Missing value for " + option);
             const std::string value = argv[++i];
-            if (option == "--compare")
+            if (option == "--mode") {
+                if (value != "offline" && value != "realtime")
+                    throw std::runtime_error("--mode must be offline or realtime");
+                o.realtime = value == "realtime";
+            } else if (option == "--lookahead")
+                o.lookahead_seconds = number(value, option);
+            else if (option == "--buffer-frames") {
+                const int capacity = integer(value, option);
+                if (capacity < 2 || capacity > 600)
+                    throw std::runtime_error("--buffer-frames must be 2..600");
+                o.max_buffered_frames = static_cast<size_t>(capacity);
+            } else if (option == "--compare")
                 o.compare = argv[i];
             else if (option == "--report")
                 o.report = argv[i];

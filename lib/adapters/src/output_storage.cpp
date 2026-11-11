@@ -92,7 +92,8 @@ nlohmann::json profile_json(const Profile& profile) {
         const double total = std::accumulate(sorted.begin(), sorted.end(), 0.0);
         auto percentile = [&](double p) { return sorted[static_cast<size_t>(p * (sorted.size() - 1))]; };
         result[name] = {{"calls", sorted.size()},     {"total_ms", total},          {"mean_ms", total / sorted.size()},
-                        {"p50_ms", percentile(0.50)}, {"p95_ms", percentile(0.95)}, {"max_ms", sorted.back()}};
+                        {"p50_ms", percentile(0.50)}, {"p95_ms", percentile(0.95)}, {"p99_ms", percentile(0.99)},
+                        {"max_ms", sorted.back()}};
     }
     return result;
 }
@@ -168,7 +169,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 7},
+            {"schema_version", 8},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -186,7 +187,8 @@ class LocalOutputStorage final : public OutputStorage {
               {"analysis_width", analysis_size.width},
               {"analysis_height", analysis_size.height}}},
             {"settings",
-             {{"rolling_shutter", options.rolling_shutter},
+             {{"mode", options.realtime ? "realtime" : "offline"},
+              {"rolling_shutter", options.rolling_shutter},
               {"scan_axis", horizontal ? "x" : "y"},
               {"bands", options.bands},
               {"features", options.features},
@@ -247,6 +249,15 @@ class LocalOutputStorage final : public OutputStorage {
 #endif
              }},
             {"stages", profile_json(data.profile)}};
+        if (options.realtime) {
+            report["trajectory"]["method"] = "fixed_lag_confidence_mesh";
+            report["streaming"] = {{"lookahead_seconds", options.stream.lookahead_seconds},
+                                   {"max_buffered_frames", options.stream.max_buffered_frames},
+                                   {"peak_buffered_frames", data.streaming.peak_buffered_frames},
+                                   {"shortened_lookahead_frames", data.streaming.shortened_lookahead_frames},
+                                   {"frame_budget_overruns", data.streaming.frame_budget_overruns},
+                                   {"crop_mode", options.crop_mode == CropMode::fixed ? "fixed" : "adaptive"}};
+        }
         write_csv(csv_path, frames, warps);
         std::ofstream file(json_path);
         file.exceptions(std::ios::badbit | std::ios::failbit);

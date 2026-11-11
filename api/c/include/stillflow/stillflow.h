@@ -96,6 +96,35 @@ SF_API sf_status sf_analyzer_finish(sf_analyzer*, sf_plan**, sf_error*);
 SF_API void sf_analyzer_destroy(sf_analyzer*);
 SF_API sf_status sf_plan_get_info(const sf_plan*, sf_plan_info*, sf_error*);
 SF_API void sf_plan_destroy(sf_plan*);
+/* Streaming analysis retains at most 24 gray proxies. The host keeps full
+   frames until their index is returned, then renders with the returned one-frame
+   plan at index 0. Each plan has independent ownership. Push is synchronous;
+   accepted=0 means capacity was reached, so drain and retry or drop the incoming
+   live frame. No queue wait occurs. Gaps keep their original timestamps.
+   Drain after each push. finish seals input; drain once more through available=0.
+   Capacity pressure and shot/end boundaries may shorten the requested lookahead. */
+typedef struct sf_stream sf_stream;
+typedef struct sf_stream_settings {
+    size_t struct_size;
+    double lookahead_seconds;
+    size_t max_buffered_frames;
+} sf_stream_settings;
+typedef struct sf_ready_frame {
+    size_t struct_size;
+    size_t index;
+    int64_t pts_us, duration_us;
+    double lookahead_seconds;
+    int32_t available;
+} sf_ready_frame;
+SF_API sf_status sf_stream_settings_default(sf_stream_settings*);
+SF_API sf_status sf_stream_create(const sf_settings*, const sf_stream_settings*, const sf_video*, const sf_runtime*,
+                                  sf_stream**, sf_error*);
+SF_API sf_status sf_stream_push(sf_stream*, const sf_image*, int64_t pts_us, int64_t duration_us, int32_t* accepted,
+                                sf_error*);
+SF_API sf_status sf_stream_finish(sf_stream*, sf_error*);
+SF_API sf_status sf_stream_take_ready(sf_stream*, sf_ready_frame*, sf_plan**, sf_error*);
+SF_API void sf_stream_destroy(sf_stream*);
+
 SF_API sf_status sf_renderer_create(const sf_runtime*, sf_renderer**, sf_error*);
 /* Explicit backend selection: "cpu", "gles" (Android), or "auto".
    auto prefers the platform GPU and falls back to CPU on backend failures. */

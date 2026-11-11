@@ -58,9 +58,10 @@ std::filesystem::path path(const char* text) {
 extern "C" {
 sf_status sf_file_options_default(sf_file_options* value) {
     return stillflow::c_api::boundary(nullptr, [&] {
-        stillflow::c_api::require(value);
+        if (!value || value->struct_size < offsetof(sf_file_options, realtime))
+            throw std::invalid_argument("Missing or undersized file options");
         auto size = value->struct_size;
-        *value = {};
+        std::memset(value, 0, std::min(size, sizeof(sf_file_options)));
         value->struct_size = size;
         value->stabilization.struct_size = sizeof(sf_settings);
         sf_settings_default(&value->stabilization);
@@ -73,6 +74,10 @@ sf_status sf_file_options_default(sf_file_options* value) {
         value->threads = 12;
         value->crf = 18;
         value->audio = 1;
+        if (size >= sizeof(sf_file_options)) {
+            value->lookahead_seconds = 1.5;
+            value->max_buffered_frames = 120;
+        }
     });
 }
 const char* sf_desktop_build_description(void) {
@@ -86,7 +91,8 @@ const char* sf_desktop_build_description(void) {
 sf_status sf_stabilize_file(const sf_file_options* value, const sf_runtime* callbacks, const sf_progress* progress,
                             sf_run_summary* summary, sf_error* error) {
     return stillflow::c_api::boundary(error, [&] {
-        stillflow::c_api::require(value);
+        if (!value || value->struct_size < offsetof(sf_file_options, realtime))
+            throw std::invalid_argument("Missing or undersized file options");
         stillflow::c_api::require(summary);
         if (!value->scan_axis || !value->preset || !value->backend || !value->decoder || !value->encoder)
             throw std::invalid_argument("Missing file option string");
@@ -107,6 +113,10 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_runtime* call
         options.crf = value->crf;
         options.audio = value->audio != 0;
         options.overwrite = value->overwrite != 0;
+        if (value->struct_size >= sizeof(sf_file_options)) {
+            options.realtime = value->realtime != 0;
+            options.stream = {value->lookahead_seconds, value->max_buffered_frames};
+        }
         stillflow::c_api::Runtime runtime(callbacks);
         auto executor = stillflow::make_thread_executor(options.threads);
         options.execution = runtime.settings();

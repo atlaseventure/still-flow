@@ -1,4 +1,5 @@
 #include "stillflow/application/stream.hpp"
+#include "recovery.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -10,10 +11,76 @@ void validate_stream_settings(const StreamSettings& s) {
 }
 StreamAnalyzer::StreamAnalyzer(StabilizationSettings settings, StreamSettings stream, Size size, double fps,
                                bool horizontal, std::unique_ptr<MotionAnalyzer> motion, ExecutionSettings execution)
-    : settings_(settings), stream_(stream), analysis_{size, horizontal, 0, {}}, fps_(fps), execution_(execution) {
+    : settings_(settings), stream_(stream), analysis_{size, horizontal, 0, {}}, fps_(fps), execution_(execution),
+      motion_(std::move(motion)) {
     // Share validation with the offline analyzer.
-    Analyzer validate(settings, size, fps, horizontal, std::move(motion), execution);
+    Analyzer validate(settings, size, fps, horizontal, nullptr, execution);
     validate_stream_settings(stream);
+}
+bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
+    execution_.check();
+    if (finished_)
+        throw std::logic_error("Stream is already finished");
+    if (duration < 0 || (!analysis_.frames.empty() && pts <= last_pts_))
+        throw std::invalid_argument("Stream timestamps must increase and durations must be nonnegative");
+    if (full())
+        return false;
+    auto current = gray_proxy(image, analysis_.size);
+    Motion observation;
+    observation.row_delta.resize(settings_.bands);
+    if (previous_ && (static_cast<long double>(pts) - last_pts_) / 1000000 <= std::max(0.5, 5 / fps_)) {
+        if (!motion_)
+            throw std::logic_error("No streaming motion estimator registered");
+        observation = motion_->estimate(previous_, current, profile);
+    }
+    push_observation(std::move(observation), pts, duration);
+    previous_ = current;
+    proxies_.emplace_back(base_ + analysis_.frames.size() - 1, std::move(current));
+    if (proxies_.size() > 24)
+        proxies_.pop_front();
+    recover_pending(profile, false);
+    return true;
+}
+void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
+    if (!motion_ || proxies_.size() < 3)
+        return;
+    const auto weak = [](const Motion& m) {
+        return m.state == MotionState::missing || (m.model_consistency > 0 && m.model_consistency < 0.40);
+    };
+    auto& frames = analysis_.frames;
+    const size_t start = proxies_.front().first - base_;
+    for (size_t first = std::max(start + 1, next_); first < frames.size(); ++first) {
+        if (!weak(frames[first].motion) || frames[first].motion.reset)
+            continue;
+        size_t last = first + 1;
+        while (last < frames.size() && weak(frames[last].motion) && !frames[last].motion.reset)
+            ++last;
+        if (last == frames.size())
+            break;
+        if (frames[last].motion.reset || frames[last].seconds - frames[first - 1].seconds > 0.20 ||
+            base_ + last <= recovered_until_ || (!flush && last + 2 >= frames.size())) {
+            first = last - 1;
+            continue;
+        }
+        size_t begin = first - 1, end = last;
+        for (int k = 0; k < 2 && begin > start && !frames[begin].motion.reset; ++k)
+            --begin;
+        for (int k = 0; k < 2 && end + 1 < frames.size() && !frames[end + 1].motion.reset; ++k)
+            ++end;
+        AnalysisResult local{analysis_.size,
+                             analysis_.horizontal,
+                             analysis_.origin_us,
+                             {frames.begin() + begin, frames.begin() + end + 1}};
+        TrackingRecovery recovery(local);
+        while (auto request = recovery.next()) {
+            const auto index = begin + request->index - start;
+            recovery.push(proxies_[index].second, request->pts_us, *motion_, profile, execution_);
+        }
+        for (size_t i = std::max(begin, next_); i <= end; ++i)
+            frames[i].motion = std::move(local.frames[i - begin].motion);
+        recovered_until_ = base_ + last;
+        first = last;
+    }
 }
 bool StreamAnalyzer::push_observation(Motion motion, int64_t pts, int64_t duration) {
     execution_.check();
@@ -46,7 +113,11 @@ void StreamAnalyzer::finish() {
     execution_.check();
     if (finished_)
         throw std::logic_error("Stream is already finished");
+    Profile profile;
+    recover_pending(profile, true);
     finished_ = true;
+    previous_.reset();
+    proxies_.clear();
 }
 bool StreamAnalyzer::take_ready(ReadyWarp& output) {
     execution_.check();
@@ -57,7 +128,8 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
     const double ahead = frames.back().seconds - current.seconds;
     const bool shot_ended = frames.back().segment != current.segment;
     // One future observation finalizes the PTS-derived duration even at zero lag.
-    if (!finished_ && !shot_ended && !full() && (buffered() < 2 || ahead + 1e-9 < stream_.lookahead_seconds))
+    if (!finished_ && !shot_ended && !full() &&
+        (buffered() < 2 || ahead + 1e-9 < std::max(stream_.lookahead_seconds, motion_ ? 0.20 + 2 / fps_ : 0.0)))
         return false;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
