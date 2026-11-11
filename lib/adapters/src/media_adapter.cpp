@@ -29,11 +29,12 @@ class FfmpegAudioPacket final : public AudioPacket {
 // first use, with the same conversion the reader applies to host frames.
 class DecodedDeviceImage final : public ImageData {
   public:
-    DecodedDeviceImage(std::shared_ptr<const DeviceFrame> frame, Size size) : frame_(std::move(frame)), size_(size) {}
+    DecodedDeviceImage(std::shared_ptr<const DeviceFrame> frame, Size size, bool luma_only)
+        : frame_(std::move(frame)), size_(size), luma_only_(luma_only) {}
     Size size() const override { return size_; }
-    PixelFormat format() const override { return PixelFormat::bgr8; }
+    PixelFormat format() const override { return luma_only_ ? PixelFormat::gray8 : PixelFormat::bgr8; }
     HostImageView map_read() const override {
-        std::call_once(converted_, [&] { host_ = image(frame_->download()); });
+        std::call_once(converted_, [&] { host_ = image(frame_->download(luma_only_)); });
         return host_->map_read();
     }
     std::optional<NativeImageView> native_read(std::string_view api) const override {
@@ -45,6 +46,7 @@ class DecodedDeviceImage final : public ImageData {
   private:
     std::shared_ptr<const DeviceFrame> frame_;
     Size size_;
+    bool luma_only_;
     mutable std::once_flag converted_;
     mutable Image host_;
 };
@@ -55,13 +57,15 @@ class FfmpegReader final : public VideoReader {
         if ((reader.info().width & 1) || (reader.info().height & 1))
             throw std::runtime_error("Output H.264 4:2:0 requires even input dimensions");
     }
-    bool next(VideoFrame& frame) override {
+    bool next(VideoFrame& frame) override { return read(frame, false); }
+    bool next_luma(VideoFrame& frame) override { return read(frame, true); }
+    bool read(VideoFrame& frame, bool luma_only) {
         DecodedFrame decoded;
-        if (!reader.next(decoded))
+        if (!reader.next(decoded, luma_only))
             return false;
         const Size size(reader.info().width, reader.info().height);
-        auto pixels = decoded.device ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size)
-                                     : image(std::move(decoded.bgr));
+        auto pixels = decoded.device ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size, luma_only)
+                                     : image(std::move(decoded.pixels));
         frame = {std::move(pixels), decoded.pts_us, decoded.duration_us};
         return true;
     }

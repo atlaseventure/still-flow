@@ -156,6 +156,38 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeAnalyze(JNIEnv* env, jc
     });
 }
 
+JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeNextRecoveryFrame(JNIEnv* env, jclass, jlong handle) {
+    jlongArray result = nullptr;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (owner.plan)
+            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        sf_error error{sizeof(sf_error), {}};
+        sf_recovery_frame frame{sizeof(sf_recovery_frame), 0, 0, 0};
+        check(sf_analyzer_next_recovery_frame(owner.analyzer.get(), &frame, &error), error);
+        if (!frame.available)
+            return;
+        result = env->NewLongArray(2);
+        if (!result)
+            return;
+        const jlong values[] = {static_cast<jlong>(frame.index), frame.pts_us};
+        env->SetLongArrayRegion(result, 0, 2, values);
+    });
+    return result;
+}
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeRecover(JNIEnv* env, jclass, jlong handle, jint width,
+                                                                 jint height, jint format, jint stride, jobject pixels,
+                                                                 jlong pts) {
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (owner.plan)
+            throw Failure(SF_INVALID_STATE, "Analysis is already finished");
+        auto input = image(env, owner, width, height, format, stride, pixels);
+        sf_error error{sizeof(sf_error), {}};
+        check(sf_analyzer_recover(owner.analyzer.get(), &input, pts, &error), error);
+    });
+}
+
 JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeFinish(JNIEnv* env, jclass, jlong handle) {
     jlongArray result = nullptr;
     boundary(env, [&] {

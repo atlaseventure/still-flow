@@ -1,4 +1,5 @@
 #include "stillflow/application/engine.hpp"
+#include "recovery.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -40,14 +41,31 @@ Analyzer::Analyzer(StabilizationSettings settings, Size size, double fps, bool h
         throw std::invalid_argument("Invalid analysis geometry or frame rate");
     execution_.check();
 }
+Analyzer::~Analyzer() = default;
+std::optional<RecoveryFrame> Analyzer::next_recovery_frame() {
+    execution_.check();
+    if (finished_ || result_.frames.empty())
+        throw std::logic_error("Analyzer is empty or already finished");
+    if (!recovery_) {
+        recovery_ = std::make_unique<TrackingRecovery>(result_);
+        previous_.reset();
+    }
+    return recovery_->next();
+}
+void Analyzer::recover(const Image& image, int64_t pts, Profile& profile) {
+    execution_.check();
+    if (finished_ || !recovery_ || !motion_)
+        throw std::logic_error("Request recovery frames before replaying them");
+    recovery_->push(image, pts, *motion_, profile, execution_);
+}
 void Analyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
     execution_.check();
-    if (finished_ || (!result_.frames.empty() && pts <= last_pts_) || duration < 0)
+    if (finished_ || recovery_ || (!result_.frames.empty() && pts <= last_pts_) || duration < 0)
         throw std::invalid_argument("Invalid analyzer state or timestamp");
     auto current = gray_proxy(image, result_.size);
     Motion observation;
     observation.row_delta.resize(settings_.bands);
-    if (previous_) {
+    if (previous_ && (static_cast<long double>(pts) - last_pts_) / 1000000 <= std::max(0.5, 5 / fps_)) {
         if (!motion_)
             throw std::logic_error("No motion estimator registered");
         execution_.for_each(1, [&](size_t) { observation = motion_->estimate(previous_, current, profile); });
@@ -57,7 +75,7 @@ void Analyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& 
 }
 void Analyzer::push_observation(Motion motion, int64_t pts, int64_t duration) {
     execution_.check();
-    if (finished_ || duration < 0 || (!result_.frames.empty() && pts <= last_pts_))
+    if (finished_ || recovery_ || duration < 0 || (!result_.frames.empty() && pts <= last_pts_))
         throw std::invalid_argument("Invalid analyzer state or timestamp");
     if (result_.frames.empty())
         result_.origin_us = pts;
@@ -81,7 +99,10 @@ AnalysisResult Analyzer::finish_analysis() {
     execution_.check();
     if (finished_ || result_.frames.empty())
         throw std::logic_error("Analyzer is empty or already finished");
+    if (next_recovery_frame())
+        throw std::logic_error("Replay requested recovery frames before finishing analysis");
     finished_ = true;
+    recovery_.reset();
     previous_.reset();
     return std::move(result_);
 }

@@ -2,7 +2,7 @@ package io.stillflow
 
 import java.nio.ByteBuffer
 
-/** Two-pass frame stabilization. Calls are synchronous; use a worker thread and close the session. */
+/** Frame stabilization. Calls are synchronous; use a worker thread and close the session. */
 class StillFlow(
     width: Int,
     height: Int,
@@ -97,6 +97,25 @@ class StillFlow(
         nativeAnalyze(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
     }
 
+    class RecoveryFrame internal constructor(values: LongArray) {
+        @JvmField val index = values[0]
+        @JvmField val ptsUs = values[1]
+    }
+
+    /** Seals analysis; replay requested frames in order until this returns null. */
+    @Synchronized
+    fun nextRecoveryFrame(): RecoveryFrame? {
+        requireOpen()
+        return nativeNextRecoveryFrame(handle)?.let { RecoveryFrame(it) }
+    }
+
+    @Synchronized
+    fun recover(frame: Frame, ptsUs: Long) {
+        requireOpen()
+        nativeRecover(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs)
+    }
+
+    /** Requires all requested recovery frames to have been replayed. */
     @Synchronized
     fun finish(): PlanInfo {
         requireOpen()
@@ -146,6 +165,10 @@ class StillFlow(
         ): Long
         @JvmStatic private external fun nativeAnalyze(
             handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
+        )
+        @JvmStatic private external fun nativeNextRecoveryFrame(handle: Long): LongArray?
+        @JvmStatic private external fun nativeRecover(
+            handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long,
         )
         @JvmStatic private external fun nativeFinish(handle: Long): LongArray
         @JvmStatic private external fun nativeRendererInfo(handle: Long): Array<String>

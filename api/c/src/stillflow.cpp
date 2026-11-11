@@ -133,6 +133,30 @@ sf_status sf_analyzer_push(sf_analyzer* analyzer, const sf_image* image, int64_t
         analyzer->analyzer->push(import_image(image), pts, duration, profile);
     });
 }
+sf_status sf_analyzer_next_recovery_frame(sf_analyzer* analyzer, sf_recovery_frame* frame, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!analyzer)
+            throw std::invalid_argument("Missing analyzer");
+        c_api::require(frame);
+        frame->available = 0;
+        frame->index = 0;
+        frame->pts_us = 0;
+        if (auto request = analyzer->analyzer->next_recovery_frame()) {
+            frame->index = request->index;
+            frame->pts_us = request->pts_us;
+            frame->available = 1;
+        }
+    });
+}
+sf_status sf_analyzer_recover(sf_analyzer* analyzer, const sf_image* image, int64_t pts, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!analyzer)
+            throw std::invalid_argument("Missing analyzer");
+        analyzer->runtime.settings().check();
+        Profile profile;
+        analyzer->analyzer->recover(import_image(image), pts, profile);
+    });
+}
 sf_status sf_analyzer_finish(sf_analyzer* analyzer, sf_plan** out, sf_error* error) {
     if (out)
         *out = nullptr;

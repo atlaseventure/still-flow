@@ -9,33 +9,28 @@ using cuda::Buffer;
 using cuda::check;
 using cuda::Stream;
 
-// Area-averages the displayed luma plane (like INTER_AREA when shrinking) and
-// expands limited range to full, approximating the host BGR->gray proxy.
+// Match the portable area sampler on the unexpanded source luma plane.
 __global__ void luma_proxy_kernel(const unsigned char* luma, size_t pitch, int coded_width, int coded_height,
-                                  int rotation, int full_range, int width, int height, unsigned char* output,
-                                  int output_width, int output_height) {
+                                  int rotation, int width, int height, unsigned char* output, int output_width,
+                                  int output_height) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= output_width || y >= output_height)
         return;
-    const float scale_x = static_cast<float>(width) / output_width,
-                scale_y = static_cast<float>(height) / output_height;
-    const float left = x * scale_x, right = fminf((x + 1) * scale_x, width);
-    const float top = y * scale_y, bottom = fminf((y + 1) * scale_y, height);
-    float sum = 0, area = 0;
-    for (int row = static_cast<int>(top); row < bottom; ++row) {
-        const float weight_y = fminf(row + 1, bottom) - fmaxf(row, top);
-        for (int column = static_cast<int>(left); column < right; ++column) {
-            const float weight = weight_y * (fminf(column + 1, right) - fmaxf(column, left));
+    const double scale_x = static_cast<double>(width) / output_width,
+                 scale_y = static_cast<double>(height) / output_height;
+    const double left = x * scale_x, right = (x + 1) * scale_x;
+    const double top = y * scale_y, bottom = (y + 1) * scale_y;
+    double sum = 0;
+    for (int row = static_cast<int>(top); row < min(height, static_cast<int>(ceil(bottom))); ++row) {
+        for (int column = static_cast<int>(left); column < min(width, static_cast<int>(ceil(right))); ++column) {
             const float2 p = cuda::coded_position(column, row, rotation, coded_width, coded_height);
-            sum += weight * luma[static_cast<size_t>(p.y) * pitch + static_cast<int>(p.x)];
-            area += weight;
+            const double value = luma[static_cast<size_t>(p.y) * pitch + static_cast<int>(p.x)];
+            sum += value * (fmin(right, column + 1.0) - fmax(left, static_cast<double>(column))) *
+                   (fmin(bottom, row + 1.0) - fmax(top, static_cast<double>(row)));
         }
     }
-    float value = sum / area;
-    if (!full_range)
-        value = (value - 16) * (255.0f / 219);
     output[static_cast<size_t>(y) * output_width + x] =
-        static_cast<unsigned char>(__float2uint_rn(fminf(fmaxf(value, 0), 255)));
+        static_cast<unsigned char>(fmin(fmax(round(sum / (scale_x * scale_y)), 0.0), 255.0));
 }
 
 // Places input and stabilized frames side by side and blends white labels
@@ -69,7 +64,7 @@ class CudaImageProcessing final : public ImageProcessing {
         return host_->analyzer(settings, horizontal);
     }
     Image gray_proxy(const Image& input, Size size) override {
-        if (!disabled_ && size.width > 0 && size.height > 0) {
+        if (!disabled_ && input && input->format() == PixelFormat::gray8 && size.width > 0 && size.height > 0) {
             if (auto source = cuda::native_source(input)) {
                 try {
                     return device_proxy(source->image, input->size(), size);
@@ -110,9 +105,9 @@ class CudaImageProcessing final : public ImageProcessing {
         output_.reserve(bytes);
         staging_.reserve(bytes);
         const dim3 block(16, 16), grid((size.width + 15) / 16, (size.height + 15) / 16);
-        luma_proxy_kernel<<<grid, block, 0, stream_->value>>>(
-            image.luma, image.luma_pitch, image.coded.width, image.coded.height, image.rotation, image.color.full_range,
-            logical.width, logical.height, output_.data(), size.width, size.height);
+        luma_proxy_kernel<<<grid, block, 0, stream_->value>>>(image.luma, image.luma_pitch, image.coded.width,
+                                                              image.coded.height, image.rotation, logical.width,
+                                                              logical.height, output_.data(), size.width, size.height);
         check(cudaGetLastError(), "Launch CUDA analysis proxy");
         check(cudaMemcpyAsync(staging_.data(), output_.data(), bytes, cudaMemcpyDeviceToHost, stream_->value),
               "Download CUDA analysis proxy");

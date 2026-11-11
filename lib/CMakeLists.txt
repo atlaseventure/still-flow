@@ -8,8 +8,9 @@ target_include_directories(stillflow_domain PUBLIC $<BUILD_INTERFACE:${CMAKE_CUR
 target_compile_definitions(stillflow_domain PRIVATE EIGEN_MPL2_ONLY)
 target_link_libraries(stillflow_domain PRIVATE $<BUILD_INTERFACE:Eigen3::Eigen>)
 
-add_library(stillflow_application STATIC application/src/engine.cpp vision/src/portable.cpp application/src/image.cpp
-                                         application/src/rendering.cpp)
+add_library(
+    stillflow_application STATIC application/src/engine.cpp application/src/recovery.cpp vision/src/portable.cpp
+                                 application/src/image.cpp application/src/rendering.cpp)
 add_library(StillFlow::application ALIAS stillflow_application)
 set_target_properties(stillflow_application PROPERTIES EXPORT_NAME application POSITION_INDEPENDENT_CODE ON)
 target_compile_features(stillflow_application PUBLIC cxx_std_20)

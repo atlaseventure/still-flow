@@ -81,6 +81,17 @@ SF_API sf_status sf_image_default(sf_image* image);
 SF_API const char* sf_build_description(void);
 SF_API sf_status sf_analyzer_create(const sf_settings*, const sf_video*, const sf_runtime*, sf_analyzer**, sf_error*);
 SF_API sf_status sf_analyzer_push(sf_analyzer*, const sf_image*, int64_t pts_us, int64_t duration_us, sf_error*);
+/* Seals analysis. Replay each requested frame with its original timestamp;
+   available is zero when recovery is complete. Requests increase by index.
+   finish returns SF_INVALID_STATE while a recovery frame remains outstanding. */
+typedef struct sf_recovery_frame {
+    size_t struct_size;
+    size_t index;
+    int64_t pts_us;
+    int32_t available;
+} sf_recovery_frame;
+SF_API sf_status sf_analyzer_next_recovery_frame(sf_analyzer*, sf_recovery_frame*, sf_error*);
+SF_API sf_status sf_analyzer_recover(sf_analyzer*, const sf_image*, int64_t pts_us, sf_error*);
 SF_API sf_status sf_analyzer_finish(sf_analyzer*, sf_plan**, sf_error*);
 SF_API void sf_analyzer_destroy(sf_analyzer*);
 SF_API sf_status sf_plan_get_info(const sf_plan*, sf_plan_info*, sf_error*);

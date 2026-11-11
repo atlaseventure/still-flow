@@ -30,7 +30,7 @@ cmake --build --preset core
 cmake --install build/core-sdk --prefix /path/to/sdk
 ```
 
-通过 `find_package(StillFlow CONFIG REQUIRED)` 引入，C API 链接 `StillFlow::c`，C++ 接口链接 `StillFlow::application`。调用方推入帧、生成规划，再按索引渲染。可移植估计器处理平移，可选 OpenCV 估计器提供完整跟踪。CPU 渲染支持 gray8、BGR8、RGBA8，分析还支持 YUV 亮度平面。结构体、所有权和回调约定见安装后的头文件。
+通过 `find_package(StillFlow CONFIG REQUIRED)` 引入，C API 链接 `StillFlow::c`，C++ 接口链接 `StillFlow::application`。调用方推入帧、按请求补送恢复帧、生成规划，再按索引渲染。可移植估计器处理平移，可选 OpenCV 估计器提供完整跟踪。CPU 渲染支持 gray8、BGR8、RGBA8，分析还支持 YUV 亮度平面。结构体、所有权和回调约定见安装后的头文件。
 
 静态 C SDK 使用 `-DSTILLFLOW_C_API_SHARED=OFF`。Android 原生开发将 `ANDROID_NDK_HOME` 指向已安装的 NDK 目录：
 

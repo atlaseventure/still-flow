@@ -3,6 +3,11 @@
 #include "stillflow/vision/vision.hpp"
 
 namespace stillflow {
+class TrackingRecovery;
+struct RecoveryFrame {
+    size_t index;
+    int64_t pts_us;
+};
 void validate_settings(const StabilizationSettings& settings);
 struct AnalysisResult {
     Size size;
@@ -19,13 +24,17 @@ class Planner {
   public:
     static Plan plan(AnalysisResult analysis, StabilizationSettings settings, ExecutionSettings execution = {});
 };
-// Push frames or measured observations in presentation order. The source is
-// owned by the host; only the preceding proxy is retained. take_ready() reserves
+// Push frames or measured observations in presentation order. Replay requested
+// recovery frames before finishing; at most 24 proxies are retained. take_ready() reserves
 // incremental plan delivery for future lookahead implementations.
 class Analyzer {
   public:
     Analyzer(StabilizationSettings settings, Size analysis_size, double fps, bool horizontal,
              std::unique_ptr<MotionAnalyzer> motion, ExecutionSettings execution = {});
+    ~Analyzer();
+    // Seals analysis and requests recovery frames in increasing index order.
+    std::optional<RecoveryFrame> next_recovery_frame();
+    void recover(const Image& image, int64_t pts_us, Profile& profile);
     void push(const Image& image, int64_t pts_us, int64_t duration_us, Profile& profile);
     void push_observation(Motion motion, int64_t pts_us, int64_t duration_us);
     AnalysisResult finish_analysis();
@@ -42,6 +51,7 @@ class Analyzer {
     std::unique_ptr<MotionAnalyzer> motion_;
     ExecutionSettings execution_;
     Image previous_;
+    std::unique_ptr<TrackingRecovery> recovery_;
     bool finished_ = false;
     int64_t last_pts_ = 0;
 };

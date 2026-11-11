@@ -14,6 +14,8 @@ class VideoReader {
   public:
     virtual ~VideoReader() = default;
     virtual bool next(VideoFrame& frame) = 0;
+    // Analysis uses unexpanded source luma where the decoder exposes it.
+    virtual bool next_luma(VideoFrame& frame) { return next(frame); }
     virtual const VideoInfo& info() const = 0;
     // Invoked on the thread calling next(), before it returns the frame demuxed alongside.
     virtual void set_audio_callback(std::function<void(const AudioPacket&)> callback) = 0;

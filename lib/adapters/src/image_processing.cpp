@@ -10,20 +10,7 @@ class OpenCvProcessing final : public ImageProcessing {
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
         return make_opencv_analyzer(settings, horizontal);
     }
-    Image gray_proxy(const Image& input, Size size) override {
-        if (input->format() != PixelFormat::bgr8)
-            return stillflow::gray_proxy(input, size);
-        cv::Mat gray, small;
-        auto view = read_pixels(input);
-        if (view.mapping.format != PixelFormat::bgr8)
-            throw std::invalid_argument("Preprocessing requires BGR8 input");
-        cv::cvtColor(view.pixels, gray, cv::COLOR_BGR2GRAY);
-        const cv::Size target(size.width, size.height);
-        if (gray.size() == target)
-            return image(std::move(gray));
-        cv::resize(gray, small, target, 0, 0, cv::INTER_AREA);
-        return image(std::move(small));
-    }
+    Image gray_proxy(const Image& input, Size size) override { return stillflow::gray_proxy(input, size); }
 
     Image comparison(const Image& input, const Image& stabilized) override {
         if (!font_)

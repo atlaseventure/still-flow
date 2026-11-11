@@ -30,7 +30,7 @@ cmake --build --preset core
 cmake --install build/core-sdk --prefix /path/to/sdk
 ```
 
-Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Frames can be pushed into an analyzer, planned, then rendered by index. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. C API structures, ownership and callbacks are documented in the installed headers.
+Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Push frames into an analyzer, replay requested recovery frames, finish the plan, then render by index. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. C API structures, ownership and callbacks are documented in the installed headers.
 
 For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android native consumers, set `ANDROID_NDK_HOME` to an installed NDK directory:
 

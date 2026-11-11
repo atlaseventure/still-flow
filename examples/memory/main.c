@@ -35,6 +35,16 @@ int main(void) {
     for (int i = 0; i < 8; ++i)
         if (sf_analyzer_push(analyzer, &image, (int64_t)i * 33333, 33333, &error) != SF_OK)
             goto done;
+    for (;;) {
+        sf_recovery_frame request = {sizeof(request), 0, 0, 0};
+        if (sf_analyzer_next_recovery_frame(analyzer, &request, &error) != SF_OK)
+            goto done;
+        if (!request.available)
+            break;
+        /* All frames in this example use the same pixels. */
+        if (sf_analyzer_recover(analyzer, &image, request.pts_us, &error) != SF_OK)
+            goto done;
+    }
     if (sf_analyzer_finish(analyzer, &plan, &error) != SF_OK)
         goto done;
     if (sf_renderer_create(NULL, &renderer, &error) != SF_OK)

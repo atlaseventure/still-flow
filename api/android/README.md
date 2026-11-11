@@ -1,6 +1,6 @@
 # Android SDK
 
-Kotlin implementation with Java-callable bindings for two-pass frame stabilization, GPU rendering and Android hardware codecs. Build from the repository root with `./api/android/gradlew -p api/android assembleRelease`, then add the generated AAR to your app:
+Kotlin implementation with Java-callable bindings for frame stabilization, GPU rendering and Android hardware codecs. Build from the repository root with `./api/android/gradlew -p api/android assembleRelease`, then add the generated AAR to your app:
 
 ```kotlin
 dependencies {
@@ -10,7 +10,7 @@ dependencies {
 
 The consuming app needs the Kotlin standard library, supplied by Kotlin-enabled Android projects.
 
-Run processing on a worker thread. Analyze decoded frames in presentation order, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
+Run processing on a worker thread. Analyze decoded frames in presentation order, replay requested recovery frames, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
 
 ```kotlin
 import io.stillflow.StillFlow
@@ -20,6 +20,12 @@ StillFlow(width, height, fps).use { session ->
     frames.forEachIndexed { index, frame ->
         session.analyze(frame, timestampsUs[index], durationsUs[index])
     }
+    var request = session.nextRecoveryFrame()
+    while (request != null) {
+        val index = request.index.toInt()
+        session.recover(frames[index], timestampsUs[index])
+        request = session.nextRecoveryFrame()
+    }
     session.finish()
     val output = ByteBuffer.allocateDirect(width * height * 4)
     frames.forEachIndexed { index, rgbaFrame ->
@@ -28,6 +34,8 @@ StillFlow(width, height, fps).use { session ->
     }
 }
 ```
+
+For streamed input, decode again only when recovery is requested and feed the requested indices in order. `finish()` requires recovery to be complete. Use the same source luma and timestamps for analysis and replay.
 
 `Frame` accepts direct buffers containing gray8, BGR8 or RGBA8, with an explicit row stride. It captures the buffer's remaining range. Analysis copies input as needed; rendering writes to caller-owned storage. Keep input unchanged during each call and close sessions with Kotlin `use` or Java try-with-resources.
 

@@ -281,7 +281,7 @@ class HostConverter {
     ~HostConverter() { release(); }
     HostConverter(const HostConverter&) = delete;
     HostConverter& operator=(const HostConverter&) = delete;
-    cv::Mat convert(const AVFrame* frame);
+    cv::Mat convert(const AVFrame* frame, bool luma_only);
 
   private:
     void release() {
@@ -300,7 +300,7 @@ class HostConverter {
 };
 
 // frame carries colour metadata; pixels is the host image to convert.
-cv::Mat HostConverter::convert(const AVFrame* frame) {
+cv::Mat HostConverter::convert(const AVFrame* frame, bool luma_only) {
     std::lock_guard lock(mutex_);
     const AVFrame* pixels = frame;
     if (frame->format == AV_PIX_FMT_CUDA) {
@@ -321,23 +321,30 @@ cv::Mat HostConverter::convert(const AVFrame* frame) {
             pixels = planar_;
         }
     }
-    // Frame dimensions are fixed by the reader; only the pixel format may change.
-    if (!scaler_ || scaler_format_ != pixels->format) {
-        sws_freeContext(scaler_);
-        scaler_ = nullptr;
-        scaler_ = make_scaler(pixels->width, pixels->height, static_cast<AVPixelFormat>(pixels->format),
-                              AV_PIX_FMT_BGR24, SWS_BILINEAR, threads_, "Create decoder color converter");
-        scaler_format_ = pixels->format;
+    cv::Mat raw, output;
+    const auto* description = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(pixels->format));
+    if (luma_only && description && !(description->flags & AV_PIX_FMT_FLAG_RGB) && description->comp[0].depth == 8 &&
+        description->comp[0].step == 1 && description->comp[0].plane == 0 && pixels->linesize[0] > 0) {
+        raw = cv::Mat(pixels->height, pixels->width, CV_8UC1, pixels->data[0], pixels->linesize[0]).clone();
+    } else {
+        // Frame dimensions are fixed by the reader; only the pixel format may change.
+        if (!scaler_ || scaler_format_ != pixels->format) {
+            sws_freeContext(scaler_);
+            scaler_ = nullptr;
+            scaler_ = make_scaler(pixels->width, pixels->height, static_cast<AVPixelFormat>(pixels->format),
+                                  AV_PIX_FMT_BGR24, SWS_BILINEAR, threads_, "Create decoder color converter");
+            scaler_format_ = pixels->format;
+        }
+        const int* coefficients = sws_getCoefficients(colorspace(frame->colorspace));
+        check(sws_setColorspaceDetails(scaler_, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1,
+                                       0, 1 << 16, 1 << 16),
+              "Set input colorspace");
+        raw.create(frame->height, frame->width, CV_8UC3);
+        borrow(converted_, raw.data, raw.step, raw.cols, raw.rows, AV_PIX_FMT_BGR24);
+        const int converted = sws_scale_frame(scaler_, converted_, pixels);
+        av_frame_unref(converted_);
+        check(converted, "Convert decoded frame");
     }
-    const int* coefficients = sws_getCoefficients(colorspace(frame->colorspace));
-    check(sws_setColorspaceDetails(scaler_, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0,
-                                   1 << 16, 1 << 16),
-          "Set input colorspace");
-    cv::Mat raw(frame->height, frame->width, CV_8UC3), output;
-    borrow(converted_, raw.data, raw.step, raw.cols, raw.rows, AV_PIX_FMT_BGR24);
-    const int converted = sws_scale_frame(scaler_, converted_, pixels);
-    av_frame_unref(converted_);
-    check(converted, "Convert decoded frame");
     switch (rotation_) {
     case 90:
         cv::rotate(raw, output, cv::ROTATE_90_CLOCKWISE);
@@ -366,7 +373,7 @@ DeviceFrame::DeviceFrame(const AVFrame* frame, std::shared_ptr<HostConverter> co
     describe_colour(frame_, descriptor_);
 }
 DeviceFrame::~DeviceFrame() { av_frame_free(&frame_); }
-cv::Mat DeviceFrame::download() const { return converter_->convert(frame_); }
+cv::Mat DeviceFrame::download(bool luma_only) const { return converter_->convert(frame_, luma_only); }
 
 struct Reader::Impl {
     AVFormatContext* format = nullptr;
@@ -478,7 +485,7 @@ void Reader::set_audio_callback(std::function<void(const AVPacket*)> callback) {
     impl_->audio_callback = std::move(callback);
 }
 
-bool Reader::next(DecodedFrame& output) {
+bool Reader::next(DecodedFrame& output, bool luma_only) {
     auto& s = *impl_;
     for (;;) {
         const int received = avcodec_receive_frame(s.decoder, s.frame);
@@ -545,10 +552,10 @@ bool Reader::next(DecodedFrame& output) {
         // NV12 stays on the GPU; consumers that need host pixels convert lazily.
         s.devices->synchronize();
         output.device = std::make_shared<const DeviceFrame>(frame, s.converter, s.info.rotation);
-        output.bgr.release();
+        output.pixels.release();
     } else {
         output.device.reset();
-        output.bgr = s.converter->convert(frame);
+        output.pixels = s.converter->convert(frame, luma_only);
     }
     av_frame_unref(s.frame);
     return true;

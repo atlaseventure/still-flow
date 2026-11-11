@@ -42,8 +42,8 @@ class HardwareDevices {
 // to call from several threads; conversions are serialized.
 class HostConverter;
 
-// An NVDEC frame kept in device memory. download() produces the same BGR image
-// the host path would have and may run on any thread.
+// An NVDEC frame kept in device memory. download() matches the host BGR or
+// source-luma path and may run on any thread.
 class DeviceFrame {
   public:
     // References (does not take) frame.
@@ -52,7 +52,7 @@ class DeviceFrame {
     DeviceFrame(const DeviceFrame&) = delete;
     DeviceFrame& operator=(const DeviceFrame&) = delete;
     [[nodiscard]] const CudaImage& descriptor() const { return descriptor_; }
-    [[nodiscard]] cv::Mat download() const;
+    [[nodiscard]] cv::Mat download(bool luma_only = false) const;
 
   private:
     AVFrame* frame_;
@@ -61,7 +61,7 @@ class DeviceFrame {
 };
 
 struct DecodedFrame {
-    cv::Mat bgr;                               // Host frames.
+    cv::Mat pixels;                            // Host BGR or source luma.
     std::shared_ptr<const DeviceFrame> device; // NVDEC frames left on the GPU.
     int64_t pts_us = 0, duration_us = 0;
 };
@@ -72,7 +72,7 @@ class Reader {
     ~Reader();
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
-    bool next(DecodedFrame& frame);
+    bool next(DecodedFrame& frame, bool luma_only = false);
     [[nodiscard]] const VideoInfo& info() const;
     [[nodiscard]] AVFormatContext* context() const;
     void set_audio_callback(std::function<void(const AVPacket*)> callback);

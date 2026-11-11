@@ -65,7 +65,7 @@ class ExportRunner : Instrumentation() {
         }
     }
 
-    private fun decode(input: File, consume: (Image, Long, MediaFormat) -> Unit): Int {
+    private fun decode(input: File, needed: () -> Boolean = { true }, consume: (Image, Long, MediaFormat) -> Unit): Int {
         val ex = extractor(input)
         var decoder: MediaCodec? = null
         try {
@@ -82,7 +82,7 @@ class ExportRunner : Instrumentation() {
             var lastProgress = System.nanoTime()
             val info = MediaCodec.BufferInfo()
             var outputFormat = format
-            while (!done) {
+            while (!done && needed()) {
                 check(System.nanoTime() - lastProgress < STALL_NS) { "Decoder stalled" }
                 if (!inputEnded) {
                     val index = codec.dequeueInputBuffer(1000)
@@ -164,6 +164,21 @@ class ExportRunner : Instrumentation() {
                 timestamps.add(pts)
                 if (timestamps.size % 60 == 0) progress("analyze", timestamps.size)
             }
+            var request = session.nextRecoveryFrame()
+            var recoveryFrames = 0
+            if (request != null) {
+                var index = 0L
+                decode(input, { request != null }) { image, pts, _ ->
+                    if (index == checkNotNull(request).index) {
+                        session.recover(AndroidFrames.luma(image), pts)
+                        recoveryFrames++
+                        request = session.nextRecoveryFrame()
+                    }
+                    index++
+                }
+                check(request == null) { "Input ended during tracking recovery" }
+            }
+            report.put("recovery_frames", recoveryFrames)
             check(frames > 0 && session.finish().frameCount == frames.toLong()) { "Analysis frame count mismatch" }
             report.put("analysis_seconds", (System.nanoTime() - began) / 1e9)
             val fmt = MediaFormat.createVideoFormat("video/avc", width, height).apply {
@@ -188,13 +203,11 @@ class ExportRunner : Instrumentation() {
                 val outputPixels = ByteBuffer.allocateDirect(width * height * 4)
                 val frame = StillFlow.Frame(width, height, StillFlow.PixelFormat.RGBA8, width * 4, inputPixels)
                 var index = 0
-                val rendered = decode(input) { image, pts, format ->
+                val rendered = decode(input) { image, pts, _ ->
                     check(index < timestamps.size && pts == timestamps[index]) { "Decode timestamp mismatch" }
-                    val standard = if (format.containsKey(MediaFormat.KEY_COLOR_STANDARD)) format.getInteger(MediaFormat.KEY_COLOR_STANDARD) else 0
-                    require(standard in intArrayOf(0, MediaFormat.COLOR_STANDARD_BT709, MediaFormat.COLOR_STANDARD_BT601_NTSC, MediaFormat.COLOR_STANDARD_BT601_PAL)) { "Unsupported color matrix" }
-                    val bt709 = if (standard == 0) config.getBoolean("bt709") else standard == MediaFormat.COLOR_STANDARD_BT709
-                    val range = if (format.containsKey(MediaFormat.KEY_COLOR_RANGE)) format.getInteger(MediaFormat.KEY_COLOR_RANGE) else 0
-                    val full = if (range == 0) config.getBoolean("fullRange") else range == MediaFormat.COLOR_RANGE_FULL
+                    // The host validates the source matrix and range before deployment.
+                    val bt709 = config.getBoolean("bt709")
+                    val full = config.getBoolean("fullRange")
                     pixels(true, image, inputPixels, width, height, bt709, full)
                     session.render(index, frame, outputPixels)
                     sink.submit(outputPixels, width, height, pts - timestamps[0])

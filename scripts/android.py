@@ -187,6 +187,7 @@ def run(args):
                 "am",
                 "instrument",
                 "-w",
+                "-r",
                 "-e",
                 "run",
                 run_id,
