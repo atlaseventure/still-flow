@@ -240,7 +240,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     const bool horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
     services.progress.analyzing(info, analysis_size, horizontal);
     StreamAnalyzer analyzer(options, options.stream, analysis_size, info.fps, horizontal,
-                            services.images.analyzer(options, horizontal), options.execution);
+                            services.images.stream_analyzer(options, horizontal), options.execution);
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())

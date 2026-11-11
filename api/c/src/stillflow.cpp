@@ -217,7 +217,7 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
             motion = make_translation_analyzer(settings);
 #ifdef STILLFLOW_C_OPENCV
         else if (value->motion_estimator == SF_MOTION_OPENCV)
-            motion = make_opencv_analyzer(settings, video->horizontal_scan != 0);
+            motion = make_opencv_analyzer(settings, video->horizontal_scan != 0, true);
 #endif
         else
             throw BackendError("Requested motion estimator is unavailable");

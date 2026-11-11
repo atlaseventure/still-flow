@@ -120,13 +120,20 @@ struct DescriptorMotion {
 // Independent correspondences recover motion when large displacement, blur or
 // parallax makes the optical-flow model unreliable. Mutual matches avoid
 // counting multiple descriptors of the same destination as independent support.
-DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& current, int features) {
+DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& current, int features,
+                                   std::vector<cv::KeyPoint>& cached_keys, cv::Mat& cached_descriptors, bool cached) {
     DescriptorMotion result;
     auto detector = cv::ORB::create(std::max(800, features));
     std::vector<cv::KeyPoint> keys_before, keys_after;
     cv::Mat descriptors_before, descriptors_after;
-    detector->detectAndCompute(previous, {}, keys_before, descriptors_before);
+    if (cached) {
+        keys_before = std::move(cached_keys);
+        descriptors_before = std::move(cached_descriptors);
+    } else
+        detector->detectAndCompute(previous, {}, keys_before, descriptors_before);
     detector->detectAndCompute(current, {}, keys_after, descriptors_after);
+    cached_keys = keys_after;
+    cached_descriptors = descriptors_after;
     if (keys_before.size() < 64 || keys_after.size() < 64)
         return result;
     result.textured = true;
@@ -199,10 +206,19 @@ bool scene_cut(const cv::Mat& previous, const cv::Mat& current, double support, 
 }
 
 } // namespace
-MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool horizontal_scan)
-    : options_(options), horizontal_(horizontal_scan) {}
+MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental)
+    : options_(options), horizontal_(horizontal_scan), incremental_(incremental) {}
 
-Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile) {
+Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive) {
+    if (!consecutive) {
+        pyramid_.clear();
+        tracked_.clear();
+        descriptors_ready_ = false;
+    }
+    const bool cached_descriptors = descriptors_ready_;
+    descriptors_ready_ = false;
+    const auto carried = incremental_ && (++pairs_ % 15 != 0) ? std::move(tracked_) : std::vector<cv::Point2f>{};
+    tracked_.clear();
     Motion result;
     result.row_delta.resize(options_.bands);
     double global_support = 0;
@@ -214,7 +230,9 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         result.failure = reason;
         result.state = MotionState::missing;
         ScopeTimer timer(profile, "analysis.recover_features");
-        const auto descriptors = descriptor_motion(previous, current, options_.features);
+        const auto descriptors =
+            descriptor_motion(previous, current, options_.features, descriptor_keys_, descriptors_, cached_descriptors);
+        descriptors_ready_ = true;
         if (descriptors.score.reliable() && geometry_failure(descriptors.step, center, norm).empty()) {
             result.step = descriptors.step;
             record_quality(result, descriptors.score);
@@ -235,23 +253,40 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                 cv::Rect roi(x * previous.cols / columns, y * previous.rows / rows,
                              (x + 1) * previous.cols / columns - x * previous.cols / columns,
                              (y + 1) * previous.rows / rows - y * previous.rows / rows);
-                std::vector<cv::Point2f> points;
-                cv::goodFeaturesToTrack(previous(roi), points, std::max(1, options_.features / (columns * rows)), 0.015,
-                                        6 * pixel_scale);
-                for (auto point : points)
-                    source.push_back(point + cv::Point2f(static_cast<float>(roi.x), static_cast<float>(roi.y)));
+                const size_t quota = static_cast<size_t>(std::max(1, options_.features / (columns * rows)));
+                std::vector<cv::Point2f> cell;
+                for (const auto point : carried)
+                    if (cell.size() < quota && point.x >= roi.x && point.x < roi.x + roi.width && point.y >= roi.y &&
+                        point.y < roi.y + roi.height)
+                        cell.push_back(point);
+                if (cell.size() < quota / 2 || cell.empty()) {
+                    std::vector<cv::Point2f> points;
+                    cv::goodFeaturesToTrack(previous(roi), points, static_cast<int>(quota), 0.015, 6 * pixel_scale);
+                    for (auto point : points) {
+                        point += cv::Point2f(static_cast<float>(roi.x), static_cast<float>(roi.y));
+                        if (cell.size() < quota && std::none_of(cell.begin(), cell.end(), [&](auto p) {
+                                return cv::norm(point - p) < 6 * pixel_scale;
+                            }))
+                            cell.push_back(point);
+                    }
+                }
+                source.insert(source.end(), cell.begin(), cell.end());
             }
     }
     if (source.size() < 24) {
+        pyramid_.clear();
         return missing("features");
     }
     std::vector<uchar> forward_status, backward_status;
     std::vector<float> forward_error, backward_error;
     {
         ScopeTimer timer(profile, "analysis.track");
-        cv::calcOpticalFlowPyrLK(previous, current, source, destination, forward_status, forward_error, {21, 21}, 3);
-        cv::calcOpticalFlowPyrLK(current, previous, destination, backward, backward_status, backward_error, {21, 21},
-                                 3);
+        auto before = std::move(pyramid_);
+        if (before.empty())
+            cv::buildOpticalFlowPyramid(previous, before, {21, 21}, 3);
+        cv::buildOpticalFlowPyramid(current, pyramid_, {21, 21}, 3);
+        cv::calcOpticalFlowPyrLK(before, pyramid_, source, destination, forward_status, forward_error, {21, 21}, 3);
+        cv::calcOpticalFlowPyrLK(pyramid_, before, destination, backward, backward_status, backward_error, {21, 21}, 3);
     }
     std::vector<cv::Point2f> p, q;
     std::vector<double> reliability;
@@ -406,6 +441,10 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         for (int j = 0; j < bands; ++j)
             result.row_delta[j] = Point(parameters(4 + 2 * j), parameters(5 + 2 * j)) * trust;
     }
+    if (incremental_)
+        for (size_t i = 0; i < q.size(); ++i)
+            if (residuals[i] <= 3 * pixel_scale)
+                tracked_.push_back(q[i]);
     return result;
 }
 

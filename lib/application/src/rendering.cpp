@@ -12,7 +12,8 @@ class CropRenderer {
     const BackendInfo& info() const { return info_; }
     Image render(const Image& input, Warp& warp, Size analysis, double crop, bool horizontal, Profile& profile) {
         if (!input || input->size().width < 2 || input->size().height < 2 || analysis.width < 2 ||
-            analysis.height < 2 || !std::isfinite(crop) || crop < 0 || crop > 0.25)
+            analysis.height < 2 || warp.boundary_search_steps < 0 || warp.boundary_search_steps > 16 ||
+            !std::isfinite(crop) || crop < 0 || crop > 0.25)
             throw std::invalid_argument("Invalid render geometry");
         const auto& formats = info_.capabilities.formats;
         if (std::find(formats.begin(), formats.end(), input->format()) == formats.end())
@@ -47,7 +48,7 @@ class CropRenderer {
                 ++warp.boundary_retries;
                 if (!check())
                     throw std::runtime_error("Cannot construct a valid crop");
-                for (int iteration = 0; iteration < 16; ++iteration) {
+                for (int iteration = 0; iteration < warp.boundary_search_steps; ++iteration) {
                     warp.strength = (low + high) * 0.5;
                     ++warp.boundary_retries;
                     if (check())
@@ -56,9 +57,11 @@ class CropRenderer {
                         high = warp.strength;
                 }
                 warp.strength = low;
-                ++warp.boundary_retries;
-                if (!check())
-                    throw std::runtime_error("Boundary validation is inconsistent");
+                if (warp.boundary_search_steps > 0) {
+                    ++warp.boundary_retries;
+                    if (!check())
+                        throw std::runtime_error("Boundary validation is inconsistent");
+                }
                 warp.render_strength = warp.planned_strength > 0 ? low / warp.planned_strength : 1;
             }
         }

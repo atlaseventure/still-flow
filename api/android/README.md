@@ -10,7 +10,7 @@ dependencies {
 
 The consuming app needs the Kotlin standard library, supplied by Kotlin-enabled Android projects.
 
-Run processing on a worker thread. Analyze decoded frames in presentation order, replay requested recovery frames, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
+Run processing on a worker thread. In offline mode, analyze decoded frames in presentation order, replay requested recovery frames, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
 
 ```kotlin
 import io.stillflow.StillFlow
@@ -35,7 +35,7 @@ StillFlow(width, height, fps).use { session ->
 }
 ```
 
-For streamed input, decode again only when recovery is requested and feed the requested indices in order. `finish()` requires recovery to be complete. Use the same source luma and timestamps for analysis and replay.
+For offline recovery, decode again only when requested and feed the requested indices in order. `finish()` requires recovery to be complete. Use the same source luma and timestamps for analysis and replay.
 
 `Frame` accepts direct buffers containing gray8, BGR8 or RGBA8, with an explicit row stride. It captures the buffer's remaining range. Analysis copies input as needed; rendering writes to caller-owned storage. Keep input unchanged during each call and close sessions with Kotlin `use` or Java try-with-resources.
 
@@ -45,4 +45,4 @@ Motion estimation defaults to `OPENCV`, using feature tracking for translation, 
 
 `HardwareCodecs.decoder(format, surface)` and `HardwareCodecs.encoder(format)` return configured hardware `MediaCodec` instances. The host starts, feeds, drains and releases them. Pass a null decoder surface for `Image` output and use `AndroidFrames.luma(image)` for analysis before releasing the decoded buffer. For encoding, configure Surface input or flexible YUV input and supply the corresponding pixels. Packed render frames require conversion to the encoder's input format. On API 26–28, codec selection uses vendor names because the hardware capability flag is unavailable.
 
-流式处理设置 `settings.realtime = true`，通过 `tryPush()` 推帧并循环调用 `takeReady()`。按返回索引取出宿主持有的全尺寸帧，调用 `renderReady()` 后再取下一帧；结束时调用 `finishStream()` 并排空。`tryPush()` 返回 `false` 表示容量已满，可排空后重试或丢弃新帧。MediaCodec 输出须复制到宿主缓冲后及时释放，音频按相同前视延迟送出并保留原始 PTS。
+Set `settings.realtime = true` for streaming. Call `tryPush()` and drain `takeReady()`; retain full frames by index and call `renderReady()` before taking another result. Finish with `finishStream()` and drain again. A rejected push means the queue is full: drain and retry or drop the incoming frame. Copy MediaCodec output into host-owned buffers before releasing it. Delay audio by the same lookahead while preserving original PTS.

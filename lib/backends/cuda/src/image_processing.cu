@@ -63,6 +63,9 @@ class CudaImageProcessing final : public ImageProcessing {
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
         return host_->analyzer(settings, horizontal);
     }
+    std::unique_ptr<MotionAnalyzer> stream_analyzer(const StabilizationSettings& settings, bool horizontal) override {
+        return host_->stream_analyzer(settings, horizontal);
+    }
     Image gray_proxy(const Image& input, Size size) override {
         if (!disabled_ && input && size.width > 0 && size.height > 0) {
             if (auto source = cuda::native_source(input)) {

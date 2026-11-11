@@ -71,6 +71,8 @@ struct Warp {
     double geometry_strength = 1;
     double planned_strength = 1;
     double render_strength = 1;
+    // Zero selects a single identity fallback for bounded-latency rendering.
+    int boundary_search_steps = 16;
     int boundary_retries = 0;
     double boundary_invalid_fraction = 0;
     double invalid_fraction = 0;

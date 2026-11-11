@@ -10,6 +10,9 @@ class OpenCvProcessing final : public ImageProcessing {
     std::unique_ptr<MotionAnalyzer> analyzer(const StabilizationSettings& settings, bool horizontal) override {
         return make_opencv_analyzer(settings, horizontal);
     }
+    std::unique_ptr<MotionAnalyzer> stream_analyzer(const StabilizationSettings& settings, bool horizontal) override {
+        return make_opencv_analyzer(settings, horizontal, true);
+    }
     Image gray_proxy(const Image& input, Size size) override { return stillflow::gray_proxy(input, size); }
 
     Image comparison(const Image& input, const Image& stabilized) override {

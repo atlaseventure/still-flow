@@ -1,5 +1,4 @@
 #include "stillflow/application/stream.hpp"
-#include "recovery.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -50,7 +49,7 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
     auto& frames = analysis_.frames;
     const size_t start = proxies_.front().first - base_;
     for (size_t first = std::max(start + 1, next_); first < frames.size(); ++first) {
-        if (!weak(frames[first].motion) || frames[first].motion.reset)
+        if (!weak(frames[first].motion) || frames[first].motion.reset || weak(frames[first - 1].motion))
             continue;
         size_t last = first + 1;
         while (last < frames.size() && weak(frames[last].motion) && !frames[last].motion.reset)
@@ -71,11 +70,33 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
                              analysis_.horizontal,
                              analysis_.origin_us,
                              {frames.begin() + begin, frames.begin() + end + 1}};
-        TrackingRecovery recovery(local);
-        while (auto request = recovery.next()) {
-            const auto index = begin + request->index - start;
-            recovery.push(proxies_[index].second, request->pts_us, *motion_, profile, execution_);
+        // Four independent endpoint links constrain a short weak interval.
+        // Limit work per push; if time runs out, the available evidence is
+        // fused and unresolved observations retain the ordinary tracking fade.
+        ScopeTimer timer(profile, "analysis.bridge");
+        const double deadline = profile.now() + 500 / fps_;
+        std::vector<TemporalLink> links;
+        bool exhausted = false;
+        for (size_t offset = 0; offset < 2 && !exhausted; ++offset) {
+            if (first <= begin + offset)
+                break;
+            const size_t from = first - 1 - offset;
+            for (size_t to = last; to <= std::min(end, last + 1); ++to) {
+                if (frames[to].seconds - frames[from].seconds > 0.20)
+                    continue;
+                if (!links.empty() && profile.now() >= deadline) {
+                    profile.add("analysis.bridge_budget_exhausted", 0);
+                    exhausted = true;
+                    break;
+                }
+                execution_.check();
+                auto observation =
+                    motion_->estimate(proxies_[from - start].second, proxies_[to - start].second, profile);
+                if (!observation.reset && observation.state != MotionState::missing)
+                    links.push_back({from - begin, to - begin, std::move(observation)});
+            }
         }
+        recover_motion(local.frames, links, analysis_.size);
         for (size_t i = std::max(begin, next_); i <= end; ++i)
             frames[i].motion = std::move(local.frames[i - begin].motion);
         recovered_until_ = base_ + last;
@@ -141,6 +162,7 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
            frames[end].seconds - current.seconds <= 0.5)
         ++end;
     auto warp = warps[next_];
+    warp.boundary_search_steps = 0;
     if (settings_.crop_mode != CropMode::fixed)
         crop_.apply(warp, std::span<const Warp>(warps).subspan(next_, end - next_), analysis_.size, settings_, dt,
                     reset);

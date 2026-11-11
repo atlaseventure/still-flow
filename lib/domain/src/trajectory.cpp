@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <deque>
 #include <stdexcept>
 
 namespace stillflow {
@@ -36,8 +35,8 @@ template <size_t Passes> class CausalPath {
         const double window = 6 * reference_dt * seconds / 0.45;
         std::array<double, 6> kernel{};
         double denominator = 1;
-        for (size_t lag = 0; lag < observations_.size(); ++lag) {
-            const auto& state = observations_[observations_.size() - 1 - lag];
+        for (size_t lag = 0; lag < count_; ++lag) {
+            const auto& state = observations_[(cursor_ + 5 - lag) % 6];
             const double age = time - state.time;
             kernel[lag] = std::exp(-9 * age * age / (window * window)) * state.confidence;
             denominator += kernel[lag];
@@ -45,18 +44,17 @@ template <size_t Passes> class CausalPath {
         Point correction;
         for (auto& pass : passes_) {
             const Point input = correction;
-            for (auto& position : pass)
+            for (size_t lag = 0; lag < count_; ++lag) {
+                auto& position = pass[(cursor_ + 5 - lag) % 6];
                 position = position - delta;
-            for (size_t lag = 0; lag < pass.size(); ++lag)
-                correction = correction + pass[pass.size() - 1 - lag] * kernel[lag];
+                correction = correction + position * kernel[lag];
+            }
             correction = correction * (1 / denominator);
-            pass.push_back(input);
-            if (pass.size() > 6)
-                pass.pop_front();
+            pass[cursor_] = input;
         }
-        observations_.push_back({time, std::clamp(confidence, 0.0, 1.0)});
-        if (observations_.size() > 6)
-            observations_.pop_front();
+        observations_[cursor_] = {time, std::clamp(confidence, 0.0, 1.0)};
+        cursor_ = (cursor_ + 1) % 6;
+        count_ = std::min(count_ + 1, size_t{6});
         if (!finite(correction))
             throw std::runtime_error("Nonfinite mesh trajectory");
         return correction;
@@ -67,8 +65,9 @@ template <size_t Passes> class CausalPath {
         double time;
         double confidence;
     };
-    std::deque<Observation> observations_;
-    std::array<std::deque<Point>, Passes> passes_;
+    size_t cursor_ = 0, count_ = 0;
+    std::array<Observation, 6> observations_{};
+    std::array<std::array<Point, 6>, Passes> passes_{};
 };
 
 // Half of the cascade runs forward and half backward. Each pass applies the
