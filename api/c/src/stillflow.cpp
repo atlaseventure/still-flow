@@ -87,6 +87,16 @@ struct sf_frame {
     HostImageView view;
 };
 extern "C" {
+sf_status sf_opencv_set_threads(int32_t threads, sf_error* error) {
+    return c_api::boundary(error, [&] {
+#ifdef STILLFLOW_C_OPENCV
+        configure_opencv_threads(threads);
+#else
+        (void)threads;
+        throw BackendError("OpenCV is unavailable");
+#endif
+    });
+}
 sf_status sf_settings_default(sf_settings* value) {
     return c_api::boundary(nullptr, [&] {
         c_api::require(value);

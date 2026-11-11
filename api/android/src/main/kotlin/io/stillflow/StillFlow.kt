@@ -200,6 +200,10 @@ class StillFlow(
     companion object {
         init { System.loadLibrary("stillflow_jni") }
 
+        /** Configure once before starting analysis workers. */
+        @JvmStatic fun configureThreads(threads: Int) = nativeThreads(threads)
+        @JvmStatic private external fun nativeThreads(threads: Int)
+        @JvmStatic fun mobileSettings(): Settings = Settings().apply { analysisWidth = 640; features = 600 }
         @JvmStatic fun buildDescription(): String = nativeBuildDescription()
         @JvmStatic private external fun nativeProfile(handle: Long): String
         @JvmStatic private external fun nativeDefaults(): DoubleArray

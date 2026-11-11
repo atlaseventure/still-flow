@@ -22,5 +22,7 @@ std::unique_ptr<MotionAnalyzer> make_translation_analyzer(const StabilizationSet
 // Optional OpenCV implementation of the full tracking algorithm.
 std::unique_ptr<MotionAnalyzer> make_opencv_analyzer(const StabilizationSettings& settings, bool horizontal,
                                                      bool incremental = false);
+// Process-wide setting; configure before creating analysis workers.
+void configure_opencv_threads(int threads);
 Image gray_proxy(const Image& image, Size size);
 } // namespace stillflow

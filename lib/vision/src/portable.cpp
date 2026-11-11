@@ -27,6 +27,17 @@ Image gray_proxy(const Image& input, Size size) {
         return row[x];
     };
     std::vector<uint8_t> pixels(static_cast<size_t>(size.width) * size.height);
+    if (view.format != PixelFormat::bgr8 && view.format != PixelFormat::rgba8 && view.size.width == size.width * 2 &&
+        view.size.height == size.height * 2) {
+        for (int y = 0; y < size.height; ++y) {
+            const auto* a = plane.bytes.data() + static_cast<size_t>(2 * y) * plane.row_stride;
+            const auto* b = a + plane.row_stride;
+            auto* out = pixels.data() + static_cast<size_t>(y) * size.width;
+            for (size_t x = 0; x < static_cast<size_t>(size.width); ++x)
+                out[x] = static_cast<uint8_t>((unsigned(a[2 * x]) + a[2 * x + 1] + b[2 * x] + b[2 * x + 1] + 2) >> 2);
+        }
+        return make_host_image(size, PixelFormat::gray8, std::move(pixels));
+    }
     // Area sampling preserves thin features when downscaling camera luma.
     const double sx = double(view.size.width) / size.width, sy = double(view.size.height) / size.height;
     for (int y = 0; y < size.height; ++y)

@@ -94,8 +94,11 @@ def run(args):
         horizontalScan=args.horizontal_scan,
         settings={"backend": args.backend.upper()},
     )
+    if args.mobile:
+        config["settings"].update(analysisWidth=640, features=600)
     keys = {
         "motion_estimator": "motionEstimator",
+        "vision_threads": "visionThreads",
         "analysis_width": "analysisWidth",
         "features": "features",
         "bands": "bands",
@@ -269,6 +272,8 @@ def main():
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
     parser.add_argument("--features", type=int)
+    parser.add_argument("--vision-threads", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--mobile", action="store_true")
     parser.add_argument("--bands", type=int)
     parser.add_argument("--crop-mode", choices=("auto", "fixed", "adaptive"))
     parser.add_argument("--rolling-shutter", action=argparse.BooleanOptionalAction, default=None)

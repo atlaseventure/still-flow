@@ -97,6 +97,12 @@ sf_image image(JNIEnv* env, const Session& owner, jint width, jint height, jint 
 } // namespace
 
 extern "C" {
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeThreads(JNIEnv* env, jclass, jint threads) {
+    boundary(env, [&] {
+        sf_error error{sizeof(sf_error), {}};
+        check(sf_opencv_set_threads(threads, &error), error);
+    });
+}
 JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env, jclass, jlong handle) {
     jstring result = nullptr;
     boundary(env, [&] {

@@ -14,7 +14,8 @@ class OpenCvMotionAnalyzer final : public MotionAnalyzer {
                   before.planes[0].row_stride);
         cv::Mat b(after.size.height, after.size.width, CV_8UC1, const_cast<uint8_t*>(after.planes[0].bytes.data()),
                   after.planes[0].row_stride);
-        auto result = estimator_.estimate(a, b, profile, previous == cached_);
+        auto result = estimator_.estimate(a, b, profile, previous == cached_, &prediction_);
+        prediction_ = result;
         cached_ = current;
         return result;
     }
@@ -22,11 +23,17 @@ class OpenCvMotionAnalyzer final : public MotionAnalyzer {
   private:
     MotionEstimator estimator_;
     Image cached_;
+    Motion prediction_;
 };
 
 } // namespace
 std::unique_ptr<MotionAnalyzer> make_opencv_analyzer(const StabilizationSettings& settings, bool horizontal,
                                                      bool incremental) {
     return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal, incremental);
+}
+void configure_opencv_threads(int threads) {
+    if (threads < 1 || threads > 64)
+        throw std::invalid_argument("Invalid OpenCV thread count");
+    cv::setNumThreads(threads);
 }
 } // namespace stillflow

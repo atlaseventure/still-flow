@@ -129,6 +129,7 @@ class ExportRunner : Instrumentation() {
         val fps = config.getDouble("fps")
         require(width in 32..4096 && height in 32..4096 && width % 2 == 0 && height % 2 == 0 && fps.isFinite() && fps > 0)
         val options = config.getJSONObject("settings")
+        StillFlow.configureThreads(options.optInt("visionThreads", 2))
         val settings = StillFlow.Settings().apply {
             backend = StillFlow.Backend.valueOf(options.optString("backend", backend.name))
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
@@ -237,6 +238,7 @@ class ExportRunner : Instrumentation() {
         val fps = config.getDouble("fps")
         require(width in 32..4096 && height in 32..4096 && width % 2 == 0 && height % 2 == 0 && fps.isFinite() && fps > 0)
         val options = config.getJSONObject("settings")
+        StillFlow.configureThreads(options.optInt("visionThreads", 2))
         val settings = StillFlow.Settings().apply {
             backend = StillFlow.Backend.valueOf(options.optString("backend", backend.name))
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))

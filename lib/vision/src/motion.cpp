@@ -209,7 +209,8 @@ bool scene_cut(const cv::Mat& previous, const cv::Mat& current, double support, 
 MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental)
     : options_(options), horizontal_(horizontal_scan), incremental_(incremental) {}
 
-Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive) {
+Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive,
+                                 const Motion* prediction) {
     if (!consecutive) {
         pyramid_.clear();
         tracked_.clear();
@@ -281,12 +282,42 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     std::vector<float> forward_error, backward_error;
     {
         ScopeTimer timer(profile, "analysis.track");
-        auto before = std::move(pyramid_);
-        if (before.empty())
-            cv::buildOpticalFlowPyramid(previous, before, {21, 21}, 3);
+        before_.swap(pyramid_);
+        if (!consecutive || before_.empty())
+            cv::buildOpticalFlowPyramid(previous, before_, {21, 21}, 3);
         cv::buildOpticalFlowPyramid(current, pyramid_, {21, 21}, 3);
-        cv::calcOpticalFlowPyrLK(before, pyramid_, source, destination, forward_status, forward_error, {21, 21}, 3);
-        cv::calcOpticalFlowPyrLK(pyramid_, before, destination, backward, backward_status, backward_error, {21, 21}, 3);
+        const bool predicted = incremental_ && consecutive && prediction && prediction->confidence >= 0.7 &&
+                               !prediction->reset && prediction->state == MotionState::tracked;
+        const bool light = predicted && options_.analysis_width <= 640 && options_.features <= 600 &&
+                           stillflow::norm(transform(prediction->step, center) - center) < norm * 0.04;
+        const auto track = [&](bool fast) {
+            destination = source;
+            if (predicted)
+                for (size_t i = 0; i < source.size(); ++i) {
+                    const auto p = transform(prediction->step, {source[i].x, source[i].y});
+                    destination[i] = {static_cast<float>(p.x), static_cast<float>(p.y)};
+                }
+            const cv::Size window = fast ? cv::Size(15, 15) : cv::Size(21, 21);
+            const int levels = fast ? 2 : 3;
+            const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
+            cv::calcOpticalFlowPyrLK(before_, pyramid_, source, destination, forward_status, forward_error, window,
+                                     levels, criteria, predicted ? cv::OPTFLOW_USE_INITIAL_FLOW : 0);
+            backward = source;
+            cv::calcOpticalFlowPyrLK(pyramid_, before_, destination, backward, backward_status, backward_error, window,
+                                     levels, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+        };
+        track(light);
+        if (light) {
+            size_t good = 0;
+            for (size_t i = 0; i < source.size(); ++i)
+                if (forward_status[i] && backward_status[i] && forward_error[i] < 35 &&
+                    cv::norm(source[i] - backward[i]) < 1.5 * pixel_scale)
+                    ++good;
+            if (good < std::max(size_t{48}, source.size() * 3 / 5)) {
+                profile.add("analysis.strong_retry", 0);
+                track(false);
+            }
+        }
     }
     std::vector<cv::Point2f> p, q;
     std::vector<double> reliability;
@@ -340,17 +371,23 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     const int bands = options_.bands;
     const int dimensions = 4 + 2 * bands;
     const Eigen::Index count = static_cast<Eigen::Index>(p.size());
-    Eigen::MatrixXd design = Eigen::MatrixXd::Zero(count * 2, dimensions);
+    struct SparseRow {
+        std::array<int, 5> index{};
+        std::array<double, 5> value{};
+        double apply(const Eigen::VectorXd& x) const {
+            double sum = 0;
+            for (size_t j = 0; j < index.size(); ++j)
+                sum += value[j] * x(index[j]);
+            return sum;
+        }
+    };
+    std::vector<SparseRow> design(static_cast<size_t>(count * 2));
     Eigen::VectorXd observed(count * 2), weights(count), parameters = Eigen::VectorXd::Zero(dimensions);
     std::vector<int> band_counts(options_.bands, 0);
     for (Eigen::Index i = 0; i < count; ++i) {
         const double x = (p[i].x - center.x) / norm, y = (p[i].y - center.y) / norm;
-        design(2 * i, 0) = x;
-        design(2 * i, 1) = -y;
-        design(2 * i, 2) = 1;
-        design(2 * i + 1, 0) = y;
-        design(2 * i + 1, 1) = x;
-        design(2 * i + 1, 3) = 1;
+        design[2 * i] = {{0, 1, 2, 0, 0}, {x, -y, 1, 0, 0}};
+        design[2 * i + 1] = {{0, 1, 3, 0, 0}, {y, x, 1, 0, 0}};
         observed(2 * i) = q[i].x - p[i].x;
         observed(2 * i + 1) = q[i].y - p[i].y;
         const double error = stillflow::norm(transform(result.step, {p[i].x, p[i].y}) - Point{q[i].x, q[i].y});
@@ -361,8 +398,11 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
             const double coordinate = horizontal_ ? (p[i].x + q[i].x) * 0.5 : (p[i].y + q[i].y) * 0.5;
             const auto [low, t] = band_position(coordinate, horizontal_ ? previous.cols : previous.rows, bands);
             for (int axis = 0; axis < 2; ++axis) {
-                design(2 * i + axis, 4 + 2 * low + axis) = 1 - t;
-                design(2 * i + axis, 4 + 2 * (low + 1) + axis) = t;
+                auto& row = design[2 * i + axis];
+                row.index[3] = 4 + 2 * low + axis;
+                row.index[4] = 4 + 2 * (low + 1) + axis;
+                row.value[3] = 1 - t;
+                row.value[4] = t;
             }
         }
     }
@@ -384,17 +424,29 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
             }
         }
     }
+    Eigen::MatrixXd lhs(dimensions, dimensions);
+    Eigen::VectorXd rhs(dimensions), residual(count * 2);
+    const auto residuals_for = [&] {
+        for (Eigen::Index i = 0; i < count * 2; ++i)
+            residual(i) = design[i].apply(parameters) - observed(i);
+    };
     for (int iteration = 0; iteration < 5; ++iteration) {
-        Eigen::VectorXd repeated(count * 2);
-        for (Eigen::Index i = 0; i < count; ++i)
-            repeated(2 * i) = repeated(2 * i + 1) = weights(i);
-        const Eigen::MatrixXd weighted = repeated.asDiagonal() * design;
-        const Eigen::MatrixXd lhs = design.transpose() * weighted + regularizer;
-        parameters = lhs.ldlt().solve(weighted.transpose() * observed);
+        lhs = regularizer;
+        rhs.setZero();
+        for (Eigen::Index i = 0; i < count * 2; ++i) {
+            const auto& row = design[i];
+            for (size_t a = 0; a < row.index.size(); ++a) {
+                const double weighted = weights(i / 2) * row.value[a];
+                rhs(row.index[a]) += weighted * observed(i);
+                for (size_t b = 0; b < row.index.size(); ++b)
+                    lhs(row.index[a], row.index[b]) += weighted * row.value[b];
+            }
+        }
+        parameters = lhs.ldlt().solve(rhs);
         if (!parameters.allFinite()) {
             return fallback("nonfinite_fit");
         }
-        const Eigen::VectorXd residual = design * parameters - observed;
+        residuals_for();
         for (Eigen::Index i = 0; i < count; ++i) {
             const double error = residual.segment<2>(2 * i).norm();
             weights(i) = std::min(1.0, 2.0 * pixel_scale / std::max(0.01, error));
@@ -405,7 +457,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                    b, a,  -b * center.x + (1 - a) * center.y + parameters(3),
                    0, 0,  1};
     std::vector<double> residuals;
-    const Eigen::VectorXd residual = design * parameters - observed;
+    residuals_for();
     for (Eigen::Index i = 0; i < count; ++i) {
         const double error = residual.segment<2>(2 * i).norm();
         residuals.push_back(error);
