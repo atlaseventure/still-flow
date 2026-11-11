@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <numbers>
 #include <stdexcept>
 
 namespace stillflow {
@@ -83,17 +84,27 @@ static_assert(trajectory_smoothing_passes % 2 == 0);
 // at that end. Pivoting the reflection on the raw end sample would mirror its
 // shake into the padding and pull the boundary frames by twice that amount.
 Point fit_endpoint(const std::vector<double>& times, const std::vector<double>& weights,
-                   const std::vector<Point>& positions, size_t first, size_t last, size_t end) {
+                   const std::vector<Point>& positions, size_t first, size_t last, size_t end, bool scanline) {
     const double at = times[end];
     double w = 0, t = 0, tt = 0;
     Point x, tx;
     for (size_t k = first; k < last; ++k) {
         const double dt = times[k] - at;
-        w += weights[k];
-        t += weights[k] * dt;
-        tt += weights[k] * dt * dt;
-        x = x + positions[k] * weights[k];
-        tx = tx + positions[k] * (weights[k] * dt);
+        double weight = weights[k];
+        // A rectangular fit leaks the phase of boundary wobble into its
+        // intercept. Taper scanline observations at both ends of the fit so
+        // oscillation cancels without anchoring the target to the first row
+        // shape. The linear model still preserves steady parallax drift.
+        if (scanline && last - first >= 6) {
+            const double phase = (times[k] - times[first]) / (times[last - 1] - times[first]);
+            const double taper = std::sin(std::numbers::pi * phase);
+            weight *= taper * taper;
+        }
+        w += weight;
+        t += weight * dt;
+        tt += weight * dt * dt;
+        x = x + positions[k] * weight;
+        tx = tx + positions[k] * (weight * dt);
     }
     const double determinant = w * tt - t * t;
     if (w <= 1e-9)
@@ -177,12 +188,20 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
     std::vector<Point> extended(total), forward(total);
     for (size_t vertex = 0; vertex < paths; ++vertex) {
         const auto& x = positions[vertex];
-        const Point begin = fit_endpoint(times, confidence, x, 0, head, 0);
-        const Point end = fit_endpoint(times, confidence, x, tail, n, n - 1);
+        const Point begin = fit_endpoint(times, confidence, x, 0, head, 0, scanline);
+        const Point end = fit_endpoint(times, confidence, x, tail, n, n - 1, scanline);
         for (size_t k = 0; k < total; ++k)
             extended[k] = k < pad       ? begin * 2 - x[pad - k]
                           : k < pad + n ? x[k - pad]
                                         : end * 2 - x[n - 1 - (k - pad - n + 1)];
+        if (scanline && n >= 6) {
+            // Reflected pairs cancel their wobble around the fitted endpoint;
+            // the unpaired raw endpoint would leave an impulse in the target.
+            // Filter the fitted value here, then express the correction relative
+            // to the actual observation below so the first frame is corrected too.
+            extended[pad] = begin;
+            extended[pad + n - 1] = end;
+        }
         SymmetricPath path;
         for (size_t k = 0; k < total; ++k)
             forward[k] =
@@ -196,7 +215,7 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
             const Point correction =
                 forward[k] + reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds);
             if (k >= pad && k < pad + n)
-                output[first + k - pad][vertex] = correction;
+                output[first + k - pad][vertex] = correction + (extended[k] - x[k - pad]);
         }
     }
     for (size_t i = first; i < last; ++i) {
