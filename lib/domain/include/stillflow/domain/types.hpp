@@ -67,6 +67,8 @@ struct Warp {
     double row_correction_rms = 0;
     double strength = 1;
     double crop_strength = 1;
+    // Independent temporal crop cap, before geometry/tracking multiplication.
+    double smoothed_crop_strength = 1;
     double tracking_strength = 1;
     double geometry_strength = 1;
     double planned_strength = 1;

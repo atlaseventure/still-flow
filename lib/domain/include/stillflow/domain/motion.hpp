@@ -3,8 +3,9 @@
 #include <span>
 
 namespace stillflow {
+// Set first_shot_start=false when a sliding window has evicted the shot beginning.
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size analysis_size,
-                             const StabilizationSettings& options, bool horizontal_scan);
+                             const StabilizationSettings& options, bool horizontal_scan, bool first_shot_start = true);
 // Geometry-constrained, shot-local viewport and compensation planning.
 void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
                 const StabilizationSettings& options);

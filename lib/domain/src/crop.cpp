@@ -247,6 +247,7 @@ void plan_shot(std::span<const FrameMotion> frames, std::span<Warp> warps, Size 
     // base again would unnecessarily delay recovery even when cropping fits.
     const auto fractions = smooth_caps(frames, crop_caps);
     for (size_t i = 0; i < warps.size(); ++i) {
+        warps[i].smoothed_crop_strength = fractions[i];
         warps[i].strength = warps[i].planned_strength = base[i] * fractions[i];
         warps[i].render_strength = 1;
         warps[i].boundary_retries = 0;
@@ -297,7 +298,7 @@ void StreamCrop::apply(Warp& warp, std::span<const Warp> future, Size size, cons
             else
                 high = middle;
         }
-    warp.crop_strength = low;
+    warp.crop_strength = warp.smoothed_crop_strength = low;
     // Safety reductions take effect immediately; recovery is rate limited.
     strength_ = std::min(base * low, strength_ + dt / 0.25);
     warp.strength = warp.planned_strength = strength_;

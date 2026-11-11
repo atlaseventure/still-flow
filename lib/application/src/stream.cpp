@@ -154,7 +154,7 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
         return false;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
-    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal);
+    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0);
     const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - frames[next_ - 1].seconds;
     size_t end = next_ + 1;

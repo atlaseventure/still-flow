@@ -217,7 +217,7 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
 } // namespace
 
 std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, const StabilizationSettings& options,
-                             bool horizontal) {
+                             bool horizontal, bool first_shot_start) {
     if (size.width < 2 || size.height < 2 || options.bands < 4 || options.bands > 32)
         throw std::invalid_argument("Invalid trajectory geometry");
     std::vector<Warp> output(frames.size());
@@ -271,6 +271,56 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         previous_tracking = warp.tracking_strength;
     }
     plan_crops(frames, output, size, options);
+    // A fast opening pan can exceed the crop budget of the extrapolated
+    // target. Scaling the whole correction then reintroduces frame-to-frame
+    // shake throughout the eroded crop-cap neighborhood. During endpoint
+    // initialization, relax the target's temporal scale instead: follow the
+    // fast trend while still filtering shake, then recheck every crop bound.
+    std::vector<double> startup_blend(frames.size());
+    double shot_start = frames.empty() ? 0 : frames.front().seconds;
+    bool initialize = first_shot_start;
+    for (size_t i = 0; i < frames.size() && options.smooth_seconds > 0 && options.crop > 0; ++i) {
+        if (frames[i].motion.reset || (i > 0 && frames[i].segment != frames[i - 1].segment)) {
+            shot_start = frames[i].seconds;
+            initialize = true;
+        }
+        if (!initialize)
+            continue;
+        const auto& w = output[i];
+        // Tracking loss keeps its existing fade; this only responds to crop pressure.
+        if (w.tracking_strength < 0.99 || w.window.scale > 1 - 2 * options.crop + 1e-6)
+            continue;
+        const double pressure = std::clamp(2 * (1 - w.smoothed_crop_strength), 0.0, 1.0);
+        const double age = frames[i].seconds - shot_start;
+        // Match the endpoint fit horizon, fading over its final smoothing scale.
+        const double startup = std::clamp((3 * options.smooth_seconds - age) / options.smooth_seconds, 0.0, 1.0);
+        startup_blend[i] = pressure * startup;
+    }
+    if (std::any_of(startup_blend.begin(), startup_blend.end(), [](double blend) { return blend > 0.02; })) {
+        std::vector<std::vector<Point>> responsive(frames.size());
+        for (size_t first = 0; first < frames.size();) {
+            size_t last = first + 1;
+            while (last < frames.size() && frames[last].segment == frames[last - 1].segment &&
+                   !frames[last].motion.reset)
+                ++last;
+            if (std::any_of(startup_blend.begin() + first, startup_blend.begin() + last,
+                            [](double blend) { return blend > 0; }))
+                plan_paths(responsive, frames, first, last, size, columns, rows, options.smooth_seconds * 0.4, false,
+                           horizontal);
+            first = last;
+        }
+        for (size_t i = 0; i < output.size(); ++i) {
+            if (startup_blend[i] == 0)
+                continue;
+            auto& w = output[i];
+            for (int vertex = 0; vertex < count; ++vertex) {
+                const auto adjustment = (responsive[i][vertex] - global[i][vertex]) * startup_blend[i];
+                w.displacement[vertex] = w.displacement[vertex] + adjustment;
+                w.global_offset = w.global_offset + adjustment * (1.0 / count);
+            }
+        }
+        plan_crops(frames, output, size, options);
+    }
     return output;
 }
 
