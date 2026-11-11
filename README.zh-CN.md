@@ -67,3 +67,5 @@ uv run --locked --group video python scripts/generate_video.py --output .local/s
 [MIT](LICENSE) © 2026 hiro。
 
 可选桌面模块默认动态链接 LGPL FFmpeg，使用 BSD OpenH264 编码。安装包含可替换的 FFmpeg 共享库、许可证声明、对应媒体源码及构建配置。版本输出与报告记录实际链接的 FFmpeg 许可证。分发桌面二进制时须遵守所链接依赖的许可证；独立核心 SDK 不包含 FFmpeg。
+
+分发二进制时保留安装附带的声明和对应源码。安装会核验依赖包的校验和并要求分发材料完整，外部提供的依赖前缀同样适用。CUDA 构建附带对应的 NVIDIA 许可及分发说明；NVIDIA 运行库组件单独遵循这些条款，项目自有代码采用 MIT 许可。

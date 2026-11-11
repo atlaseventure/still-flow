@@ -102,6 +102,11 @@ else()
 endif()
 
 include(GNUInstallDirs)
+if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_DEPS_ROOT)
+    # Validate the dependency package before installing any application files.
+    install(CODE "set(ROOT \"${STILLFLOW_DEPS_ROOT}\")")
+    install(SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DistributionManifest.cmake")
+endif()
 if(STILLFLOW_BUILD_ADAPTERS
    AND STILLFLOW_WITH_CUDA
    AND CMAKE_CUDA_COMPILER)
@@ -143,17 +148,13 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/StillFlowConfig.cmake"
 install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow")
 
 if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_DEPS_ROOT)
-    install(
-        DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/licenses/stillflow/"
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow"
-        OPTIONAL)
+    install(DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/licenses/stillflow/"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow")
 endif()
 
 if(STILLFLOW_BUILD_ADAPTERS AND STILLFLOW_DEPS_ROOT)
-    install(
-        DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/stillflow/media-sources"
-        DESTINATION "${CMAKE_INSTALL_DATADIR}/stillflow"
-        OPTIONAL)
+    install(DIRECTORY "${STILLFLOW_DEPS_ROOT}/share/stillflow/media-sources"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/stillflow")
 endif()
 
 install(DIRECTORY licenses/eigen/ DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/eigen")

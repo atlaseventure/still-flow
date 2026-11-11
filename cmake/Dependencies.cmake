@@ -225,12 +225,15 @@ if(STILLFLOW_BUILD_ADAPTERS)
     list(APPEND stillflow_dependencies dep_opencv dep_ffmpeg dep_json)
 endif()
 
+set(distribution_files)
 # Copy dependency license notices into the install prefix.
 function(stillflow_dependency_notice target name)
     ExternalProject_Get_Property(${target} SOURCE_DIR)
     set(notice_dir "${prefix}/share/licenses/stillflow/${name}")
     set(commands COMMAND "${CMAKE_COMMAND}" -E make_directory "${notice_dir}")
     foreach(file IN LISTS ARGN)
+        get_filename_component(filename "${file}" NAME)
+        list(APPEND distribution_files "share/licenses/stillflow/${name}/${filename}")
         list(
             APPEND
             commands
@@ -241,6 +244,9 @@ function(stillflow_dependency_notice target name)
             "${SOURCE_DIR}/${file}"
             "${notice_dir}/")
     endforeach()
+    set(distribution_files
+        "${distribution_files}"
+        PARENT_SCOPE)
     ExternalProject_Add_Step(
         ${target} license_${name}
         DEPENDEES install ${commands}
@@ -266,7 +272,7 @@ if(STILLFLOW_BUILD_ADAPTERS)
 endif()
 
 if(STILLFLOW_BUILD_ADAPTERS)
-    set(media_sources dep_ffmpeg dep_openh264 dep_dav1d dep_zlib)
+    set(media_sources dep_ffmpeg dep_openh264 dep_dav1d dep_zlib dep_nasm dep_meson)
     if(STILLFLOW_WITH_NVCODEC)
         list(APPEND media_sources dep_nvcodec)
     endif()
@@ -276,6 +282,7 @@ if(STILLFLOW_BUILD_ADAPTERS)
     foreach(dependency IN LISTS media_sources)
         ExternalProject_Get_Property(${dependency} URL URL_HASH)
         get_filename_component(archive "${URL}" NAME)
+        list(APPEND distribution_files "share/stillflow/media-sources/${archive}")
         list(
             APPEND
             source_commands
@@ -288,13 +295,40 @@ if(STILLFLOW_BUILD_ADAPTERS)
         string(APPEND source_manifest "${dependency}: ${URL} ${URL_HASH}\n")
     endforeach()
     file(WRITE "${CMAKE_BINARY_DIR}/media-sources.txt" "${source_manifest}")
+    configure_file("${CMAKE_SOURCE_DIR}/cmake/MediaBuild.txt.in" "${CMAKE_BINARY_DIR}/BUILDING.txt" @ONLY)
     ExternalProject_Get_Property(dep_ffmpeg BINARY_DIR)
     ExternalProject_Add_Step(
         dep_ffmpeg source_bundle
         DEPENDEES install ${source_commands}
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_BINARY_DIR}/media-sources.txt" "${BINARY_DIR}/config.h"
-                "${CMAKE_SOURCE_DIR}/cmake/RelocateFFmpeg.cmake" "${source_bundle}/"
+                "${CMAKE_BINARY_DIR}/BUILDING.txt" "${source_bundle}/"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${source_bundle}/build-source"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+                "${CMAKE_SOURCE_DIR}/LICENSE" "${source_bundle}/build-source/"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_SOURCE_DIR}/cmake" "${source_bundle}/build-source/cmake"
         ALWAYS TRUE)
+    list(
+        APPEND
+        distribution_files
+        share/stillflow/media-sources/media-sources.txt
+        share/stillflow/media-sources/config.h
+        share/stillflow/media-sources/BUILDING.txt
+        share/stillflow/media-sources/build-source/CMakeLists.txt
+        share/stillflow/media-sources/build-source/LICENSE
+        share/stillflow/media-sources/build-source/cmake/Dependencies.cmake
+        share/stillflow/media-sources/build-source/cmake/RelocateFFmpeg.cmake
+        share/licenses/opencv5/SoftFloat-COPYING.txt
+        share/licenses/opencv5/fonts-Rubik_OFL.txt)
+    string(JOIN "\n" distribution_files_text ${distribution_files})
+    file(WRITE "${CMAKE_BINARY_DIR}/distribution-files.txt" "${distribution_files_text}\n")
+    add_custom_target(
+        dep_distribution
+        COMMAND "${CMAKE_COMMAND}" "-DROOT=${prefix}" "-DREQUIRED_FILE=${CMAKE_BINARY_DIR}/distribution-files.txt"
+                -DWRITE_MANIFEST=ON -P "${CMAKE_SOURCE_DIR}/cmake/DistributionManifest.cmake"
+        DEPENDS ${stillflow_dependencies}
+        COMMENT "Inventory dependency distribution materials"
+        VERBATIM)
+    list(APPEND stillflow_dependencies dep_distribution)
 endif()
 
 string(REPLACE ";" "|" cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")

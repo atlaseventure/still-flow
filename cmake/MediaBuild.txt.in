@@ -1,0 +1,15 @@
+Rebuild the corresponding FFmpeg shared libraries on Linux amd64.
+Requires a C/C++ compiler, CMake, Ninja, Make, pkg-config, Python and Perl.
+Run from this directory; the included source archives supply the downloads.
+
+cmake -E make_directory rebuild/deps/downloads
+cp ./*.tar.* rebuild/deps/downloads/
+cmake -S build-source -B rebuild -G Ninja -DSTILLFLOW_WITH_CUDA=OFF -DSTILLFLOW_WITH_NVCODEC=@STILLFLOW_WITH_NVCODEC@ -DCMAKE_BUILD_TYPE=@CMAKE_BUILD_TYPE@
+cmake --build rebuild --target dep_ffmpeg --parallel @STILLFLOW_BUILD_JOBS@
+
+Libraries are written to rebuild/deps/install/lib. Replace the installed FFmpeg
+shared libraries with ABI-compatible builds to use a modified version.
+config.h records the original FFmpeg configuration and compiler identification.
+The archives contain unmodified upstream sources; the included build scripts
+configure the libraries and adjust their runtime search paths after installation.
+Keep this source bundle and the accompanying license notices with redistribution.

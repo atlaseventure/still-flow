@@ -67,3 +67,5 @@ Quality commands emit JSON Lines and exit nonzero on failure. `format` applies f
 [MIT](LICENSE) © 2026 hiro.
 
 The optional desktop module dynamically links LGPL FFmpeg and uses BSD OpenH264 by default. Installation includes replaceable FFmpeg shared libraries, license notices and corresponding media sources with build configuration. Version output and reports identify the linked FFmpeg license. Distributing desktop binaries requires compliance with their linked dependencies; the standalone core SDK excludes FFmpeg.
+
+Keep the installed notices and corresponding sources with binary distributions. Installation verifies the dependency package's checksums and requires complete distribution materials, including for externally supplied dependency prefixes. CUDA builds include the matching NVIDIA license and distribution notice; NVIDIA runtime components follow those terms separately from the project's MIT license.

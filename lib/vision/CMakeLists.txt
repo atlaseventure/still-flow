@@ -14,6 +14,17 @@ elseif(STILLFLOW_DEPS_ROOT)
 else()
     find_package(OpenCV 5.1 REQUIRED CONFIG COMPONENTS core imgproc video geometry features)
 endif()
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../licenses/opencv/"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/opencv")
+if(ANDROID AND NOT STILLFLOW_DEPS_ROOT)
+    set(opencv_notice_dir "${opencv_prefix}/share/licenses/opencv5")
+else()
+    set(opencv_notice_dir "${OpenCV_INSTALL_PATH}/share/licenses/opencv${OpenCV_VERSION_MAJOR}")
+endif()
+# SoftFloat is included in core; require it even when the directory is empty.
+install(FILES "${opencv_notice_dir}/SoftFloat-COPYING.txt"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/opencv")
+install(DIRECTORY "${opencv_notice_dir}/" DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/opencv")
 add_library(stillflow_vision_opencv STATIC src/motion.cpp src/opencv.cpp)
 target_include_directories(stillflow_vision_opencv SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(stillflow_vision_opencv PRIVATE EIGEN_MPL2_ONLY)

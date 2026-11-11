@@ -1,0 +1,14 @@
+This build includes NVIDIA CUDA @CMAKE_CUDA_COMPILER_VERSION@ runtime components
+(libcudart_static and libcudadevrt). These components are governed by the
+accompanying LICENSE from the Toolkit used to build this package.
+
+The project's MIT license applies to Still Flow's own code. NVIDIA components
+remain subject to their separate license grants and restrictions. Redistribute
+them only as permitted by that agreement, as part of an application with material
+additional functionality, under terms consistent with the NVIDIA agreement.
+Preserve the applicable proprietary notices and review section 1.1.2 and the
+redistributable list in Attachment A before further distribution.
+
+These component terms leave the rights granted for Still Flow and its open-source
+dependencies under their respective licenses unchanged.
+https://docs.nvidia.com/cuda/eula/index.html
