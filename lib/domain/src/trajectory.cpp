@@ -24,31 +24,22 @@ Point row_motion(const Motion& motion, double position) {
 // utils.generateSmooth_online/_causal7_once. Each pass averages its INPUT at
 // t and t-1..t-6; it does not recursively average its own output. The current
 // weight is one and available taps are normalized locally at shot boundaries.
-// We use the demo's Gaussian fallback, gated by measured motion and confidence
-// instead of pretrained kernels. Positions are rebased to O_t after each input
-// displacement, so the result is directly M_t = S_t - O_t without large sums.
+// Confidence weights are shared by the mesh rather than adapting separately
+// to each vertex's speed. Positions are rebased after each input displacement,
+// so the result is directly M_t = S_t - O_t without large sums.
 template <size_t Passes> class CausalPath {
   public:
-    Point advance(Point delta, double time, double confidence, double seconds, double pixel_scale) {
+    Point advance(Point delta, double time, double confidence, double seconds) {
         if (seconds <= 0)
             return {};
         constexpr double reference_dt = 1.0 / 30;
         const double window = 6 * reference_dt * seconds / 0.45;
-        Point trend;
-        double trend_weight = 0;
-        for (auto& state : observations_) {
-            state.position = state.position - delta;
-            trend = trend - state.position * (state.confidence * reference_dt / (time - state.time));
-            trend_weight += state.confidence;
-        }
-        trend = trend * (1 / std::max(1e-6, trend_weight));
-        const double attenuation = std::exp(-0.02 * trend.dot(trend) / (pixel_scale * pixel_scale));
         std::array<double, 6> kernel{};
         double denominator = 1;
         for (size_t lag = 0; lag < observations_.size(); ++lag) {
             const auto& state = observations_[observations_.size() - 1 - lag];
             const double age = time - state.time;
-            kernel[lag] = std::exp(-9 * age * age / (window * window)) * attenuation * state.confidence;
+            kernel[lag] = std::exp(-9 * age * age / (window * window)) * state.confidence;
             denominator += kernel[lag];
         }
         Point correction;
@@ -63,7 +54,7 @@ template <size_t Passes> class CausalPath {
             if (pass.size() > 6)
                 pass.pop_front();
         }
-        observations_.push_back({time, {}, std::clamp(confidence, 0.0, 1.0)});
+        observations_.push_back({time, std::clamp(confidence, 0.0, 1.0)});
         if (observations_.size() > 6)
             observations_.pop_front();
         if (!finite(correction))
@@ -74,19 +65,19 @@ template <size_t Passes> class CausalPath {
   private:
     struct Observation {
         double time;
-        Point position;
         double confidence;
     };
     std::deque<Observation> observations_;
     std::array<std::deque<Point>, Passes> passes_;
 };
 
-using ScanlinePath = CausalPath<trajectory_smoothing_passes>;
 // Half of the cascade runs forward and half backward. Each pass applies the
 // same kernel, so |H_forward * H_backward| equals the causal |H_50| while the
 // opposite group delays cancel: offline planning keeps the full smoothing
 // strength without lagging behind intentional camera motion.
-using GlobalPath = CausalPath<trajectory_smoothing_passes / 2>;
+// A single temporal kernel preserves the global similarity model. Adapting
+// independently to each vertex's speed bends a rigid rotation into a mesh warp.
+using SymmetricPath = CausalPath<trajectory_smoothing_passes / 2>;
 static_assert(trajectory_smoothing_passes % 2 == 0);
 
 // Confidence-weighted linear fit of one vertex path near a shot end, evaluated
@@ -114,11 +105,13 @@ Point fit_endpoint(const std::vector<double>& times, const std::vector<double>& 
     return (x * tt - tx * t) * (1 / determinant);
 }
 
-// Zero-phase global trajectory for frames [first, last). Point reflection about
+// Zero-phase trajectory for frames [first, last). Point reflection about
 // fitted shot ends extends constant-velocity motion linearly, so the symmetric
-// response neither lags nor bends a steady pan at the boundaries.
-void plan_global(std::vector<std::vector<Point>>& output, const std::vector<FrameMotion>& frames, size_t first,
-                 size_t last, Size size, int columns, int rows, double seconds, double pixel_scale) {
+// response neither lags nor bends a steady pan at the boundaries. Applying the
+// same construction to row motion also avoids accumulating steady parallax
+// into a persistent scanline warp that consumes the global correction budget.
+void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<FrameMotion>& frames, size_t first,
+                size_t last, Size size, int columns, int rows, double seconds, bool scanline, bool horizontal) {
     const size_t n = last - first, count = static_cast<size_t>(columns) * rows;
     for (size_t i = first; i < last; ++i)
         output[i].assign(count, Point{});
@@ -130,8 +123,10 @@ void plan_global(std::vector<std::vector<Point>>& output, const std::vector<Fram
     for (size_t k = 0; k < n; ++k) {
         const auto& frame = frames[first + k];
         times[k] = frame.seconds;
-        confidence[k] = k == 0 ? 1 : std::clamp(frame.motion.confidence, 0.0, 1.0);
-        const bool observed = k > 0 && frame.motion.state != MotionState::missing;
+        confidence[k] =
+            k == 0 ? 1 : std::clamp(scanline ? frame.motion.rs_confidence : frame.motion.confidence, 0.0, 1.0);
+        const bool observed = k > 0 && (scanline ? frame.motion.state == MotionState::tracked
+                                                 : frame.motion.state != MotionState::missing);
         for (int y = 0; y < rows; ++y)
             for (int x = 0; x < columns; ++x) {
                 const size_t vertex = static_cast<size_t>(y) * columns + x;
@@ -139,7 +134,9 @@ void plan_global(std::vector<std::vector<Point>>& output, const std::vector<Fram
                 if (observed) {
                     const Point p(static_cast<double>(x) * (size.width - 1) / (columns - 1),
                                   static_cast<double>(y) * (size.height - 1) / (rows - 1));
-                    delta = transform(frame.motion.step, p) - p;
+                    delta = scanline ? row_motion(frame.motion, horizontal ? static_cast<double>(x) / (columns - 1)
+                                                                           : static_cast<double>(y) / (rows - 1))
+                                     : transform(frame.motion.step, p) - p;
                     if (!finite(delta))
                         throw std::runtime_error("Nonfinite observed mesh motion");
                 }
@@ -182,67 +179,22 @@ void plan_global(std::vector<std::vector<Point>>& output, const std::vector<Fram
             extended[k] = k < pad       ? begin * 2 - x[pad - k]
                           : k < pad + n ? x[k - pad]
                                         : end * 2 - x[n - 1 - (k - pad - n + 1)];
-        GlobalPath path;
+        SymmetricPath path;
         for (size_t k = 0; k < total; ++k)
-            forward[k] = path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k], seconds,
-                                      pixel_scale);
+            forward[k] =
+                path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k], seconds);
         // Smooth S_f = X + forward in reversed time. The step from k+1 to k is
         // S_f[k] - S_f[k+1]; the result is relative to S_f, so both add up.
-        GlobalPath reverse;
+        SymmetricPath reverse;
         for (size_t k = total; k-- > 0;) {
             const bool last_sample = k + 1 == total;
             const Point delta = last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
             const Point correction =
-                forward[k] +
-                reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds, pixel_scale);
+                forward[k] + reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds);
             if (k >= pad && k < pad + n)
                 output[first + k - pad][vertex] = correction;
         }
     }
-}
-
-std::vector<Point> initialize_rows(std::vector<ScanlinePath>& paths, const std::vector<FrameMotion>& frames,
-                                   size_t start, int columns, int rows, bool horizontal, double seconds,
-                                   double pixel_scale) {
-    if (seconds <= 0 || frames[start].motion.state == MotionState::missing)
-        return {};
-    // Reflect a reliable prefix around the shot boundary. The original causal
-    // cascade then starts with real local-motion history instead of retaining
-    // the first frame's rolling-shutter shape. Never cross an unreliable link.
-    size_t end = start;
-    const double origin = frames[start].seconds;
-    // Five kernel widths cover the cascade's dominant history; its exact
-    // maximum support is six observations per pass.
-    for (size_t i = start + 1; i < frames.size() && i - start <= size_t{6} * trajectory_smoothing_passes; ++i) {
-        const auto& frame = frames[i];
-        if (frame.segment != frames[start].segment || frame.motion.reset)
-            break;
-        if (!std::isfinite(frame.seconds) || frame.seconds <= frames[i - 1].seconds)
-            throw std::invalid_argument("Trajectory timestamps must increase within a shot");
-        if (frame.seconds - origin > 5 * seconds || frame.motion.state != MotionState::tracked ||
-            frame.motion.rs_confidence < 0.5 || frame.motion.row_delta.empty())
-            break;
-        end = i;
-    }
-    if (end - start < 6)
-        return {};
-    std::vector<Point> correction(paths.size());
-    for (int y = 0; y < rows; ++y)
-        for (int x = 0; x < columns; ++x) {
-            const int vertex = y * columns + x;
-            const double position =
-                horizontal ? static_cast<double>(x) / (columns - 1) : static_cast<double>(y) / (rows - 1);
-            auto& path = paths[vertex];
-            path.advance({}, 2 * origin - frames[end].seconds, frames[end].motion.rs_confidence, seconds, pixel_scale);
-            for (size_t i = end; i > start; --i) {
-                const Point delta = row_motion(frames[i].motion, position) * -1;
-                if (!finite(delta))
-                    throw std::runtime_error("Nonfinite observed mesh motion");
-                correction[vertex] = path.advance(delta, 2 * origin - frames[i - 1].seconds,
-                                                  frames[i].motion.rs_confidence, seconds, pixel_scale);
-            }
-        }
-    return correction;
 }
 
 } // namespace
@@ -254,9 +206,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
     std::vector<Warp> output(frames.size());
     const int columns = horizontal ? options.bands : 9, rows = horizontal ? 9 : options.bands;
     const int count = columns * rows;
-    const double pixel_scale = std::max(size.width, size.height) / 960.0;
-    std::vector<ScanlinePath> local(count);
-    std::vector<std::vector<Point>> global(frames.size());
+    std::vector<std::vector<Point>> global(frames.size()), local(frames.size());
     for (size_t first = 0; first < frames.size();) {
         size_t last = first + 1;
         if (!std::isfinite(frames[first].seconds))
@@ -266,30 +216,24 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 throw std::invalid_argument("Trajectory timestamps must increase within a shot");
             ++last;
         }
-        plan_global(global, frames, first, last, size, columns, rows, options.smooth_seconds, pixel_scale);
+        plan_paths(global, frames, first, last, size, columns, rows, options.smooth_seconds, false, horizontal);
+        plan_paths(local, frames, first, last, size, columns, rows, options.rolling_shutter ? options.rs_seconds : 0,
+                   true, horizontal);
         first = last;
     }
-    double missing_seconds = 0, row_strength = 0, previous_tracking = 1;
+    double missing_seconds = 0, previous_tracking = 1;
     for (size_t i = 0; i < frames.size(); ++i) {
         const auto& frame = frames[i];
         const auto& motion = frame.motion;
         const bool start = i == 0 || frame.segment != frames[i - 1].segment || motion.reset;
         if (!std::isfinite(frame.seconds) || (!start && frame.seconds <= frames[i - 1].seconds))
             throw std::invalid_argument("Trajectory timestamps must increase within a shot");
-        std::vector<Point> initial_rows;
         if (start) {
-            local.assign(count, ScanlinePath{});
             missing_seconds = 0;
-            row_strength = 0;
             previous_tracking = 1;
-            if (options.rolling_shutter && options.rs_strength > 0)
-                initial_rows =
-                    initialize_rows(local, frames, i, columns, rows, horizontal, options.rs_seconds, pixel_scale);
         }
         const double dt = start ? std::max(0.0, frame.duration) : frame.seconds - frames[i - 1].seconds;
         const bool missing = motion.state == MotionState::missing;
-        const bool has_rows = !start && motion.state == MotionState::tracked && options.rolling_shutter;
-        row_strength = !initial_rows.empty() ? 1 : has_rows ? std::min(1.0, row_strength + dt / 0.15) : 0;
         auto& warp = output[i];
         warp.columns = columns;
         warp.rows = rows;
@@ -298,18 +242,8 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         for (int y = 0; y < rows; ++y)
             for (int x = 0; x < columns; ++x) {
                 const int vertex = y * columns + x;
-                const Point residual = has_rows ? row_motion(motion, horizontal ? static_cast<double>(x) / (columns - 1)
-                                                                                : static_cast<double>(y) / (rows - 1))
-                                                : Point{};
-                if (!finite(residual))
-                    throw std::runtime_error("Nonfinite observed mesh motion");
                 const auto g = global[i][vertex];
-                const auto local_correction =
-                    initial_rows.empty()
-                        ? local[vertex].advance(residual, frame.seconds, has_rows ? motion.rs_confidence : 0,
-                                                options.rs_seconds, pixel_scale)
-                        : initial_rows[vertex];
-                const auto r = local_correction * (options.rs_strength * row_strength);
+                const auto r = local[i][vertex] * options.rs_strength;
                 warp.displacement[vertex] = g + r;
                 warp.global_offset = warp.global_offset + g * (1.0 / count);
                 row_energy += r.dot(r);

@@ -3,7 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
 
-TEST_CASE("Trajectory and crop plans match the pre-refactor golden sample", "[domain][golden]") {
+TEST_CASE("Trajectory and crop plans match the validated golden sample", "[domain][golden]") {
     std::ifstream input(STILLFLOW_GOLDEN_FILE);
     REQUIRE(input.good());
     const auto actual = golden_values();
