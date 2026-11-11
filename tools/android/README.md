@@ -5,7 +5,7 @@ Headless Kotlin app consuming the packaged AAR, with hardware H.264 decoding/enc
 From the repository root:
 
 ```sh
-uv run --locked --group video python scripts/android.py input.mp4
+uv run --locked --group video python scripts/android.py input.mp4 --gpu-surface --mobile --vision-threads 2
 uv run --locked --group video python scripts/android.py input.mp4 --serial DEVICE --reference host.mp4 --max-displacement 0.5
 uv run --locked --group video python scripts/compare_video.py host.mp4 android.mp4 --output .local/comparison
 ```

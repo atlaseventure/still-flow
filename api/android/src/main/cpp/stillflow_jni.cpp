@@ -1,10 +1,13 @@
 #include "stillflow/stillflow.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <jni.h>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 template <class T, auto Destroy> using Handle = std::unique_ptr<T, decltype(Destroy)>;
@@ -14,7 +17,7 @@ struct Session {
     Handle<sf_analyzer, sf_analyzer_destroy> analyzer{nullptr, sf_analyzer_destroy};
     Handle<sf_plan, sf_plan_destroy> plan{nullptr, sf_plan_destroy};
     Handle<sf_renderer, sf_renderer_destroy> renderer{nullptr, sf_renderer_destroy};
-    int width{}, height{};
+    int width{}, height{}, analysis_width{}, analysis_height{};
 };
 
 struct Failure : std::runtime_error {
@@ -75,7 +78,9 @@ Session& session(jlong handle) {
 }
 
 sf_image image(JNIEnv* env, const Session& owner, jint width, jint height, jint format, jint stride, jobject pixels) {
-    if (width != owner.width || height != owner.height || format < SF_GRAY8 || format > SF_RGBA8 || stride <= 0)
+    if (!((width == owner.width && height == owner.height) ||
+          (format == SF_GRAY8 && width == owner.analysis_width && height == owner.analysis_height)) ||
+        format < SF_GRAY8 || format > SF_RGBA8 || stride <= 0)
         throw Failure(SF_INVALID_ARGUMENT, "Frame dimensions or format do not match the session");
     auto* data = static_cast<uint8_t*>(env->GetDirectBufferAddress(pixels));
     const auto capacity = env->GetDirectBufferCapacity(pixels);
@@ -114,12 +119,12 @@ JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env,
                   [](void* data, const char* stage, double ms) {
                       auto& output = *static_cast<std::string*>(data);
                       if (output.size() > 1)
-                          output += ",";
+                          output += ',';
                       output += "[\"" + std::string(stage) + "\"," + std::to_string(ms) + "]";
                   },
                   &json, &error),
               error);
-        json += "]";
+        json += ']';
         result = env->NewStringUTF(json.c_str());
     });
     return result;
@@ -161,6 +166,9 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
         auto owner = std::make_unique<Session>();
         owner->width = width;
         owner->height = height;
+        const double scale = std::min(1.0, double(analysis_width) / width);
+        owner->analysis_width = std::max(32, int(std::lround(width * scale)));
+        owner->analysis_height = std::max(32, int(std::lround(height * scale)));
         if (realtime) {
             if (max_buffered_frames < 2)
                 throw Failure(SF_INVALID_ARGUMENT, "Streaming capacity must be at least two frames");
@@ -209,6 +217,29 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeStreamFinish(JNIEnv* en
         sf_error error{sizeof(sf_error), {}};
         check(sf_stream_finish(owner.stream.get(), &error), error);
     });
+}
+JNIEXPORT jfloatArray JNICALL Java_io_stillflow_StillFlow_nativeReadyMap(JNIEnv* env, jclass, jlong handle) {
+    jfloatArray result = nullptr;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (!owner.stream || !owner.plan)
+            throw Failure(SF_INVALID_STATE, "No ready streaming plan");
+        sf_error error{sizeof(sf_error), {}};
+        sf_map map{};
+        map.struct_size = sizeof(map);
+        check(sf_plan_get_map(owner.plan.get(), 0, owner.width, owner.height, &map, &error), error);
+        std::vector<jfloat> values{float(map.columns), float(map.rows),   float(map.origin_x), float(map.origin_y),
+                                   float(map.step_x),  float(map.step_y), float(map.grid_x),   float(map.grid_y)};
+        for (int i = 0; i < map.columns * map.rows * 2; ++i)
+            values.push_back(static_cast<float>(map.offsets[i]));
+        result = env->NewFloatArray(static_cast<jsize>(values.size()));
+        if (!result)
+            return;
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+        if (!env->ExceptionCheck())
+            owner.plan.reset();
+    });
+    return result;
 }
 JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeStreamReady(JNIEnv* env, jclass, jlong handle) {
     jlongArray result = nullptr;

@@ -80,3 +80,5 @@ val notices = tasks.register<GenerateNotices>("generateNotices") {
 androidComponents.onVariants { variant ->
     variant.sources.assets?.addGeneratedSourceDirectory(notices, GenerateNotices::outputDirectory)
 }
+
+dependencies { compileOnly("androidx.annotation:annotation:1.11.0") }

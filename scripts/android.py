@@ -89,6 +89,7 @@ def run(args):
     media = probe(source)
     config = android_input(media)
     config.update(
+        gpu_surface=args.gpu_surface,
         realtime=args.realtime,
         bitrate=args.bitrate,
         horizontalScan=args.horizontal_scan,
@@ -267,6 +268,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
+    parser.add_argument("--gpu-surface", action="store_true", help="GPU-resident realtime export (Android 10+)")
     parser.add_argument("--realtime", action="store_true")
     parser.add_argument("--backend", choices=("auto", "cpu", "gles"), default="gles")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
@@ -288,6 +290,8 @@ def main():
     )
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    if args.gpu_surface:
+        args.realtime = True
     if min(args.jobs, args.timeout, args.bitrate) <= 0:
         parser.error("jobs, timeout and bitrate must be positive")
     if args.max_displacement is not None and (

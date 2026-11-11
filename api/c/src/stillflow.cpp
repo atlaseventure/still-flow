@@ -204,6 +204,29 @@ sf_status sf_plan_get_info(const sf_plan* plan, sf_plan_info* info, sf_error* er
         info->origin_us = plan->plan.analysis.origin_us;
     });
 }
+sf_status sf_plan_get_map(const sf_plan* plan, size_t index, int32_t width, int32_t height, sf_map* out,
+                          sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(out);
+        if (!plan || width < 2 || height < 2)
+            throw std::invalid_argument("Invalid map geometry");
+        const auto& p = plan->plan;
+        const auto map =
+            prepare_map(p.warps.at(index), p.analysis.size, {width, height}, p.settings.crop, p.analysis.horizontal);
+        out->columns = map.columns;
+        out->rows = map.rows;
+        out->origin_x = map.origin_x;
+        out->origin_y = map.origin_y;
+        out->step_x = map.step_x;
+        out->step_y = map.step_y;
+        out->grid_x = map.grid_x;
+        out->grid_y = map.grid_y;
+        for (size_t i = 0; i < static_cast<size_t>(map.columns) * map.rows; ++i) {
+            out->offsets[2 * i] = map.offset_x[i];
+            out->offsets[2 * i + 1] = map.offset_y[i];
+        }
+    });
+}
 void sf_plan_destroy(sf_plan* plan) { delete plan; }
 sf_status sf_stream_settings_default(sf_stream_settings* value) {
     return c_api::boundary(nullptr, [&] {

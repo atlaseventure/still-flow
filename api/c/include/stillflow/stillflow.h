@@ -95,6 +95,14 @@ SF_API sf_status sf_analyzer_recover(sf_analyzer*, const sf_image*, int64_t pts_
 SF_API sf_status sf_analyzer_finish(sf_analyzer*, sf_plan**, sf_error*);
 SF_API void sf_analyzer_destroy(sf_analyzer*);
 SF_API sf_status sf_plan_get_info(const sf_plan*, sf_plan_info*, sf_error*);
+/* Output-resolution inverse-map parameters; mesh offsets are interleaved x/y. */
+typedef struct sf_map {
+    size_t struct_size;
+    int32_t columns, rows;
+    double origin_x, origin_y, step_x, step_y, grid_x, grid_y;
+    double offsets[2 * 9 * 32];
+} sf_map;
+SF_API sf_status sf_plan_get_map(const sf_plan*, size_t index, int32_t width, int32_t height, sf_map*, sf_error*);
 SF_API void sf_plan_destroy(sf_plan*);
 /* Streaming analysis retains at most 24 gray proxies. The host keeps full
    frames until their index is returned, then renders with the returned one-frame

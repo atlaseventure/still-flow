@@ -10,6 +10,10 @@ import android.media.MediaMuxer
 import android.os.Build
 import android.os.Bundle
 import io.stillflow.AndroidFrames
+import io.stillflow.GpuFrames
+import android.media.ImageReader
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import io.stillflow.HardwareCodecs
 import io.stillflow.StillFlow
 import java.io.File
@@ -32,7 +36,9 @@ class ExportRunner : Instrumentation() {
             require(runId.matches(Regex("[a-f0-9]{32}"))) { "Invalid run ID" }
             val directory = File(targetContext.filesDir, runId)
             val config = JSONObject(File(directory, "config.json").readText())
-            if (config.optBoolean("realtime")) exportStream(directory, config) else export(directory, config)
+            if (config.optBoolean("gpu_surface")) {
+                exportGpu(directory, config)
+            } else if (config.optBoolean("realtime")) exportStream(directory, config) else export(directory, config)
             report.put("status", "passed").put("run", runId)
                 .put("sdk", StillFlow.buildDescription()).put("model", Build.MODEL)
                 .put("manufacturer", Build.MANUFACTURER).put("api", Build.VERSION.SDK_INT)
@@ -65,13 +71,13 @@ class ExportRunner : Instrumentation() {
         }
     }
 
-    private fun decode(input: File, needed: () -> Boolean = { true }, consume: (Image, Long, MediaFormat) -> Unit): Int {
+    private fun decode(input: File, needed: () -> Boolean = { true }, images: ImageReader? = null, consume: (Image, Long, MediaFormat) -> Unit): Int {
         val ex = extractor(input)
         var decoder: MediaCodec? = null
         try {
             val format = ex.getTrackFormat(ex.sampleTrackIndex)
-            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            val codec = HardwareCodecs.decoder(format, null)
+            if (images == null) format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+            val codec = HardwareCodecs.decoder(format, images?.surface)
             decoder = codec
             check(codec.codecInfo.isHardwareAccelerated) { "Software decoder" }
             report.put("decoder", codec.name)
@@ -100,17 +106,31 @@ class ExportRunner : Instrumentation() {
                 val index = codec.dequeueOutputBuffer(info, 1000)
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outputFormat = codec.outputFormat
                 if (index >= 0) {
+                    var released = false
                     try {
                         if (info.size > 0) {
-                            checkNotNull(codec.getOutputImage(index)) { "Missing decoded Image" }.use {
-                                consume(it, info.presentationTimeUs, outputFormat)
+                            if (images == null) {
+                                checkNotNull(codec.getOutputImage(index)) { "Missing decoded Image" }.use {
+                                    consume(it, info.presentationTimeUs, outputFormat)
+                                }
+                            } else {
+                                codec.releaseOutputBuffer(index, true)
+                                released = true
+                                val deadline = System.nanoTime() + STALL_NS
+                                var image = images.acquireNextImage()
+                                while (image == null) {
+                                    check(System.nanoTime() < deadline) { "Decoder Surface stalled" }
+                                    Thread.sleep(1)
+                                    image = images.acquireNextImage()
+                                }
+                                image.use { consume(it, info.presentationTimeUs, outputFormat) }
                             }
                             count++
                         }
                         done = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                         lastProgress = System.nanoTime()
                     } finally {
-                        codec.releaseOutputBuffer(index, false)
+                        if (!released) codec.releaseOutputBuffer(index, false)
                     }
                 }
             }
@@ -403,6 +423,132 @@ class ExportRunner : Instrumentation() {
         }
     }
 
+    private fun exportGpu(directory: File, config: JSONObject) {
+        val input = File(directory, "input.mp4")
+        val output = File(directory, "output.mp4")
+        val width = config.getInt("width")
+        val height = config.getInt("height")
+        val fps = config.getDouble("fps")
+        require(width in 32..4096 && height in 32..4096 && width % 2 == 0 && height % 2 == 0 && fps.isFinite() && fps > 0)
+        val options = config.getJSONObject("settings")
+        StillFlow.configureThreads(options.optInt("visionThreads", 2))
+        val settings = StillFlow.Settings().apply {
+            backend = StillFlow.Backend.valueOf(options.optString("backend", backend.name))
+            motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
+            analysisWidth = options.optInt("analysisWidth", analysisWidth)
+            features = options.optInt("features", features)
+            bands = options.optInt("bands", bands)
+            cropMode = StillFlow.CropMode.valueOf(options.optString("cropMode", cropMode.name))
+            rollingShutter = options.optBoolean("rollingShutter", rollingShutter)
+            smoothSeconds = options.optDouble("smoothSeconds", smoothSeconds)
+            rsSeconds = options.optDouble("rsSeconds", rsSeconds)
+            crop = options.optDouble("crop", crop)
+            rsStrength = options.optDouble("rsStrength", rsStrength)
+        }
+        report.put("settings", JSONObject().apply {
+            put("backend", settings.backend.name)
+            put("motionEstimator", settings.motionEstimator.name)
+            put("analysisWidth", settings.analysisWidth)
+            put("features", settings.features)
+            put("bands", settings.bands)
+            put("cropMode", settings.cropMode.name)
+            put("rollingShutter", settings.rollingShutter)
+            put("smoothSeconds", settings.smoothSeconds)
+            put("rsSeconds", settings.rsSeconds)
+            put("crop", settings.crop)
+            put("rsStrength", settings.rsStrength)
+        })
+        settings.realtime = true
+        val scale = minOf(1.0, settings.analysisWidth.toDouble() / width)
+        val aw = maxOf(32, Math.round(width * scale).toInt())
+        val ah = maxOf(32, Math.round(height * scale).toInt())
+        val duration = Math.round(1_000_000 / fps)
+        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, config.getInt("bitrate"))
+            setFloat(MediaFormat.KEY_FRAME_RATE, fps.toFloat())
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+        }
+        val began = System.nanoTime()
+        val encoder = HardwareCodecs.encoder(format)
+        try {
+            val surface = encoder.createInputSurface()
+            try {
+                val writer = MediaMuxer(File(directory, "output.mp4").path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                try {
+                    val sink = EncoderSink(encoder, writer)
+                    encoder.start()
+                    GpuFrames(width, height, settings.maxBufferedFrames, surface).use { gpu ->
+                        ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
+                            StillFlow(width, height, fps, config.getBoolean("horizontalScan"), settings).use { session ->
+                                data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame)
+                                val pending = java.util.ArrayDeque<Pending>()
+                                val stages = linkedMapOf<String, MutableList<Double>>()
+                                fun mark(name: String, start: Long) { stages.getOrPut(name) { mutableListOf() }.add((System.nanoTime() - start) / 1e6) }
+                                var received = 0
+                                var rendered = 0
+                                var peak = 0
+                                var origin = 0L
+                                var latest = 0L
+                                val events = org.json.JSONArray()
+                                fun drain(flushing: Boolean) {
+                                    while (true) {
+                                        val ready = session.takeReady() ?: break
+                                        val item = pending.removeFirst()
+                                        check(ready.index == item.index && ready.index == rendered.toLong() && ready.ptsUs == item.pts)
+                                        val map = session.takeReadyMap()
+                                        val start = System.nanoTime()
+                                        sink.drain(0)
+                                        gpu.render(item.frame, map, ready.ptsUs - origin)
+                                        sink.drain(0)
+                                        mark("render.surface", start)
+                                        events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
+                                            .put("duration_us", ready.durationUs).put("flushing", flushing))
+                                        rendered++
+                                    }
+                                }
+                                val decoded = decode(input, images = images) { image, pts, _ ->
+                                    if (received == 0) origin = pts else check(pts > latest)
+                                    latest = pts
+                                    val start = System.nanoTime()
+                                    val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                                    mark("decode.capture_proxy", start)
+                                    check(session.tryPush(frame.luma, pts, duration))
+                                    pending.addLast(Pending(received.toLong(), pts, frame))
+                                    received++
+                                    peak = maxOf(peak, pending.size)
+                                    drain(false)
+                                    if (received % 60 == 0) progress("gpu_stream", received)
+                                }
+                                val beforeFlush = rendered
+                                session.finishStream()
+                                drain(true)
+                                sink.finishSurface()
+                                check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
+                                val timings = JSONObject()
+                                stages.forEach { (name, values) ->
+                                    val sorted = values.sorted()
+                                    timings.put(name, JSONObject().put("calls", values.size).put("total_ms", values.sum())
+                                        .put("mean_ms", values.average()).put("p95_ms", sorted[((sorted.size - 1) * 0.95).toInt()]))
+                                }
+                                report.put("frames", received).put("width", width).put("height", height)
+                                    .put("backend", "gles").put("gpu", true).put("device", gpu.device)
+                                    .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
+                                    .put("native_profile", org.json.JSONArray(session.profile())).put("stages", timings).put("frame_events", events)
+                                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
+                                        .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
+                            }
+                        }
+                    }
+                } finally { writer.release() }
+            } finally { surface.release() }
+        } finally { encoder.release() }
+    }
+
     private class EncoderSink(val codec: MediaCodec, val muxer: MediaMuxer) {
         private val info = MediaCodec.BufferInfo()
         private var track = -1
@@ -410,7 +556,7 @@ class ExportRunner : Instrumentation() {
             private set
         private var eos = false
 
-        private fun drain(timeout: Long) {
+        fun drain(timeout: Long) {
             var index = codec.dequeueOutputBuffer(info, timeout)
             while (index != MediaCodec.INFO_TRY_AGAIN_LATER) {
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -452,8 +598,17 @@ class ExportRunner : Instrumentation() {
             drain(0)
         }
 
+        fun finishSurface() {
+            codec.signalEndOfInputStream()
+            finishOutput()
+        }
+
         fun finish(pts: Long) {
             codec.queueInputBuffer(nextInput(), 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            finishOutput()
+        }
+
+        private fun finishOutput() {
             val deadline = System.nanoTime() + STALL_NS
             while (!eos) {
                 drain(1000)

@@ -1,3 +1,3 @@
--keepclasseswithmembernames,includedescriptorclasses class io.stillflow.StillFlow {
+-keepclasseswithmembernames,includedescriptorclasses class io.stillflow.** {
     native <methods>;
 }

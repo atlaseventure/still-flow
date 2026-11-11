@@ -123,6 +123,13 @@ class StillFlow(
         return nativeStreamReady(handle)?.let { ReadyFrame(it) }
     }
 
+    /** Transfers the ready plan into an independent GPU map and releases its native storage. */
+    @Synchronized
+    fun takeReadyMap(): FloatArray {
+        requireOpen()
+        return nativeReadyMap(handle)
+    }
+
     /** Seals streaming input. Drain takeReady() until null after this call. */
     @Synchronized
     fun finishStream() {
@@ -216,6 +223,7 @@ class StillFlow(
         @JvmStatic private external fun nativeStreamPush(
             handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
         ): Boolean
+        @JvmStatic private external fun nativeReadyMap(handle: Long): FloatArray
         @JvmStatic private external fun nativeStreamReady(handle: Long): LongArray?
         @JvmStatic private external fun nativeStreamFinish(handle: Long)
         @JvmStatic private external fun nativeAnalyze(

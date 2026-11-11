@@ -1,4 +1,4 @@
 {
-    global: Java_io_stillflow_StillFlow_*;
+    global: Java_io_stillflow_StillFlow_*; Java_io_stillflow_GpuFrames_*;
     local: *;
 };

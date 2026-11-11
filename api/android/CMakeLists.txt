@@ -34,6 +34,10 @@ set(STILLFLOW_C_API_SHARED
 add_subdirectory(../.. core)
 
 add_library(stillflow_jni SHARED src/main/cpp/stillflow_jni.cpp)
+if(ANDROID)
+    target_sources(stillflow_jni PRIVATE src/main/cpp/gpu_images.cpp)
+    target_link_libraries(stillflow_jni PRIVATE android EGL GLESv3)
+endif()
 target_link_libraries(stillflow_jni PRIVATE StillFlow::c)
 target_compile_features(stillflow_jni PRIVATE cxx_std_20)
 target_compile_options(stillflow_jni PRIVATE -Wall -Wextra -Wpedantic)
