@@ -1,11 +1,24 @@
 #pragma once
 #include "stillflow/domain/types.hpp"
+#include <memory>
 #include <span>
 
 namespace stillflow {
+// Per-stream forward trajectory state. Unchanged evidence is reused after exact FIR support.
+class TrajectoryCache {
+  public:
+    struct Impl;
+    TrajectoryCache();
+    ~TrajectoryCache();
+    TrajectoryCache(const TrajectoryCache&) = delete;
+    TrajectoryCache& operator=(const TrajectoryCache&) = delete;
+    std::unique_ptr<Impl> impl;
+};
 // Set first_shot_start=false when a sliding window has evicted the shot beginning.
-std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size analysis_size,
-                             const StabilizationSettings& options, bool horizontal_scan, bool first_shot_start = true);
+std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size analysis_size,
+                             const StabilizationSettings& options, bool horizontal_scan, bool first_shot_start = true,
+                             TrajectoryCache* cache = nullptr, size_t output_first = 0,
+                             size_t output_last = std::dynamic_extent);
 // Geometry-constrained, shot-local viewport and compensation planning.
 void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
                 const StabilizationSettings& options);

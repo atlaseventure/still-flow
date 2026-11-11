@@ -161,7 +161,7 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
             candidate.seconds - analysis_.frames[next_].seconds + pts_tolerance >= required)
             break;
     }
-    const std::vector<FrameMotion> frames(analysis_.frames.begin(), analysis_.frames.begin() + limit);
+    const auto frames = std::span<const FrameMotion>(analysis_.frames).first(limit);
     const auto& current = frames[next_];
     const double ahead = frames.back().seconds - current.seconds;
     const bool shot_ended = frames.back().segment != current.segment;
@@ -170,7 +170,11 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
         return false;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
-    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0);
+    // Two crop passes each have one second of finite constraint support.
+    const auto first = std::lower_bound(frames.begin(), frames.end(), current.seconds - 2.0 - 2e-6,
+                                        [](const auto& frame, double seconds) { return frame.seconds < seconds; });
+    const size_t output_first = static_cast<size_t>(first - frames.begin());
+    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0, &planning_, output_first);
     const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - frames[next_ - 1].seconds;
     size_t end = next_ + 1;

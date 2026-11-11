@@ -486,13 +486,15 @@ class ExportRunner : Instrumentation() {
                     GpuFrames(width, height, settings.maxBufferedFrames, surface).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
                             StreamPlanner(width, height, fps, config.getBoolean("horizontalScan"), settings).use { planner ->
-                                data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame)
+                                data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
                                 val pending = java.util.ArrayDeque<Pending>()
                                 val stages = linkedMapOf<String, MutableList<Double>>()
                                 fun mark(name: String, start: Long) { stages.getOrPut(name) { mutableListOf() }.add((System.nanoTime() - start) / 1e6) }
                                 var received = 0
                                 var rendered = 0
                                 var peak = 0
+                                var firstOutputSeconds = 0.0
+                                var firstOutputAfterInputs = 0
                                 var origin = 0L
                                 var latest = 0L
                                 val events = org.json.JSONArray()
@@ -508,6 +510,11 @@ class ExportRunner : Instrumentation() {
                                         mark("render.surface", start)
                                         events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
                                             .put("duration_us", ready.durationUs).put("flushing", flushing))
+                                        stages.getOrPut("stream.residence") { mutableListOf() }.add((System.nanoTime()-item.receivedNs)/1e6)
+                                        if (rendered == 0) {
+                                            firstOutputSeconds = (System.nanoTime()-began)/1e9
+                                            firstOutputAfterInputs = received
+                                        }
                                         rendered++
                                     }
                                 }
@@ -517,7 +524,7 @@ class ExportRunner : Instrumentation() {
                                     val start = System.nanoTime()
                                     val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
                                     mark("decode.capture_proxy", start)
-                                    pending.addLast(Pending(received.toLong(), pts, frame))
+                                    pending.addLast(Pending(received.toLong(), pts, frame, start))
                                     while (!planner.trySubmit(frame.luma, pts, duration)) {
                                         drain(false)
                                         Thread.sleep(1)
@@ -538,11 +545,15 @@ class ExportRunner : Instrumentation() {
                                     timings.put(name, JSONObject().put("calls", values.size).put("total_ms", values.sum())
                                         .put("mean_ms", values.average()).put("p95_ms", sorted[((sorted.size - 1) * 0.95).toInt()]))
                                 }
+                                val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
+                                    ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
+                                report.put("peak_rss_mib", peakRss ?: JSONObject.NULL)
                                 report.put("frames", received).put("width", width).put("height", height)
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
                                     .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timings).put("frame_events", events)
                                     .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
+                                        .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
                                         .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
                             }
                         }

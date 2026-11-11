@@ -27,47 +27,50 @@ Point row_motion(const Motion& motion, double position) {
 // Confidence weights are shared by the mesh rather than adapting separately
 // to each vertex's speed. Positions are rebased after each input displacement,
 // so the result is directly M_t = S_t - O_t without large sums.
+struct PathKernel {
+    std::array<double, 6> weights{};
+    double denominator = 1;
+    size_t count = 0;
+};
+std::vector<PathKernel> kernels(const std::vector<double>& time, const std::vector<double>& confidence, double seconds,
+                                bool reverse) {
+    std::vector<PathKernel> result(time.size());
+    const double window = 0.2 * seconds / 0.45;
+    for (size_t k = 0; k < time.size(); ++k) {
+        auto& kernel = result[k];
+        kernel.count = std::min(size_t{6}, reverse ? time.size() - 1 - k : k);
+        for (size_t lag = 0; lag < kernel.count; ++lag) {
+            const size_t j = reverse ? k + lag + 1 : k - lag - 1;
+            const double age = time[k] - time[j];
+            const double weight = reverse ? (j + 1 == time.size() ? 1 : confidence[j + 1]) : confidence[j];
+            kernel.weights[lag] = std::exp(-9 * age * age / (window * window)) * std::clamp(weight, 0.0, 1.0);
+            kernel.denominator += kernel.weights[lag];
+        }
+    }
+    return result;
+}
 template <size_t Passes> class CausalPath {
   public:
-    Point advance(Point delta, double time, double confidence, double seconds) {
-        if (seconds <= 0)
-            return {};
-        constexpr double reference_dt = 1.0 / 30;
-        const double window = 6 * reference_dt * seconds / 0.45;
-        std::array<double, 6> kernel{};
-        double denominator = 1;
-        for (size_t lag = 0; lag < count_; ++lag) {
-            const auto& state = observations_[(cursor_ + 5 - lag) % 6];
-            const double age = time - state.time;
-            kernel[lag] = std::exp(-9 * age * age / (window * window)) * state.confidence;
-            denominator += kernel[lag];
-        }
+    Point advance(Point delta, const PathKernel& kernel) {
         Point correction;
         for (auto& pass : passes_) {
             const Point input = correction;
-            for (size_t lag = 0; lag < count_; ++lag) {
+            for (size_t lag = 0; lag < kernel.count; ++lag) {
                 auto& position = pass[(cursor_ + 5 - lag) % 6];
                 position = position - delta;
-                correction = correction + position * kernel[lag];
+                correction = correction + position * kernel.weights[lag];
             }
-            correction = correction * (1 / denominator);
+            correction = correction * (1 / kernel.denominator);
             pass[cursor_] = input;
         }
-        observations_[cursor_] = {time, std::clamp(confidence, 0.0, 1.0)};
         cursor_ = (cursor_ + 1) % 6;
-        count_ = std::min(count_ + 1, size_t{6});
         if (!finite(correction))
             throw std::runtime_error("Nonfinite mesh trajectory");
         return correction;
     }
 
   private:
-    struct Observation {
-        double time;
-        double confidence;
-    };
-    size_t cursor_ = 0, count_ = 0;
-    std::array<Observation, 6> observations_{};
+    size_t cursor_ = 0;
     std::array<std::array<Point, 6>, Passes> passes_{};
 };
 
@@ -79,6 +82,31 @@ template <size_t Passes> class CausalPath {
 // independently to each vertex's speed bends a rigid rotation into a mesh warp.
 using SymmetricPath = CausalPath<trajectory_smoothing_passes / 2>;
 static_assert(trajectory_smoothing_passes % 2 == 0);
+struct PathCache {
+    double seconds = 0;
+    int segment = -1;
+    bool scanline = false;
+    std::vector<double> time, confidence;
+    std::vector<std::vector<Point>> delta, forward;
+    std::vector<SymmetricPath> snapshot;
+    size_t at = 0;
+};
+} // namespace
+struct TrajectoryCache::Impl {
+    std::vector<PathCache> paths;
+    size_t cursor = 0;
+};
+TrajectoryCache::TrajectoryCache() : impl(std::make_unique<Impl>()) {}
+TrajectoryCache::~TrajectoryCache() = default;
+namespace {
+PathCache* cache_slot(TrajectoryCache* cache) {
+    if (!cache)
+        return nullptr;
+    auto& state = *cache->impl;
+    if (state.cursor == state.paths.size())
+        state.paths.emplace_back();
+    return &state.paths[state.cursor++];
+}
 
 // Confidence-weighted linear fit of one vertex path near a shot end, evaluated
 // at that end. Pivoting the reflection on the raw end sample would mirror its
@@ -120,10 +148,11 @@ Point fit_endpoint(const std::vector<double>& times, const std::vector<double>& 
 // response neither lags nor bends a steady pan at the boundaries. Applying the
 // same construction to row motion also avoids accumulating steady parallax
 // into a persistent scanline warp that consumes the global correction budget.
-void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<FrameMotion>& frames, size_t first,
-                size_t last, Size size, int columns, int rows, double seconds, bool scanline, bool horizontal) {
+void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMotion> frames, size_t first, size_t last,
+                Size size, int columns, int rows, double seconds, bool scanline, bool horizontal, PathCache* cache,
+                size_t output_first, size_t output_last) {
     const size_t n = last - first, count = static_cast<size_t>(columns) * rows;
-    for (size_t i = first; i < last; ++i)
+    for (size_t i = std::max(first, output_first); i < std::min(last, output_last); ++i)
         output[i].assign(count, Point{});
     if (seconds <= 0 || n < 2)
         return;
@@ -132,7 +161,8 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
     // The temporal kernel is shared: affine global motion needs only three
     // anchors, and scanline motion has one independent path per band.
     const bool affine = std::all_of(frames.begin() + first, frames.begin() + last, [](const auto& f) {
-        return f.motion.step(2, 0) == 0 && f.motion.step(2, 1) == 0 && f.motion.step(2, 2) == 1;
+        return f.motion.step(2, 0) == 0 && f.motion.step(2, 1) == 0 && std::isfinite(f.motion.step(2, 2)) &&
+               f.motion.step(2, 2) != 0;
     });
     const size_t paths = scanline ? static_cast<size_t>(horizontal ? columns : rows) : (affine ? 3 : count);
     std::vector<std::vector<Point>> positions(paths, std::vector<Point>(n));
@@ -185,7 +215,21 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
             step_confidence[k] = confidence[j + 1];
         }
     }
-    std::vector<Point> extended(total), forward(total);
+    const auto forward_kernels = kernels(time, step_confidence, seconds, false);
+    const auto reverse_kernels = kernels(time, step_confidence, seconds, true);
+    PathCache next;
+    if (cache) {
+        next.seconds = seconds;
+        next.segment = frames[first].segment;
+        next.scanline = scanline;
+        next.time = time;
+        next.confidence = step_confidence;
+        next.at = pad + n - 2;
+        next.delta.resize(paths);
+        next.forward.resize(paths);
+        next.snapshot.resize(paths);
+    }
+    std::vector<Point> extended(total), forward(total), delta(total);
     for (size_t vertex = 0; vertex < paths; ++vertex) {
         const auto& x = positions[vertex];
         const Point begin = fit_endpoint(times, confidence, x, 0, head, 0, scanline);
@@ -202,23 +246,67 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
             extended[pad] = begin;
             extended[pad + n - 1] = end;
         }
-        SymmetricPath path;
         for (size_t k = 0; k < total; ++k)
-            forward[k] =
-                path.advance(k ? extended[k] - extended[k - 1] : Point{}, time[k], step_confidence[k], seconds);
+            delta[k] = k ? extended[k] - extended[k - 1] : Point{};
+        size_t reuse_begin = total, reuse_end = total, old_begin = 0;
+        if (cache && cache->seconds == seconds && cache->segment == frames[first].segment &&
+            cache->scanline == scanline && cache->delta.size() == paths && !cache->time.empty()) {
+            size_t streak = 0, previous = 0;
+            for (size_t k = 0; k < total; ++k) {
+                const auto found = std::lower_bound(cache->time.begin(), cache->time.end(), time[k]);
+                const size_t j = static_cast<size_t>(found - cache->time.begin());
+                const bool same = found != cache->time.end() && *found == time[k] &&
+                                  cache->confidence[j] == step_confidence[k] &&
+                                  norm(cache->delta[vertex][j] - delta[k]) < 1e-10;
+                streak = same ? (streak && j == previous + 1 ? streak + 1 : 1) : 0;
+                previous = j;
+                // The state retains six samples per pass, plus the six kernel observations.
+                if (streak >= size_t{6} * (trajectory_smoothing_passes / 2 + 1) && j <= cache->at) {
+                    if (reuse_begin == total) {
+                        reuse_begin = k;
+                        old_begin = j;
+                    }
+                    if (j == cache->at && k <= next.at) {
+                        reuse_end = k;
+                        break;
+                    }
+                } else {
+                    reuse_begin = total;
+                }
+            }
+            if (reuse_end == total)
+                reuse_begin = total;
+        }
+        SymmetricPath path;
+        for (size_t k = 0; k < total; ++k) {
+            if (k == reuse_begin) {
+                for (size_t i = k; i <= reuse_end; ++i)
+                    forward[i] = cache->forward[vertex][old_begin + i - k];
+                path = cache->snapshot[vertex];
+                k = reuse_end;
+            } else
+                forward[k] = path.advance(delta[k], forward_kernels[k]);
+            if (cache && k == next.at)
+                next.snapshot[vertex] = path;
+        }
+        if (cache) {
+            next.delta[vertex] = delta;
+            next.forward[vertex] = forward;
+        }
         // Smooth S_f = X + forward in reversed time. The step from k+1 to k is
         // S_f[k] - S_f[k+1]; the result is relative to S_f, so both add up.
         SymmetricPath reverse;
         for (size_t k = total; k-- > 0;) {
             const bool last_sample = k + 1 == total;
             const Point delta = last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
-            const Point correction =
-                forward[k] + reverse.advance(delta, -time[k], last_sample ? 1 : step_confidence[k + 1], seconds);
-            if (k >= pad && k < pad + n)
+            const Point correction = forward[k] + reverse.advance(delta, reverse_kernels[k]);
+            if (k >= pad && k < pad + n && first + k - pad >= output_first && first + k - pad < output_last)
                 output[first + k - pad][vertex] = correction + (extended[k] - x[k - pad]);
         }
     }
-    for (size_t i = first; i < last; ++i) {
+    if (cache)
+        *cache = std::move(next);
+    for (size_t i = std::max(first, output_first); i < std::min(last, output_last); ++i) {
         auto& mesh = output[i];
         const auto anchors = mesh;
         for (int y = 0; y < rows; ++y)
@@ -235,10 +323,16 @@ void plan_paths(std::vector<std::vector<Point>>& output, const std::vector<Frame
 
 } // namespace
 
-std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, const StabilizationSettings& options,
-                             bool horizontal, bool first_shot_start) {
+std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size size, const StabilizationSettings& options,
+                             bool horizontal, bool first_shot_start, TrajectoryCache* cache, size_t output_first,
+                             size_t output_last) {
     if (size.width < 2 || size.height < 2 || options.bands < 4 || options.bands > 32)
         throw std::invalid_argument("Invalid trajectory geometry");
+    output_last = std::min(output_last, frames.size());
+    if (output_first > output_last)
+        throw std::invalid_argument("Invalid planning range");
+    if (cache)
+        cache->impl->cursor = 0;
     std::vector<Warp> output(frames.size());
     const int columns = horizontal ? options.bands : 9, rows = horizontal ? 9 : options.bands;
     const int count = columns * rows;
@@ -252,9 +346,10 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 throw std::invalid_argument("Trajectory timestamps must increase within a shot");
             ++last;
         }
-        plan_paths(global, frames, first, last, size, columns, rows, options.smooth_seconds, false, horizontal);
+        plan_paths(global, frames, first, last, size, columns, rows, options.smooth_seconds, false, horizontal,
+                   cache_slot(cache), output_first, output_last);
         plan_paths(local, frames, first, last, size, columns, rows, options.rolling_shutter ? options.rs_seconds : 0,
-                   true, horizontal);
+                   true, horizontal, cache_slot(cache), output_first, output_last);
         first = last;
     }
     double missing_seconds = 0, previous_tracking = 1;
@@ -270,7 +365,13 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
         }
         const double dt = start ? std::max(0.0, frame.duration) : frame.seconds - frames[i - 1].seconds;
         const bool missing = motion.state == MotionState::missing;
+        missing_seconds = missing ? missing_seconds + dt : 0;
+        const double tracking = std::min(std::max(0.0, 1 - missing_seconds / 0.25), previous_tracking + dt / 0.25);
+        previous_tracking = tracking;
+        if (i < output_first || i >= output_last)
+            continue;
         auto& warp = output[i];
+        warp.tracking_strength = tracking;
         warp.columns = columns;
         warp.rows = rows;
         warp.displacement.resize(count);
@@ -285,11 +386,9 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 row_energy += r.dot(r);
             }
         warp.row_correction_rms = std::sqrt(row_energy / count);
-        missing_seconds = missing ? missing_seconds + dt : 0;
-        warp.tracking_strength = std::min(std::max(0.0, 1 - missing_seconds / 0.25), previous_tracking + dt / 0.25);
-        previous_tracking = warp.tracking_strength;
     }
-    plan_crops(frames, output, size, options);
+    plan_crops(frames.subspan(output_first, output_last - output_first),
+               std::span<Warp>(output).subspan(output_first, output_last - output_first), size, options);
     // A fast opening pan can exceed the crop budget of the extrapolated
     // target. Scaling the whole correction then reintroduces frame-to-frame
     // shake throughout the eroded crop-cap neighborhood. During endpoint
@@ -303,7 +402,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
             shot_start = frames[i].seconds;
             initialize = true;
         }
-        if (!initialize)
+        if (!initialize || i < output_first || i >= output_last)
             continue;
         const auto& w = output[i];
         // Tracking loss keeps its existing fade; this only responds to crop pressure.
@@ -325,7 +424,7 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
             if (std::any_of(startup_blend.begin() + first, startup_blend.begin() + last,
                             [](double blend) { return blend > 0; }))
                 plan_paths(responsive, frames, first, last, size, columns, rows, options.smooth_seconds * 0.4, false,
-                           horizontal);
+                           horizontal, cache_slot(cache), output_first, output_last);
             first = last;
         }
         for (size_t i = 0; i < output.size(); ++i) {
@@ -338,8 +437,11 @@ std::vector<Warp> plan_warps(const std::vector<FrameMotion>& frames, Size size, 
                 w.global_offset = w.global_offset + adjustment * (1.0 / count);
             }
         }
-        plan_crops(frames, output, size, options);
+        plan_crops(frames.subspan(output_first, output_last - output_first),
+                   std::span<Warp>(output).subspan(output_first, output_last - output_first), size, options);
     }
+    if (cache)
+        cache->impl->paths.resize(cache->impl->cursor);
     return output;
 }
 
