@@ -61,6 +61,7 @@ class DeviceFrame {
 };
 
 struct DecodedFrame {
+    cv::Mat luma;
     cv::Mat pixels;                            // Host BGR or source luma.
     std::shared_ptr<const DeviceFrame> device; // NVDEC frames left on the GPU.
     int64_t pts_us = 0, duration_us = 0;

@@ -16,6 +16,7 @@ struct VideoInfo {
 struct VideoFrame {
     Image image;
     int64_t pts_us = 0, duration_us = 0;
+    Image analysis_image;
 };
 // Codec choice handed to media adapters. "auto" lets the adapter choose,
 // trying hardware first when prefer_hardware is set and falling back to

@@ -188,12 +188,20 @@ class StillFlow(
         }
     }
 
+    /** Native streaming stage samples as JSON pairs [stage, milliseconds]. */
+    @Synchronized
+    fun profile(): String {
+        requireOpen()
+        return nativeProfile(handle)
+    }
+
     private fun requireOpen() = check(handle != 0L) { "StillFlow session is closed" }
 
     companion object {
         init { System.loadLibrary("stillflow_jni") }
 
         @JvmStatic fun buildDescription(): String = nativeBuildDescription()
+        @JvmStatic private external fun nativeProfile(handle: Long): String
         @JvmStatic private external fun nativeDefaults(): DoubleArray
         @JvmStatic private external fun nativeCreate(
             width: Int, height: Int, fps: Double, horizontalScan: Boolean, backend: Int, motionEstimator: Int,

@@ -66,7 +66,8 @@ class FfmpegReader final : public VideoReader {
         const Size size(reader.info().width, reader.info().height);
         auto pixels = decoded.device ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size, luma_only)
                                      : image(std::move(decoded.pixels));
-        frame = {std::move(pixels), decoded.pts_us, decoded.duration_us};
+        frame = {std::move(pixels), decoded.pts_us, decoded.duration_us,
+                 decoded.luma.empty() ? Image{} : image(std::move(decoded.luma))};
         return true;
     }
     const VideoInfo& info() const override { return reader.info(); }

@@ -21,7 +21,8 @@ struct ReadyWarp {
 class StreamAnalyzer {
   public:
     StreamAnalyzer(StabilizationSettings settings, StreamSettings stream, Size size, double fps, bool horizontal,
-                   std::unique_ptr<MotionAnalyzer> motion = {}, ExecutionSettings execution = {});
+                   std::unique_ptr<MotionAnalyzer> motion = {}, ExecutionSettings execution = {},
+                   std::unique_ptr<MotionAnalyzer> recovery = {});
     // Only reduced gray proxies are retained (at most 24); callers own the
     // delayed full-resolution frames until take_ready returns their index.
     bool push(const Image& image, int64_t pts_us, int64_t duration_us, Profile& profile);
@@ -41,7 +42,7 @@ class StreamAnalyzer {
     int64_t last_pts_ = 0;
     bool finished_ = false;
     StreamCrop crop_;
-    std::unique_ptr<MotionAnalyzer> motion_;
+    std::unique_ptr<MotionAnalyzer> motion_, recovery_;
     Image previous_;
     std::deque<std::pair<size_t, Image>> proxies_;
     size_t recovered_until_ = 0;

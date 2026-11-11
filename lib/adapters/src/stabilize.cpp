@@ -240,7 +240,8 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     const bool horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
     services.progress.analyzing(info, analysis_size, horizontal);
     StreamAnalyzer analyzer(options, options.stream, analysis_size, info.fps, horizontal,
-                            services.images.stream_analyzer(options, horizontal), options.execution);
+                            services.images.stream_analyzer(options, horizontal), options.execution,
+                            services.images.analyzer(options, horizontal));
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())
@@ -315,14 +316,17 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
         Image proxy;
         {
             ScopeTimer timer(profile, "stream.proxy");
-            proxy = services.images.gray_proxy(frame.image, analysis_size);
+            proxy =
+                services.images.gray_proxy(frame.analysis_image ? frame.analysis_image : frame.image, analysis_size);
         }
         {
             ScopeTimer timer(profile, "stream.analyze");
             if (!analyzer.push(proxy, frame.pts_us, frame.duration_us, profile))
                 throw std::logic_error("Streaming queue was not drained");
         }
+        frame.analysis_image.reset();
         delayed.push_back({std::move(frame), std::move(audio), work_start});
+        frame = {};
         audio.clear();
         ++decoded;
         statistics.peak_buffered_frames = std::max(statistics.peak_buffered_frames, delayed.size());

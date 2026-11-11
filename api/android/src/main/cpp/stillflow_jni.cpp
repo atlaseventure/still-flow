@@ -4,6 +4,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace {
 template <class T, auto Destroy> using Handle = std::unique_ptr<T, decltype(Destroy)>;
@@ -96,6 +97,28 @@ sf_image image(JNIEnv* env, const Session& owner, jint width, jint height, jint 
 } // namespace
 
 extern "C" {
+JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env, jclass, jlong handle) {
+    jstring result = nullptr;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        std::string json = "[";
+        sf_error error{sizeof(sf_error), {}};
+        check(sf_stream_profile(
+                  owner.stream.get(),
+                  [](void* data, const char* stage, double ms) {
+                      auto& output = *static_cast<std::string*>(data);
+                      if (output.size() > 1)
+                          output += ",";
+                      output += "[\"" + std::string(stage) + "\"," + std::to_string(ms) + "]";
+                  },
+                  &json, &error),
+              error);
+        json += "]";
+        result = env->NewStringUTF(json.c_str());
+    });
+    return result;
+}
+
 JNIEXPORT jdoubleArray JNICALL Java_io_stillflow_StillFlow_nativeDefaults(JNIEnv* env, jclass) {
     sf_settings settings{};
     settings.struct_size = sizeof(settings);

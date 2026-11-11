@@ -4,10 +4,14 @@
 #ifdef STILLFLOW_C_GLES
 #include "stillflow/backends/gles.hpp"
 #endif
+#include <chrono>
 #include <cmath>
 
 using namespace stillflow;
 namespace {
+double profile_now() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 Image import_image(const sf_image* value) {
     c_api::require(value);
     if (value->plane_count < 1 || value->plane_count > 3 || value->format < SF_GRAY8 || value->format > SF_I420 ||
@@ -56,6 +60,7 @@ struct sf_analyzer {
 struct sf_stream {
     c_api::Runtime runtime;
     std::unique_ptr<StreamAnalyzer> analyzer;
+    Profile profile{profile_now};
     StabilizationSettings settings;
     Size size;
     bool horizontal = false;
@@ -227,7 +232,11 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
         result->horizontal = video->horizontal_scan != 0;
         result->analyzer = std::make_unique<StreamAnalyzer>(
             settings, StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames}, size, video->fps,
-            result->horizontal, std::move(motion), result->runtime.settings());
+            result->horizontal, std::move(motion), result->runtime.settings(),
+#ifdef STILLFLOW_C_OPENCV
+            value->motion_estimator == SF_MOTION_OPENCV ? make_opencv_analyzer(settings, result->horizontal) :
+#endif
+                                                        make_translation_analyzer(settings));
         *out = result.release();
     });
 }
@@ -239,8 +248,8 @@ sf_status sf_stream_push(sf_stream* stream, const sf_image* image, int64_t pts, 
         if (!stream || !accepted)
             throw std::invalid_argument("Missing stream push argument");
         stream->runtime.settings().check();
-        Profile profile;
-        *accepted = stream->analyzer->push(import_image(image), pts, duration, profile);
+        ScopeTimer timer(stream->profile, "stream.analyze");
+        *accepted = stream->analyzer->push(import_image(image), pts, duration, stream->profile);
     });
 }
 sf_status sf_stream_finish(sf_stream* stream, sf_error* error) {
@@ -265,6 +274,7 @@ sf_status sf_stream_take_ready(sf_stream* stream, sf_ready_frame* frame, sf_plan
         plan->plan.analysis.frames.resize(1);
         plan->plan.warps.resize(1);
         ReadyWarp ready;
+        ScopeTimer timer(stream->profile, "stream.plan");
         if (!stream->analyzer->take_ready(ready))
             return;
         plan->plan.analysis.origin_us = ready.pts_us;
@@ -277,6 +287,15 @@ sf_status sf_stream_take_ready(sf_stream* stream, sf_ready_frame* frame, sf_plan
         frame->lookahead_seconds = ready.lookahead_seconds;
         frame->available = 1;
         *out = plan.release();
+    });
+}
+sf_status sf_stream_profile(const sf_stream* stream, sf_profile_sample sample, void* user_data, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!stream || !sample)
+            throw std::invalid_argument("Missing stream or profile callback");
+        for (const auto& [stage, values] : stream->profile.samples())
+            for (double ms : values)
+                sample(user_data, stage.c_str(), ms);
     });
 }
 void sf_stream_destroy(sf_stream* stream) { delete stream; }

@@ -582,6 +582,7 @@ bool Reader::next(DecodedFrame& output, bool luma_only) {
     } else {
         output.device.reset();
         output.pixels = s.converter->convert(frame, luma_only);
+        output.luma = luma_only ? output.pixels : s.converter->convert(frame, true);
     }
     av_frame_unref(s.frame);
     return true;

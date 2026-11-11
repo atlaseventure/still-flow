@@ -123,6 +123,9 @@ SF_API sf_status sf_stream_push(sf_stream*, const sf_image*, int64_t pts_us, int
                                 sf_error*);
 SF_API sf_status sf_stream_finish(sf_stream*, sf_error*);
 SF_API sf_status sf_stream_take_ready(sf_stream*, sf_ready_frame*, sf_plan**, sf_error*);
+/* Synchronously visits samples on the calling thread; callback must not reenter the stream. */
+typedef void (*sf_profile_sample)(void* user_data, const char* stage, double milliseconds);
+SF_API sf_status sf_stream_profile(const sf_stream*, sf_profile_sample, void* user_data, sf_error*);
 SF_API void sf_stream_destroy(sf_stream*);
 
 SF_API sf_status sf_renderer_create(const sf_runtime*, sf_renderer**, sf_error*);

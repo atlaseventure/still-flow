@@ -9,9 +9,10 @@ void validate_stream_settings(const StreamSettings& s) {
         throw std::invalid_argument("Invalid streaming lookahead or buffer capacity");
 }
 StreamAnalyzer::StreamAnalyzer(StabilizationSettings settings, StreamSettings stream, Size size, double fps,
-                               bool horizontal, std::unique_ptr<MotionAnalyzer> motion, ExecutionSettings execution)
+                               bool horizontal, std::unique_ptr<MotionAnalyzer> motion, ExecutionSettings execution,
+                               std::unique_ptr<MotionAnalyzer> recovery)
     : settings_(settings), stream_(stream), analysis_{size, horizontal, 0, {}}, fps_(fps), execution_(execution),
-      motion_(std::move(motion)) {
+      motion_(std::move(motion)), recovery_(std::move(recovery)) {
     // Share validation with the offline analyzer.
     Analyzer validate(settings, size, fps, horizontal, nullptr, execution);
     validate_stream_settings(stream);
@@ -24,7 +25,11 @@ bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Pro
         throw std::invalid_argument("Stream timestamps must increase and durations must be nonnegative");
     if (full())
         return false;
-    auto current = gray_proxy(image, analysis_.size);
+    Image current;
+    {
+        ScopeTimer timer(profile, "analysis.proxy");
+        current = gray_proxy(image, analysis_.size);
+    }
     Motion observation;
     observation.row_delta.resize(settings_.bands);
     if (previous_ && (static_cast<long double>(pts) - last_pts_) / 1000000 <= std::max(0.5, 5 / fps_)) {
@@ -41,13 +46,14 @@ bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Pro
     return true;
 }
 void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
-    if (!motion_ || proxies_.size() < 3)
+    if (!recovery_ || proxies_.size() < 3)
         return;
     const auto weak = [](const Motion& m) {
         return m.state == MotionState::missing || (m.model_consistency > 0 && m.model_consistency < 0.40);
     };
     auto& frames = analysis_.frames;
     const size_t start = proxies_.front().first - base_;
+    size_t budget = 4;
     for (size_t first = std::max(start + 1, next_); first < frames.size(); ++first) {
         if (!weak(frames[first].motion) || frames[first].motion.reset || weak(frames[first - 1].motion))
             continue;
@@ -71,10 +77,8 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
                              analysis_.origin_us,
                              {frames.begin() + begin, frames.begin() + end + 1}};
         // Four independent endpoint links constrain a short weak interval.
-        // Limit work per push; if time runs out, the available evidence is
-        // fused and unresolved observations retain the ordinary tracking fade.
+        // A fixed estimate budget makes recovery independent of processor speed.
         ScopeTimer timer(profile, "analysis.bridge");
-        const double deadline = profile.now() + 500 / fps_;
         std::vector<TemporalLink> links;
         bool exhausted = false;
         for (size_t offset = 0; offset < 2 && !exhausted; ++offset) {
@@ -84,14 +88,15 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
             for (size_t to = last; to <= std::min(end, last + 1); ++to) {
                 if (frames[to].seconds - frames[from].seconds > 0.20)
                     continue;
-                if (!links.empty() && profile.now() >= deadline) {
+                if (budget == 0) {
                     profile.add("analysis.bridge_budget_exhausted", 0);
                     exhausted = true;
                     break;
                 }
                 execution_.check();
+                --budget;
                 auto observation =
-                    motion_->estimate(proxies_[from - start].second, proxies_[to - start].second, profile);
+                    recovery_->estimate(proxies_[from - start].second, proxies_[to - start].second, profile);
                 if (!observation.reset && observation.state != MotionState::missing)
                     links.push_back({from - begin, to - begin, std::move(observation)});
             }
@@ -101,6 +106,8 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
             frames[i].motion = std::move(local.frames[i - begin].motion);
         recovered_until_ = base_ + last;
         first = last;
+        if (exhausted)
+            break;
     }
 }
 bool StreamAnalyzer::push_observation(Motion motion, int64_t pts, int64_t duration) {
@@ -144,13 +151,22 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
     execution_.check();
     if (!buffered())
         return false;
-    const auto& frames = analysis_.frames;
+    // Microsecond timestamps can round an exact lookahead down by one tick.
+    constexpr double pts_tolerance = 2e-6;
+    const double required = std::max(stream_.lookahead_seconds, motion_ ? 0.20 + 2 / fps_ : 0.0);
+    size_t limit = next_ + 1;
+    while (limit < analysis_.frames.size()) {
+        const auto& candidate = analysis_.frames[limit++];
+        if (candidate.segment != analysis_.frames[next_].segment ||
+            candidate.seconds - analysis_.frames[next_].seconds + pts_tolerance >= required)
+            break;
+    }
+    const std::vector<FrameMotion> frames(analysis_.frames.begin(), analysis_.frames.begin() + limit);
     const auto& current = frames[next_];
     const double ahead = frames.back().seconds - current.seconds;
     const bool shot_ended = frames.back().segment != current.segment;
     // One future observation finalizes the PTS-derived duration even at zero lag.
-    if (!finished_ && !shot_ended && !full() &&
-        (buffered() < 2 || ahead + 1e-9 < std::max(stream_.lookahead_seconds, motion_ ? 0.20 + 2 / fps_ : 0.0)))
+    if (!finished_ && !shot_ended && !full() && (buffered() < 2 || ahead + pts_tolerance < required))
         return false;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;

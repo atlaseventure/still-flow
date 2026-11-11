@@ -88,7 +88,12 @@ def run(args):
     source = args.input.resolve(strict=True)
     media = probe(source)
     config = android_input(media)
-    config.update(bitrate=args.bitrate, horizontalScan=args.horizontal_scan, settings={"backend": args.backend.upper()})
+    config.update(
+        realtime=args.realtime,
+        bitrate=args.bitrate,
+        horizontalScan=args.horizontal_scan,
+        settings={"backend": args.backend.upper()},
+    )
     keys = {
         "motion_estimator": "motionEstimator",
         "analysis_width": "analysisWidth",
@@ -259,6 +264,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
+    parser.add_argument("--realtime", action="store_true")
     parser.add_argument("--backend", choices=("auto", "cpu", "gles"), default="gles")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
