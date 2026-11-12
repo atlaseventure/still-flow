@@ -17,6 +17,30 @@ StreamAnalyzer::StreamAnalyzer(StabilizationSettings settings, StreamSettings st
     Analyzer validate(settings, size, fps, horizontal, nullptr, execution);
     validate_stream_settings(stream);
 }
+StreamAnalyzer::~StreamAnalyzer() {
+    stop_recovery_.store(true);
+    if (recovery_task_.valid())
+        recovery_task_.wait();
+}
+void StreamAnalyzer::settle_recovery(Profile& profile) {
+    if (!recovery_task_.valid())
+        return;
+    RecoveryResult result;
+    {
+        ScopeTimer timer(profile, "analysis.recovery_join");
+        result = recovery_task_.get();
+    }
+    profile.merge(result.profile);
+    ScopeTimer timer(profile, "analysis.recovery_apply");
+    for (size_t i = 0; i < result.frames.size(); ++i) {
+        const size_t index = result.begin + i;
+        if (index < base_ + next_ || index >= base_ + analysis_.frames.size())
+            continue;
+        auto& frame = analysis_.frames[index - base_];
+        if (frame.segment == result.segment)
+            frame.motion = std::move(result.frames[i].motion);
+    }
+}
 bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
     execution_.check();
     if (finished_)
@@ -46,6 +70,14 @@ bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Pro
     return true;
 }
 void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
+    // Apply at a fixed input index, independent of worker completion time.
+    // Output consumption and end-of-stream are earlier hard deadlines.
+    if (recovery_task_.valid()) {
+        if (flush || base_ + analysis_.frames.size() >= recovery_apply_at_)
+            settle_recovery(profile);
+        else
+            return;
+    }
     if (!recovery_ || proxies_.size() < 3)
         return;
     const auto weak = [](const Motion& m) {
@@ -76,37 +108,50 @@ void StreamAnalyzer::recover_pending(Profile& profile, bool flush) {
                              analysis_.horizontal,
                              analysis_.origin_us,
                              {frames.begin() + begin, frames.begin() + end + 1}};
-        // Four independent endpoint links constrain a short weak interval.
-        // A fixed estimate budget makes recovery independent of processor speed.
-        ScopeTimer timer(profile, "analysis.bridge");
-        std::vector<TemporalLink> links;
-        bool exhausted = false;
-        for (size_t offset = 0; offset < 2 && !exhausted; ++offset) {
+        std::vector<std::pair<size_t, size_t>> pairs;
+        for (size_t offset = 0; offset < 2; ++offset) {
             if (first <= begin + offset)
                 break;
             const size_t from = first - 1 - offset;
             for (size_t to = last; to <= std::min(end, last + 1); ++to) {
-                if (frames[to].seconds - frames[from].seconds > 0.20)
-                    continue;
-                if (budget == 0) {
-                    profile.add("analysis.bridge_budget_exhausted", 0);
-                    exhausted = true;
-                    break;
-                }
-                execution_.check();
-                --budget;
-                auto observation =
-                    recovery_->estimate(proxies_[from - start].second, proxies_[to - start].second, profile);
-                if (!observation.reset && observation.state != MotionState::missing)
-                    links.push_back({from - begin, to - begin, std::move(observation)});
+                if (frames[to].seconds - frames[from].seconds <= 0.20 && pairs.size() < budget)
+                    pairs.emplace_back(from - begin, to - begin);
             }
         }
-        recover_motion(local.frames, links, analysis_.size);
-        for (size_t i = std::max(begin, next_); i <= end; ++i)
-            frames[i].motion = std::move(local.frames[i - begin].motion);
+        std::vector<Image> images;
+        for (size_t i = begin; i <= end; ++i)
+            images.push_back(proxies_[i - start].second);
+        RecoveryResult result{base_ + begin, base_ + frames.size() + 16, frames[begin].segment, std::move(local.frames),
+                              Profile(profile.timer())};
+        recovery_apply_at_ = result.apply_at;
+        recovery_begin_ = result.begin;
+        auto work = [this, result = std::move(result), images = std::move(images), pairs]() mutable {
+            {
+                ScopeTimer timer(result.profile, "analysis.bridge_worker");
+                std::vector<TemporalLink> links;
+                for (const auto& [from, to] : pairs) {
+                    if (stop_recovery_.load())
+                        break;
+                    auto observation = recovery_->estimate(images[from], images[to], result.profile);
+                    if (!observation.reset && observation.state != MotionState::missing)
+                        links.push_back({from, to, std::move(observation)});
+                }
+                recover_motion(result.frames, links, analysis_.size);
+            }
+            return result;
+        };
         recovered_until_ = base_ + last;
+        if (stream_.background_recovery && !flush) {
+            recovery_task_ = std::async(std::launch::async, std::move(work));
+            break;
+        }
+        auto completed = work();
+        profile.merge(completed.profile);
+        for (size_t i = std::max(begin, next_); i <= end; ++i)
+            frames[i].motion = std::move(completed.frames[i - begin].motion);
+        budget -= pairs.size();
         first = last;
-        if (exhausted)
+        if (budget == 0)
             break;
     }
 }
@@ -137,17 +182,17 @@ bool StreamAnalyzer::push_observation(Motion motion, int64_t pts, int64_t durati
     last_pts_ = pts;
     return true;
 }
-void StreamAnalyzer::finish() {
+void StreamAnalyzer::finish(Profile* output_profile) {
     execution_.check();
     if (finished_)
         throw std::logic_error("Stream is already finished");
     Profile profile;
-    recover_pending(profile, true);
+    recover_pending(output_profile ? *output_profile : profile, true);
     finished_ = true;
     previous_.reset();
     proxies_.clear();
 }
-bool StreamAnalyzer::take_ready(ReadyWarp& output) {
+bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
     execution_.check();
     if (!buffered())
         return false;
@@ -168,6 +213,11 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
     // One future observation finalizes the PTS-derived duration even at zero lag.
     if (!finished_ && !shot_ended && !full() && (buffered() < 2 || ahead + pts_tolerance < required))
         return false;
+    if (recovery_task_.valid() && base_ + next_ >= recovery_begin_) {
+        // Recovery must be committed before its first mutable frame is emitted.
+        Profile profile;
+        settle_recovery(output_profile ? *output_profile : profile);
+    }
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
     // Fixed cropping retains the offline constraint neighborhoods. Adaptive

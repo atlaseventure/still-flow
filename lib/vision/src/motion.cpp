@@ -121,17 +121,39 @@ struct DescriptorMotion {
 // parallax makes the optical-flow model unreliable. Mutual matches avoid
 // counting multiple descriptors of the same destination as independent support.
 DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& current, int features,
-                                   std::vector<cv::KeyPoint>& cached_keys, cv::Mat& cached_descriptors, bool cached) {
+                                   std::vector<cv::KeyPoint>& cached_keys, cv::Mat& cached_descriptors, bool cached,
+                                   Profile& profile, FeatureFrame* before, FeatureFrame* after) {
     DescriptorMotion result;
     auto detector = cv::ORB::create(std::max(800, features));
     std::vector<cv::KeyPoint> keys_before, keys_after;
     cv::Mat descriptors_before, descriptors_after;
-    if (cached) {
-        keys_before = std::move(cached_keys);
-        descriptors_before = std::move(cached_descriptors);
-    } else
-        detector->detectAndCompute(previous, {}, keys_before, descriptors_before);
-    detector->detectAndCompute(current, {}, keys_after, descriptors_after);
+    {
+        ScopeTimer timer(profile, "analysis.descriptors");
+        if (before && before->descriptors_ready) {
+            keys_before = before->keys;
+            descriptors_before = before->descriptors;
+        } else if (cached) {
+            keys_before = std::move(cached_keys);
+            descriptors_before = std::move(cached_descriptors);
+        } else
+            detector->detectAndCompute(previous, {}, keys_before, descriptors_before);
+        if (before && !before->descriptors_ready) {
+            before->keys = keys_before;
+            before->descriptors = descriptors_before;
+            before->descriptors_ready = true;
+        }
+        if (after && after->descriptors_ready) {
+            keys_after = after->keys;
+            descriptors_after = after->descriptors;
+        } else {
+            detector->detectAndCompute(current, {}, keys_after, descriptors_after);
+            if (after) {
+                after->keys = keys_after;
+                after->descriptors = descriptors_after;
+                after->descriptors_ready = true;
+            }
+        }
+    }
     cached_keys = keys_after;
     cached_descriptors = descriptors_after;
     if (keys_before.size() < 64 || keys_after.size() < 64)
@@ -139,8 +161,11 @@ DescriptorMotion descriptor_motion(const cv::Mat& previous, const cv::Mat& curre
     result.textured = true;
     std::vector<std::vector<cv::DMatch>> forward, backward;
     cv::BFMatcher matcher(cv::NORM_HAMMING);
-    matcher.knnMatch(descriptors_before, descriptors_after, forward, 2);
-    matcher.knnMatch(descriptors_after, descriptors_before, backward, 2);
+    {
+        ScopeTimer timer(profile, "analysis.match");
+        matcher.knnMatch(descriptors_before, descriptors_after, forward, 2);
+        matcher.knnMatch(descriptors_after, descriptors_before, backward, 2);
+    }
     std::vector<cv::Point2f> p, q;
     std::vector<double> reliability;
     for (const auto& pair : forward) {
@@ -210,7 +235,7 @@ MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool hori
     : options_(options), horizontal_(horizontal_scan), incremental_(incremental) {}
 
 Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive,
-                                 const Motion* prediction) {
+                                 const Motion* prediction, FeatureFrame* before, FeatureFrame* after) {
     if (!consecutive) {
         pyramid_.clear();
         tracked_.clear();
@@ -231,8 +256,8 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         result.failure = reason;
         result.state = MotionState::missing;
         ScopeTimer timer(profile, "analysis.recover_features");
-        const auto descriptors =
-            descriptor_motion(previous, current, options_.features, descriptor_keys_, descriptors_, cached_descriptors);
+        const auto descriptors = descriptor_motion(previous, current, options_.features, descriptor_keys_, descriptors_,
+                                                   cached_descriptors, profile, before, after);
         descriptors_ready_ = true;
         if (descriptors.score.reliable() && geometry_failure(descriptors.step, center, norm).empty()) {
             result.step = descriptors.step;
@@ -247,32 +272,40 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     std::vector<cv::Point2f> source, destination, backward;
     {
         ScopeTimer timer(profile, "analysis.features");
-        // Per-cell quotas stop one detailed foreground object taking all keypoints.
-        constexpr int columns = 8, rows = 6;
-        for (int y = 0; y < rows; ++y)
-            for (int x = 0; x < columns; ++x) {
-                cv::Rect roi(x * previous.cols / columns, y * previous.rows / rows,
-                             (x + 1) * previous.cols / columns - x * previous.cols / columns,
-                             (y + 1) * previous.rows / rows - y * previous.rows / rows);
-                const size_t quota = static_cast<size_t>(std::max(1, options_.features / (columns * rows)));
-                std::vector<cv::Point2f> cell;
-                for (const auto point : carried)
-                    if (cell.size() < quota && point.x >= roi.x && point.x < roi.x + roi.width && point.y >= roi.y &&
-                        point.y < roi.y + roi.height)
-                        cell.push_back(point);
-                if (cell.size() < quota / 2 || cell.empty()) {
-                    std::vector<cv::Point2f> points;
-                    cv::goodFeaturesToTrack(previous(roi), points, static_cast<int>(quota), 0.015, 6 * pixel_scale);
-                    for (auto point : points) {
-                        point += cv::Point2f(static_cast<float>(roi.x), static_cast<float>(roi.y));
-                        if (cell.size() < quota && std::none_of(cell.begin(), cell.end(), [&](auto p) {
-                                return cv::norm(point - p) < 6 * pixel_scale;
-                            }))
+        if (before && before->corners_ready) {
+            source = before->corners;
+        } else {
+            // Per-cell quotas stop one detailed foreground object taking all keypoints.
+            constexpr int columns = 8, rows = 6;
+            for (int y = 0; y < rows; ++y)
+                for (int x = 0; x < columns; ++x) {
+                    cv::Rect roi(x * previous.cols / columns, y * previous.rows / rows,
+                                 (x + 1) * previous.cols / columns - x * previous.cols / columns,
+                                 (y + 1) * previous.rows / rows - y * previous.rows / rows);
+                    const size_t quota = static_cast<size_t>(std::max(1, options_.features / (columns * rows)));
+                    std::vector<cv::Point2f> cell;
+                    for (const auto point : carried)
+                        if (cell.size() < quota && point.x >= roi.x && point.x < roi.x + roi.width &&
+                            point.y >= roi.y && point.y < roi.y + roi.height)
                             cell.push_back(point);
+                    if (cell.size() < quota / 2 || cell.empty()) {
+                        std::vector<cv::Point2f> points;
+                        cv::goodFeaturesToTrack(previous(roi), points, static_cast<int>(quota), 0.015, 6 * pixel_scale);
+                        for (auto point : points) {
+                            point += cv::Point2f(static_cast<float>(roi.x), static_cast<float>(roi.y));
+                            if (cell.size() < quota && std::none_of(cell.begin(), cell.end(), [&](auto p) {
+                                    return cv::norm(point - p) < 6 * pixel_scale;
+                                }))
+                                cell.push_back(point);
+                        }
                     }
+                    source.insert(source.end(), cell.begin(), cell.end());
                 }
-                source.insert(source.end(), cell.begin(), cell.end());
-            }
+        }
+        if (before) {
+            before->corners = source;
+            before->corners_ready = true;
+        }
     }
     if (source.size() < 24) {
         pyramid_.clear();
@@ -282,10 +315,28 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     std::vector<float> forward_error, backward_error;
     {
         ScopeTimer timer(profile, "analysis.track");
-        before_.swap(pyramid_);
-        if (!consecutive || before_.empty())
-            cv::buildOpticalFlowPyramid(previous, before_, {21, 21}, 3);
-        cv::buildOpticalFlowPyramid(current, pyramid_, {21, 21}, 3);
+        {
+            ScopeTimer pyramid_timer(profile, "analysis.pyramid");
+            before_.swap(pyramid_);
+            if (before && !before->pyramid.empty())
+                before_ = before->pyramid;
+            else if (!consecutive || before_.empty()) {
+                if (before)
+                    before_.clear();
+                cv::buildOpticalFlowPyramid(previous, before_, {21, 21}, 3);
+            }
+            if (before)
+                before->pyramid = before_;
+            if (after && !after->pyramid.empty())
+                pyramid_ = after->pyramid;
+            else {
+                if (after)
+                    pyramid_.clear();
+                cv::buildOpticalFlowPyramid(current, pyramid_, {21, 21}, 3);
+            }
+            if (after)
+                after->pyramid = pyramid_;
+        }
         const bool predicted = incremental_ && consecutive && prediction && prediction->confidence >= 0.7 &&
                                !prediction->reset && prediction->state == MotionState::tracked;
         const bool mobile = options_.analysis_width <= 640 && options_.features <= 600;
@@ -305,11 +356,17 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
             const cv::Size window = fast && mobile ? cv::Size(15, 15) : cv::Size(21, 21);
             const int levels = fast ? 2 : 3;
             const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
-            cv::calcOpticalFlowPyrLK(before_, pyramid_, source, destination, forward_status, forward_error, window,
-                                     levels, criteria, predicted ? cv::OPTFLOW_USE_INITIAL_FLOW : 0);
+            {
+                ScopeTimer forward_timer(profile, "analysis.lk_forward");
+                cv::calcOpticalFlowPyrLK(before_, pyramid_, source, destination, forward_status, forward_error, window,
+                                         levels, criteria, predicted ? cv::OPTFLOW_USE_INITIAL_FLOW : 0);
+            }
             backward = source;
-            cv::calcOpticalFlowPyrLK(pyramid_, before_, destination, backward, backward_status, backward_error, window,
-                                     levels, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+            {
+                ScopeTimer backward_timer(profile, "analysis.lk_backward");
+                cv::calcOpticalFlowPyrLK(pyramid_, before_, destination, backward, backward_status, backward_error,
+                                         window, levels, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
+            }
         };
         if (light)
             profile.add("analysis.predicted_track", 0);

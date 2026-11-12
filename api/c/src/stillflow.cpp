@@ -316,8 +316,15 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
         result->size = size;
         result->horizontal = video->horizontal_scan != 0;
         result->analyzer = std::make_unique<StreamAnalyzer>(
-            settings, StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames}, size, video->fps,
-            result->horizontal, std::move(motion), result->runtime.settings(),
+            settings,
+            StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames,
+#ifdef __ANDROID__
+                           true
+#else
+                                     false
+#endif
+            },
+            size, video->fps, result->horizontal, std::move(motion), result->runtime.settings(),
 #ifdef STILLFLOW_C_OPENCV
             value->motion_estimator == SF_MOTION_OPENCV ? make_opencv_analyzer(settings, result->horizontal) :
 #endif
@@ -347,7 +354,9 @@ sf_status sf_stream_finish(sf_stream* stream, sf_error* error) {
         c_api::require(stream);
         stream->runtime.settings().check();
         if (!stream->finished) {
-            stream->analyzer->finish();
+            Profile call{profile_now};
+            stream->analyzer->finish(&call);
+            stream->record(call);
             stream->finished = true;
         }
     });
@@ -365,7 +374,7 @@ sf_status sf_stream_take_ready(sf_stream* stream, sf_frame_plan** out, sf_error*
         bool available;
         {
             ScopeTimer timer(call, "stream.plan");
-            available = stream->analyzer->take_ready(ready);
+            available = stream->analyzer->take_ready(ready, &call);
         }
         stream->record(call);
         if (!available)

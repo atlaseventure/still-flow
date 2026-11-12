@@ -1,11 +1,14 @@
 #pragma once
 #include "stillflow/application/engine.hpp"
+#include <atomic>
 #include <deque>
+#include <future>
 
 namespace stillflow {
 struct StreamSettings {
     double lookahead_seconds = 1.35;
     size_t max_buffered_frames = 120;
+    bool background_recovery = false;
 };
 void validate_stream_settings(const StreamSettings& settings);
 struct ReadyWarp {
@@ -23,12 +26,13 @@ class StreamAnalyzer {
     StreamAnalyzer(StabilizationSettings settings, StreamSettings stream, Size size, double fps, bool horizontal,
                    std::unique_ptr<MotionAnalyzer> motion = {}, ExecutionSettings execution = {},
                    std::unique_ptr<MotionAnalyzer> recovery = {});
+    ~StreamAnalyzer();
     // Only reduced gray proxies are retained (at most 24); callers own the
     // delayed full-resolution frames until take_ready returns their index.
     bool push(const Image& image, int64_t pts_us, int64_t duration_us, Profile& profile);
     bool push_observation(Motion motion, int64_t pts_us, int64_t duration_us);
-    bool take_ready(ReadyWarp& output);
-    void finish();
+    bool take_ready(ReadyWarp& output, Profile* profile = nullptr);
+    void finish(Profile* profile = nullptr);
     size_t buffered() const { return analysis_.frames.size() - next_; }
     bool full() const { return buffered() >= stream_.max_buffered_frames; }
 
@@ -47,6 +51,16 @@ class StreamAnalyzer {
     Image previous_;
     std::deque<std::pair<size_t, Image>> proxies_;
     size_t recovered_until_ = 0;
+    struct RecoveryResult {
+        size_t begin = 0, apply_at = 0;
+        int segment = 0;
+        std::vector<FrameMotion> frames;
+        Profile profile;
+    };
+    std::atomic<bool> stop_recovery_{false};
+    std::future<RecoveryResult> recovery_task_;
+    size_t recovery_apply_at_ = 0, recovery_begin_ = 0;
+    void settle_recovery(Profile& profile);
     void recover_pending(Profile& profile, bool flush);
 };
 } // namespace stillflow
