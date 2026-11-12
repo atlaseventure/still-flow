@@ -28,13 +28,20 @@ set(ENV{PKG_CONFIG_LIBDIR} "${STILLFLOW_DEPS_ROOT}/lib/pkgconfig")
 set(PKG_CONFIG_USE_CMAKE_PREFIX_PATH FALSE)
 # Re-read metadata when the source build changes codec or license options.
 unset(__pkg_config_checked_FFMPEG CACHE)
-pkg_check_modules(FFMPEG REQUIRED libavformat>=62 libavcodec>=62 libavutil>=60 libswscale>=9)
+pkg_check_modules(
+    FFMPEG
+    REQUIRED
+    libavformat>=62
+    libavcodec>=62
+    libavutil>=60
+    libswscale>=9
+    libswresample>=6)
 
 # FFmpeg stays replaceable as separate shared libraries.
 add_library(stillflow_ffmpeg INTERFACE)
 target_include_directories(stillflow_ffmpeg SYSTEM INTERFACE ${FFMPEG_INCLUDE_DIRS})
 target_compile_options(stillflow_ffmpeg INTERFACE ${FFMPEG_CFLAGS_OTHER})
-foreach(library avformat avcodec swscale avutil)
+foreach(library avformat avcodec swscale swresample avutil)
     set(shared_library
         "${STILLFLOW_DEPS_ROOT}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}${library}${CMAKE_SHARED_LIBRARY_SUFFIX}")
     if(NOT EXISTS "${shared_library}")
@@ -64,7 +71,7 @@ if(NOT STILLFLOW_FFMPEG_IS_LGPL)
     message(FATAL_ERROR "The desktop module requires LGPL FFmpeg shared libraries")
 endif()
 
-add_library(stillflow_media STATIC src/media.cpp src/media_adapter.cpp)
+add_library(stillflow_media STATIC src/media.cpp src/media_adapter.cpp src/audio.cpp)
 add_library(stillflow_images STATIC src/image_processing.cpp)
 add_library(stillflow_host STATIC src/output_storage.cpp src/runtime.cpp src/options.cpp src/stabilize.cpp)
 find_package(Threads REQUIRED)

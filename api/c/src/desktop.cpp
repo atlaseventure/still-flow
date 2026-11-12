@@ -13,8 +13,20 @@ class Progress final : public stillflow::Progress {
   public:
     explicit Progress(const sf_progress* value) {
         if (value) {
-            stillflow::c_api::require(value);
-            value_ = *value;
+            if (value->struct_size < offsetof(sf_progress, event))
+                throw std::invalid_argument("Undersized progress callbacks");
+            std::memcpy(&value_, value, offsetof(sf_progress, event));
+            if (value->struct_size >= sizeof(sf_progress))
+                value_.event = value->event;
+        }
+    }
+    void event(const stillflow::ProgressEvent& value) override {
+        if (value_.event) {
+            const sf_progress_event event{sizeof(sf_progress_event), static_cast<int32_t>(value.stage),
+                                          value.stage_complete,      value.processed_frames,
+                                          value.total_frames,        value.processed_us,
+                                          value.duration_us,         value.fraction};
+            value_.event(value_.user_data, &event);
         }
     }
     void send(const std::string& message) {
@@ -74,7 +86,7 @@ sf_status sf_file_options_default(sf_file_options* value) {
         value->threads = 12;
         value->crf = 18;
         value->audio = 1;
-        if (size >= sizeof(sf_file_options)) {
+        if (size >= offsetof(sf_file_options, audio_mode)) {
             value->lookahead_seconds = 1.5;
             value->max_buffered_frames = 120;
         }
@@ -113,10 +125,12 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_runtime* call
         options.crf = value->crf;
         options.audio = value->audio != 0;
         options.overwrite = value->overwrite != 0;
-        if (value->struct_size >= sizeof(sf_file_options)) {
+        if (value->struct_size >= offsetof(sf_file_options, audio_mode)) {
             options.realtime = value->realtime != 0;
             options.stream = {value->lookahead_seconds, value->max_buffered_frames};
         }
+        if (value->struct_size >= offsetof(sf_file_options, audio_mode) + sizeof(value->audio_mode))
+            options.audio_mode = static_cast<stillflow::AudioMode>(value->audio_mode);
         stillflow::c_api::Runtime runtime(callbacks);
         auto executor = stillflow::make_thread_executor(options.threads);
         options.execution = runtime.settings();

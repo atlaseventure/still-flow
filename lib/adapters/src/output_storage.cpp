@@ -1,5 +1,6 @@
 #include "stillflow/adapters/backends.hpp"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -117,14 +118,23 @@ nlohmann::json rendering_json(const RenderingReport& data) {
 }
 nlohmann::json codecs_json(const std::vector<std::pair<std::string, CodecReport>>& codecs) {
     auto result = nlohmann::json::object();
-    for (const auto& [stream, codec] : codecs)
+    for (const auto& [stream, codec] : codecs) {
+        auto audio = nlohmann::json::array();
+        for (const auto& track : codec.audio_tracks)
+            audio.push_back({{"input_stream", track.input_stream},
+                             {"input_codec", track.input_codec},
+                             {"output_codec", track.output_codec},
+                             {"action", track.action}});
         result[stream] = {{"requested", codec.request.name},
                           {"prefer_hardware", codec.request.prefer_hardware},
                           {"implementation", codec.implementation},
                           {"device", codec.device},
                           {"frames", codec.frames},
                           {"hardware_frames", codec.hardware_frames},
-                          {"fallbacks", codec.fallbacks}};
+                          {"reconstructed_timestamps", codec.reconstructed_timestamps},
+                          {"fallbacks", codec.fallbacks},
+                          {"audio_tracks", audio}};
+    }
     return result;
 }
 class LocalOutputStorage final : public OutputStorage {
@@ -169,7 +179,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 8},
+            {"schema_version", 9},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -203,7 +213,8 @@ class LocalOutputStorage final : public OutputStorage {
               {"preset", options.preset},
               {"decoder", options.decoder},
               {"encoder", options.encoder},
-              {"audio_copy", options.audio},
+              {"audio", options.audio && options.audio_mode != AudioMode::drop},
+              {"audio_mode", std::array{"auto", "copy", "aac", "none"}[static_cast<size_t>(options.audio_mode)]},
               {"comparison", !options.compare.empty()}}},
             {"cropping",
              {{"method", "geometric_viewport"},

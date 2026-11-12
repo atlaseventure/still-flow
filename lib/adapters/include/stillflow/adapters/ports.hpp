@@ -64,9 +64,18 @@ class Runtime {
     virtual void configure(int threads) = 0;
     virtual ResourceUsage resources() const = 0;
 };
+enum class ProgressStage { analyze, recover, plan, render, finalize, complete };
+struct ProgressEvent {
+    ProgressStage stage;
+    bool stage_complete;
+    size_t processed_frames, total_frames;
+    int64_t processed_us, duration_us;
+    double fraction;
+};
 class Progress {
   public:
     virtual ~Progress() = default;
+    virtual void event(const ProgressEvent&) {}
     virtual void backend(const RenderingReport& report) = 0;
     virtual void analyzing(const VideoInfo& info, Size analysis_size, bool horizontal) = 0;
     virtual void analyzed(size_t frames, bool complete) = 0;

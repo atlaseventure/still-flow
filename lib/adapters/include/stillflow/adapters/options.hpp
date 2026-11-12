@@ -1,4 +1,5 @@
 #pragma once
+#include "stillflow/application/media.hpp"
 #include "stillflow/application/runtime.hpp"
 #include "stillflow/application/stream.hpp"
 #include "stillflow/domain/settings.hpp"
@@ -19,6 +20,7 @@ struct Options : StabilizationSettings {
     bool realtime = false;
     StreamSettings stream;
     bool audio = true;
+    AudioMode audio_mode = AudioMode::automatic;
     bool overwrite = false;
 };
 // Resolve derived paths and validate the use-case request before invoking services.

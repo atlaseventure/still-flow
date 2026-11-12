@@ -16,7 +16,9 @@ cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow --help
 ```
 
-`--backend auto` 优先使用 CUDA，失败时回退 CPU。GPU 渲染默认优先使用硬件编解码；`--backend cpu --decoder cpu --encoder openh264` 强制软件处理。输入须为逐行扫描、方形像素、偶数尺寸的 8 位 SDR 视频。输出保留显示时间戳并复制兼容音轨；音频不兼容时使用 MKV 或 `--no-audio`。
+`--backend auto` 优先使用 CUDA，失败时回退 CPU。GPU 渲染默认优先使用硬件编解码；`--backend cpu --decoder cpu --encoder openh264` 强制软件处理。输入须为逐行扫描、方形像素、偶数尺寸的 8 位 SDR 视频。输出保留显示时间戳；AVI 重排帧缺失时间戳时使用固定帧率时基补齐。`--audio auto` 复制容器兼容音轨，其余转为 AAC；`--audio aac` 将全部音轨转为 AAC，`copy` 要求直接复制，`none` 移除音频。
+
+离线 CLI 显示分阶段进度。文件 API 通过 `sf_progress.event` 回调结构化进度，输出和报告发布成功后报告完成。
 
 默认裁剪预算为每边 8%。`--crop-mode fixed` 使用精确居中裁剪，`auto` 为每个镜头选择固定窗口，`adaptive` 允许窗口缓慢移动。`--rs off` 关闭滚动快门校正。`--crf` 分别控制 OpenH264 QP 或 NVENC CQ，相同数值的画质并不等价。`--preset` 用于 NVENC。
 

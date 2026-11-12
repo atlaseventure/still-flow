@@ -12,6 +12,8 @@ struct VideoInfo {
     double fps = 0;
     std::string codec;
     bool horizontal_scan = false;
+    int64_t duration_us = 0; // Zero when the container does not provide a duration.
+    size_t estimated_frames = 0;
 };
 struct VideoFrame {
     Image image;
@@ -27,19 +29,27 @@ struct CodecRequest {
     // Copy decoder surfaces into a separate device pool for delayed consumption.
     bool independent_frames = false;
 };
+enum class AudioMode { automatic, copy, aac, drop };
 struct EncodingSettings {
     int threads = 12;
     int crf = 18;
     std::string preset = "fast";
     bool audio = true;
+    AudioMode audio_mode = AudioMode::automatic;
 };
 // The codec a reader or writer actually used. A hardware decoder may hand
 // individual streams back to software, so frames are counted separately.
+struct AudioTrackReport {
+    size_t input_stream;
+    std::string input_codec, output_codec, action;
+};
 struct CodecReport {
     CodecRequest request;
     std::string implementation, device;
     size_t frames = 0, hardware_frames = 0;
+    size_t reconstructed_timestamps = 0;
     std::vector<std::string> fallbacks;
+    std::vector<AudioTrackReport> audio_tracks;
 };
 // Borrowed during the reader callback; consumers retain() packets they keep.
 class AudioPacket {

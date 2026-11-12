@@ -16,7 +16,9 @@ cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow --help
 ```
 
-`--backend auto` prefers CUDA and falls back to CPU. Hardware codecs are selected when GPU rendering is used; `--backend cpu --decoder cpu --encoder openh264` forces software processing. Input must be progressive 8-bit SDR with square pixels and even dimensions. Output preserves presentation timestamps and copies compatible audio; use MKV or `--no-audio` for incompatible audio.
+`--backend auto` prefers CUDA and falls back to CPU. Hardware codecs are selected when GPU rendering is used; `--backend cpu --decoder cpu --encoder openh264` forces software processing. Input must be progressive 8-bit SDR with square pixels and even dimensions. Output preserves presentation timestamps; missing reordered AVI timestamps use the fixed-rate stream clock. `--audio auto` copies container-compatible tracks and converts others to AAC. Use `--audio aac` to encode all audio as AAC, `copy` to require stream copying, or `none` to omit audio.
+
+Offline CLI processing displays staged progress. File API consumers receive structured progress through `sf_progress.event`; completion is reported after output and reports are published.
 
 The default crop budget is 8% per edge. `--crop-mode fixed` applies the exact centered crop; `auto` selects a fixed window per shot, and `adaptive` permits slow viewport motion. `--rs off` disables rolling shutter correction. `--crf` controls OpenH264 QP or NVENC CQ; values across encoders are not quality-equivalent. `--preset` applies to NVENC.
 

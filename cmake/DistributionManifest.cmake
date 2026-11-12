@@ -20,7 +20,7 @@ if(WRITE_MANIFEST)
         RELATIVE "${ROOT}"
         "${ROOT}/share/licenses/stillflow/*" "${ROOT}/share/licenses/opencv5/*"
         "${ROOT}/share/stillflow/media-sources/*")
-    foreach(library avformat avcodec swscale avutil)
+    foreach(library avformat avcodec swscale swresample avutil)
         list(APPEND required_files "lib/lib${library}.so")
         file(
             GLOB libraries

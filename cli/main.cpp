@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <unistd.h>
 
 namespace {
 constexpr std::string_view help = R"(stillflow - video stabilization with scanline wobble suppression
@@ -33,7 +34,8 @@ Usage: stillflow INPUT OUTPUT [options]
   --encoder NAME          H.264 encoder: auto, openh264 or nvenc (default auto)
   --crf N                 H.264 quality, 0..51 (default 18); OpenH264 QP / NVENC CQ
   --preset NAME           NVENC speed preset (default fast); NVENC maps it or takes p1..p7
-  --no-audio              Omit audio instead of stream copying
+  --audio MODE            auto (copy compatible tracks), copy, aac or none
+  --no-audio              Alias for --audio none
   --overwrite             Replace existing output/report files
   --version               Print version
   --help                  Show this help
@@ -152,6 +154,18 @@ int main(int argc, char** argv) {
                 if (value != "auto" && value != "cpu" && value != "nvdec")
                     throw std::runtime_error("--decoder must be auto, cpu or nvdec");
                 o.decoder = argv[i];
+            } else if (option == "--audio") {
+                if (value == "auto")
+                    o.audio_mode = SF_AUDIO_AUTO;
+                else if (value == "copy")
+                    o.audio_mode = SF_AUDIO_COPY;
+                else if (value == "aac")
+                    o.audio_mode = SF_AUDIO_AAC;
+                else if (value == "none")
+                    o.audio_mode = SF_AUDIO_DROP;
+                else
+                    throw std::runtime_error("--audio must be auto, copy, aac or none");
+                o.audio = true;
             } else if (option == "--encoder") {
                 if (value != "auto" && value != "openh264" && value != "nvenc")
                     throw std::runtime_error("--encoder must be auto, openh264 or nvenc");
@@ -174,7 +188,38 @@ int main(int argc, char** argv) {
         result.struct_size = sizeof(result);
         sf_error error{};
         error.struct_size = sizeof(error);
-        sf_progress progress{sizeof(progress), nullptr, [](void*, const char* text) { std::cerr << text << '\n'; }};
+        struct Display {
+            bool terminal = isatty(STDERR_FILENO);
+            int percent = -1, stage = -1;
+        } display;
+        sf_progress progress{sizeof(progress), &display,
+                             [](void* context, const char* text) {
+                                 if (static_cast<Display*>(context)->terminal)
+                                     std::cerr << "\r\033[K";
+                                 std::cerr << text << '\n';
+                             },
+                             [](void* context, const sf_progress_event* event) {
+                                 auto& state = *static_cast<Display*>(context);
+                                 const int percent = static_cast<int>(event->fraction * 100);
+                                 if (state.percent == percent && state.stage == event->stage && !event->stage_complete)
+                                     return;
+                                 state.percent = percent;
+                                 state.stage = event->stage;
+                                 constexpr const char* stages[]{"analyze", "recover",  "plan",
+                                                                "render",  "finalize", "complete"};
+                                 if (state.terminal)
+                                     std::cerr << "\r\033[K";
+                                 std::cerr << '[' << std::string(percent / 5, '=') << std::string(20 - percent / 5, ' ')
+                                           << "] " << percent << "% " << stages[event->stage];
+                                 if (event->processed_frames || event->total_frames) {
+                                     std::cerr << ' ' << event->processed_frames;
+                                     if (event->total_frames)
+                                         std::cerr << '/' << event->total_frames;
+                                 }
+                                 if (!state.terminal || event->stage == SF_PROGRESS_COMPLETE)
+                                     std::cerr << '\n';
+                                 std::cerr.flush();
+                             }};
         if (sf_stabilize_file(&o, nullptr, &progress, &result, &error) != SF_OK)
             throw std::runtime_error(error.message);
         const std::string report = o.report ? o.report : std::string(o.output) + ".profile.json";

@@ -26,6 +26,8 @@ void validate_options(const Options& o) {
         throw std::invalid_argument("crop_mode must be auto, fixed or adaptive");
     if (o.scan_axis != "auto" && o.scan_axis != "x" && o.scan_axis != "y")
         throw std::invalid_argument("scan_axis must be auto, x or y");
+    if (o.audio_mode < AudioMode::automatic || o.audio_mode > AudioMode::drop)
+        throw std::invalid_argument("Invalid audio mode");
     if (o.decoder.empty() || o.encoder.empty())
         throw std::invalid_argument("decoder and encoder must be named; use auto for adapter selection");
 }

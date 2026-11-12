@@ -66,6 +66,16 @@ struct Analysis {
     std::optional<CodecReport> recovery_decoder;
 };
 
+void progress(Progress& sink, ProgressStage stage, size_t frames = 0, size_t total = 0, int64_t position_us = 0,
+              int64_t duration_us = 0, bool complete = false) {
+    constexpr std::array starts{0.0, 0.40, 0.50, 0.55, 0.98, 1.0};
+    constexpr std::array weights{0.40, 0.10, 0.05, 0.43, 0.02, 0.0};
+    double ratio = total ? double(frames) / total : duration_us > 0 ? double(position_us) / duration_us : 0;
+    ratio = complete ? 1.0 : std::clamp(ratio, 0.0, 0.99);
+    const auto index = static_cast<size_t>(stage);
+    sink.event({stage, complete, frames, total, position_us, duration_us, starts[index] + weights[index] * ratio});
+}
+
 // Decoding runs ahead on its own thread and proxies are generated in order;
 // motion estimation between consecutive proxies is independent per pair and
 // runs on a worker pool.
@@ -82,6 +92,7 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
     result.size = {std::max(32, static_cast<int>(std::lround(info.width * scale))),
                    std::max(32, static_cast<int>(std::lround(info.height * scale)))};
     services.progress.analyzing(info, result.size, result.horizontal);
+    progress(services.progress, ProgressStage::analyze, 0, info.estimated_frames, 0, info.duration_us);
 
     struct Task {
         Image previous, current;
@@ -155,6 +166,8 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
             }
             frames.push_back(std::move(frame));
             previous = std::move(current);
+            progress(services.progress, ProgressStage::analyze, frames.size(), info.estimated_frames,
+                     source.pts_us - result.origin + source.duration_us, info.duration_us);
             if (frames.size() % 120 == 0)
                 services.progress.analyzed(frames.size(), false);
         }
@@ -171,18 +184,29 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
         if (estimated[i])
             frames[i].motion = std::move(*estimated[i]);
     }
+    const auto duration_us =
+        frames.empty() ? 0
+                       : static_cast<int64_t>(std::llround((frames.back().seconds + frames.back().duration) * 1000000));
+    progress(services.progress, ProgressStage::analyze, frames.size(), frames.size(), duration_us, duration_us, true);
+    progress(services.progress, ProgressStage::recover, 0, frames.size(), 0, duration_us);
     Analyzer collector(options, result.size, info.fps, result.horizontal,
                        services.images.analyzer(options, result.horizontal), options.execution);
     for (auto& frame : frames)
         collector.push_observation(std::move(frame.motion),
                                    result.origin + static_cast<int64_t>(std::llround(frame.seconds * 1000000)),
                                    static_cast<int64_t>(std::llround(frame.duration * 1000000)));
+    size_t recovery_scanned = 0;
+    int64_t recovery_position_us = 0;
     if (auto request = collector.next_recovery_frame()) {
         auto recovery_reader = services.media.reader(
             options.input, options.threads, {options.decoder, services.renderers.prefers_gpu(options.backend)});
         VideoFrame source;
         for (size_t index = 0; request && recovery_reader->next_luma(source); ++index) {
             options.execution.check();
+            recovery_scanned = index + 1;
+            recovery_position_us = source.pts_us - result.origin + source.duration_us;
+            progress(services.progress, ProgressStage::recover, recovery_scanned, frames.size(), recovery_position_us,
+                     duration_us);
             if (index == request->index) {
                 collector.recover(services.images.gray_proxy(source.image, result.size), source.pts_us, profile);
                 request = collector.next_recovery_frame();
@@ -193,6 +217,8 @@ Analysis analyze(const Options& options, Services& services, PendingRenderer& re
         result.recovery_decoder = recovery_reader->codec();
     }
     result.frames = collector.finish_analysis().frames;
+    progress(services.progress, ProgressStage::recover, recovery_scanned, frames.size(), recovery_position_us,
+             duration_us, true);
     services.progress.analyzed(frames.size(), true);
     services.progress.codec("analysis_decoder", result.decoder);
     return result;
@@ -326,7 +352,8 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
                     break;
             }
             if (!writer) {
-                const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
+                const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio,
+                                                options.audio_mode};
                 writer = services.media.writer(output->temporary(), size, info.fps, *reader, frame.pts_us, encoding,
                                                {options.encoder, gpu});
                 if (comparison)
@@ -429,10 +456,12 @@ RunSummary stabilize(const Options& request, Services services) {
     for (size_t i = 0; i + 1 < frames.size(); ++i)
         analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
     Plan plan;
+    progress(services.progress, ProgressStage::plan);
     {
         ScopeTimer timer(profile, "plan.optimize");
         plan = Planner::plan({analysis_size, horizontal, origin, frames}, options, options.execution);
     }
+    progress(services.progress, ProgressStage::plan, 0, 0, 0, 0, true);
     auto& warps = plan.warps;
     const auto analysis_ms = milliseconds(start);
     auto& renderer = pending.get(profile);
@@ -442,6 +471,9 @@ RunSummary stabilize(const Options& request, Services services) {
     if (!options.compare.empty())
         comparison = services.outputs.stage(options.compare);
     size_t rendered = 0;
+    const auto duration_us =
+        static_cast<int64_t>(std::llround((frames.back().seconds + frames.back().duration) * 1000000));
+    progress(services.progress, ProgressStage::render, 0, frames.size(), 0, duration_us);
     std::vector<std::pair<std::string, CodecReport>> codecs{{"analysis_decoder", analysis.decoder}};
     if (analysis.recovery_decoder)
         codecs.emplace_back("recovery_decoder", *analysis.recovery_decoder);
@@ -451,7 +483,8 @@ RunSummary stabilize(const Options& request, Services services) {
         auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         const Size size(info.width, info.height);
         const CodecRequest encoder{options.encoder, gpu};
-        const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
+        const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio,
+                                        options.audio_mode};
         auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, encoding, encoder);
         std::unique_ptr<VideoWriter> compare_writer;
         if (comparison)
@@ -502,6 +535,8 @@ RunSummary stabilize(const Options& request, Services services) {
                     out.stabilized = session.render(rendered, out.input, profile);
                     out.duration_us = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
                     ++rendered;
+                    progress(services.progress, ProgressStage::render, rendered, frames.size(),
+                             pts - origin + out.duration_us, duration_us);
                     if (rendered % 120 == 0)
                         services.progress.rendered(rendered, frames.size(), false);
                 }
@@ -510,6 +545,8 @@ RunSummary stabilize(const Options& request, Services services) {
                 if (!encode.push(std::move(out)))
                     break;
             }
+            progress(services.progress, ProgressStage::render, rendered, frames.size(), duration_us, duration_us, true);
+            progress(services.progress, ProgressStage::finalize);
             encode.close();
             compare.close();
         } catch (...) {
@@ -553,6 +590,7 @@ RunSummary stabilize(const Options& request, Services services) {
         comparison->publish();
     csv_file->publish();
     report_file->publish();
+    progress(services.progress, ProgressStage::complete, rendered, frames.size(), duration_us, duration_us, true);
     return summary;
 }
 } // namespace stillflow

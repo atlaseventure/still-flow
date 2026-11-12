@@ -1,4 +1,5 @@
 #include "media.hpp"
+#include "audio.hpp"
 
 #include <array>
 #include <cmath>
@@ -389,6 +390,9 @@ struct Reader::Impl {
     int video_stream = -1;
     bool draining = false;
     int64_t last_pts = AV_NOPTS_VALUE;
+    bool avi_clock = false;
+    AVRational frame_time_base{0, 1};
+    int64_t start_us = 0;
     VideoInfo info;
     std::function<void(const AVPacket*)> audio_callback;
     ~Impl() {
@@ -451,6 +455,21 @@ Reader::Reader(const std::filesystem::path& path, int threads, const CodecReques
     const auto rate = av_guess_frame_rate(s.format, stream, nullptr);
     s.info.fps = rate.num && rate.den ? av_q2d(rate) : 30.0;
     s.info.codec = codec->name;
+    if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0)
+        s.info.duration_us = av_rescale_q(stream->duration, stream->time_base, microseconds);
+    else if (s.format->duration != AV_NOPTS_VALUE && s.format->duration > 0)
+        s.info.duration_us = s.format->duration;
+    if (stream->nb_frames > 0)
+        s.info.estimated_frames = static_cast<size_t>(stream->nb_frames);
+    // AVI stores decode timestamps. Reordered H.264/HEVC frames can have no
+    // presentation timestamps, including frames emitted only at decoder flush.
+    // Its fixed-rate stream clock supplies display times without cumulative rounding.
+    s.avi_clock = std::strcmp(s.format->iformat->name, "avi") == 0 &&
+                  (codec->id == AV_CODEC_ID_H264 || codec->id == AV_CODEC_ID_HEVC) && rate.num > 0 && rate.den > 0 &&
+                  av_cmp_q(stream->time_base, av_inv_q(rate)) == 0;
+    s.frame_time_base = rate.num > 0 && rate.den > 0 ? av_inv_q(rate) : AVRational{0, 1};
+    s.start_us =
+        stream->start_time == AV_NOPTS_VALUE ? 0 : av_rescale_q(stream->start_time, stream->time_base, microseconds);
     const auto* display = av_packet_side_data_get(stream->codecpar->coded_side_data,
                                                   stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
     if (display && display->size >= 9 * sizeof(int32_t)) {
@@ -543,10 +562,16 @@ bool Reader::next(DecodedFrame& output, bool luma_only) {
             "Host reference pipeline accepts 8-bit SDR; convert HDR/high-bit-depth input explicitly");
     if (frame->flags & AV_FRAME_FLAG_INTERLACED)
         throw std::runtime_error("Deinterlace input before stabilization");
-    if (frame->best_effort_timestamp == AV_NOPTS_VALUE)
-        throw std::runtime_error("Video frame has no presentation timestamp");
     const auto time_base = s.format->streams[s.video_stream]->time_base;
-    output.pts_us = av_rescale_q(frame->best_effort_timestamp, time_base, microseconds);
+    if (s.avi_clock && frame->pts == AV_NOPTS_VALUE && s.decoder->has_b_frames > 0) {
+        output.pts_us =
+            s.start_us + av_rescale_q(static_cast<int64_t>(s.codec.frames - 1), s.frame_time_base, microseconds);
+        ++s.codec.reconstructed_timestamps;
+    } else {
+        if (frame->best_effort_timestamp == AV_NOPTS_VALUE)
+            throw std::runtime_error("Video frame has no presentation timestamp");
+        output.pts_us = av_rescale_q(frame->best_effort_timestamp, time_base, microseconds);
+    }
     if (s.last_pts != AV_NOPTS_VALUE && output.pts_us <= s.last_pts)
         throw std::runtime_error("Video presentation timestamps must be strictly increasing");
     s.last_pts = output.pts_us;
@@ -600,6 +625,7 @@ struct Writer::Impl {
     SwsContext* scaler = nullptr;
     HardwareDevices* devices = nullptr;
     std::vector<int> stream_map;
+    std::vector<std::unique_ptr<AudioTranscoder>> audio_transcoders;
     std::map<int64_t, int64_t> durations;
     int64_t origin_us = 0;
     bool finished = false;
@@ -738,8 +764,8 @@ EncoderContext open_nvenc(const EncoderSettings& settings, AVBufferRef* device) 
 } // namespace
 
 Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
-               int threads, int crf, const std::string& preset, bool audio, const CodecRequest& request,
-               HardwareDevices& devices)
+               int threads, int crf, const std::string& preset, bool audio, AudioMode audio_mode,
+               const CodecRequest& request, HardwareDevices& devices)
     : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
     for (unsigned i = 0; i < source->nb_streams; ++i)
@@ -788,19 +814,30 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     if (cuda_input)
         s.video->codecpar->format = AV_PIX_FMT_YUV420P; // What decoders of the stream produce.
     s.stream_map.assign(source->nb_streams, -1);
-    if (audio) {
+    s.audio_transcoders.resize(source->nb_streams);
+    if (audio && audio_mode != AudioMode::drop) {
         for (unsigned i = 0; i < source->nb_streams; ++i) {
             const auto* input = source->streams[i];
             if (input->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
                 continue;
-            if (avformat_query_codec(s.format->oformat, input->codecpar->codec_id, FF_COMPLIANCE_NORMAL) == 0)
-                throw std::runtime_error("Audio codec is incompatible with output container; choose MKV or --no-audio");
+            const bool compatible =
+                avformat_query_codec(s.format->oformat, input->codecpar->codec_id, FF_COMPLIANCE_NORMAL) > 0;
+            if (!compatible && audio_mode == AudioMode::copy)
+                throw std::runtime_error(
+                    "Audio codec is incompatible with output container; use --audio auto, aac or none");
+            const bool transcode = audio_mode == AudioMode::aac || !compatible;
             auto* stream = avformat_new_stream(s.format, nullptr);
             if (!stream)
                 throw std::bad_alloc();
-            check(avcodec_parameters_copy(stream->codecpar, input->codecpar), "Copy audio parameters");
-            stream->codecpar->codec_tag = 0;
-            stream->time_base = input->time_base;
+            if (transcode)
+                s.audio_transcoders[i] = std::make_unique<AudioTranscoder>(s.format, input, stream, origin_us, threads);
+            else {
+                check(avcodec_parameters_copy(stream->codecpar, input->codecpar), "Copy audio parameters");
+                stream->codecpar->codec_tag = 0;
+                stream->time_base = input->time_base;
+            }
+            s.codec.audio_tracks.push_back({i, avcodec_get_name(input->codecpar->codec_id),
+                                            avcodec_get_name(stream->codecpar->codec_id), transcode ? "aac" : "copy"});
             stream->disposition = input->disposition;
             av_dict_copy(&stream->metadata, input->metadata, 0);
             s.stream_map[i] = stream->index;
@@ -891,6 +928,10 @@ void Writer::audio(const AVPacket* packet) {
     const int index = s.stream_map.at(packet->stream_index);
     if (index < 0)
         return;
+    if (auto& transcoder = s.audio_transcoders.at(packet->stream_index)) {
+        transcoder->push(packet);
+        return;
+    }
     auto* copy = av_packet_clone(packet);
     if (!copy)
         throw std::bad_alloc();
@@ -914,6 +955,9 @@ void Writer::finish() {
         return;
     check(avcodec_send_frame(s.encoder, nullptr), "Flush encoder");
     s.drain();
+    for (auto& transcoder : s.audio_transcoders)
+        if (transcoder)
+            transcoder->finish();
     check(av_write_trailer(s.format), "Finalize output");
     s.finished = true;
 }

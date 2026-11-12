@@ -162,7 +162,7 @@ if(STILLFLOW_BUILD_ADAPTERS)
             "--cxx=${CMAKE_CXX_COMPILER}" --pkg-config-flags=--static --disable-autodetect --enable-shared
             --disable-static --enable-rpath --enable-pic --disable-gpl --disable-nonfree --enable-libopenh264
             --enable-libdav1d --enable-zlib --disable-programs --disable-doc --disable-debug --disable-avdevice
-            --disable-avfilter --disable-swresample --disable-network ${nvidia_codec_args}
+            --disable-avfilter --enable-swresample --disable-network ${nvidia_codec_args}
         BUILD_COMMAND ${build_env} "${STILLFLOW_MAKE}" "-j${STILLFLOW_BUILD_JOBS}"
         INSTALL_COMMAND "${STILLFLOW_MAKE}" install
         COMMAND "${CMAKE_COMMAND}" "-DPREFIX=${prefix}" -P "${CMAKE_SOURCE_DIR}/cmake/RelocateFFmpeg.cmake")
