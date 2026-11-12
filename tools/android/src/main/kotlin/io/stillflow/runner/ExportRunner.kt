@@ -342,7 +342,10 @@ class ExportRunner : Instrumentation() {
             try {
                 val writer = MediaMuxer(File(directory, "output.mp4").path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 try {
-                    val sink = EncoderSink(encoder, writer)
+                    val encoded = org.json.JSONArray()
+                    val sink = EncoderSink(encoder, writer) { pts, ns ->
+                        encoded.put(JSONObject().put("pts_us", pts).put("output_ns", ns - began))
+                    }
                     encoder.start()
                     GpuFrames(width, height, settings.maxBufferedFrames, surface).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
@@ -370,7 +373,12 @@ class ExportRunner : Instrumentation() {
                                         sink.drain(0)
                                         mark("render.surface", start)
                                         events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
-                                            .put("duration_us", ready.durationUs).put("flushing", flushing))
+                                            .put("duration_us", ready.durationUs).put("flushing", flushing)
+                                            .put("input_ns", item.receivedNs - began)
+                                            .put("analysis_start_ns", ready.analysisStartedNs - began)
+                                            .put("analysis_complete_ns", ready.analysisCompletedNs - began)
+                                            .put("plan_complete_ns", ready.planCompletedNs - began)
+                                            .put("render_start_ns", start - began).put("render_complete_ns", System.nanoTime() - began))
                                         stages.getOrPut("stream.residence") { TimingStatistics() }.add((System.nanoTime()-item.receivedNs)/1e6)
                                         if (rendered == 0) {
                                             firstOutputSeconds = (System.nanoTime()-began)/1e9
@@ -382,6 +390,13 @@ class ExportRunner : Instrumentation() {
                                 val decoded = decode(input, images = images) { image, pts, _ ->
                                     if (received == 0) origin = pts else check(pts > latest)
                                     latest = pts
+                                    if (config.optBoolean("paced")) {
+                                        val target = began + (pts - origin) * 1000
+                                        while (System.nanoTime() < target) {
+                                            drain(false)
+                                            Thread.sleep(1)
+                                        }
+                                    }
                                     val start = System.nanoTime()
                                     val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
                                     mark("decode.capture_proxy", start)
@@ -398,7 +413,7 @@ class ExportRunner : Instrumentation() {
                                 val beforeFlush = rendered
                                 while (!planner.tryFinish()) { drain(false); Thread.sleep(1) }
                                 while (!planner.finished) { drain(true); Thread.sleep(1) }
-                                sink.finish()
+                                timed(stages, "encode.drain_eos") { sink.finish() }
                                 check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
                                 val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
                                     ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
@@ -407,7 +422,7 @@ class ExportRunner : Instrumentation() {
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
                                     .put("mode", "realtime").put("gpu_surface", true)
-                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events)
+                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events).put("encoded_events", encoded)
                                     .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
                                         .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
                                         .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
@@ -419,7 +434,7 @@ class ExportRunner : Instrumentation() {
         } finally { encoder.release() }
     }
 
-    private class EncoderSink(val codec: MediaCodec, val muxer: MediaMuxer) {
+    private class EncoderSink(val codec: MediaCodec, val muxer: MediaMuxer, val onOutput: (Long, Long) -> Unit = { _, _ -> }) {
         private val info = MediaCodec.BufferInfo()
         private var track = -1
         var frames = 0
@@ -438,6 +453,7 @@ class ExportRunner : Instrumentation() {
                         if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                             check(track >= 0) { "Missing muxer track" }
                             muxer.writeSampleData(track, checkNotNull(codec.getOutputBuffer(index)), info)
+                            onOutput(info.presentationTimeUs, System.nanoTime())
                             frames++
                         }
                         eos = eos || info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0

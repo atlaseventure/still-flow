@@ -159,7 +159,10 @@ JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env,
                                 "\",\"count\":" + std::to_string(entry->count) +
                                 ",\"total_ms\":" + std::to_string(entry->total_ms) +
                                 ",\"min_ms\":" + std::to_string(entry->min_ms) +
-                                ",\"max_ms\":" + std::to_string(entry->max_ms) + "}";
+                                ",\"max_ms\":" + std::to_string(entry->max_ms) +
+                                ",\"p50_ms\":" + std::to_string(entry->p50_ms) +
+                                ",\"p95_ms\":" + std::to_string(entry->p95_ms) +
+                                ",\"p99_ms\":" + std::to_string(entry->p99_ms) + "}";
                   },
                   &json, &error),
               error);

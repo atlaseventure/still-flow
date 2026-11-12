@@ -151,6 +151,7 @@ typedef struct sf_profile_entry {
     const char* stage; /* Borrowed for the duration of the visitor callback. */
     uint64_t count;
     double total_ms, min_ms, max_ms;
+    double p50_ms, p95_ms, p99_ms;
 } sf_profile_entry;
 typedef void (*sf_profile_visitor)(void* user_data, const sf_profile_entry* entry);
 /* Visits cumulative aggregates on the calling thread; storage is bounded by

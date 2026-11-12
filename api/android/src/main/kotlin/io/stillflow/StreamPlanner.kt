@@ -12,6 +12,9 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
         @JvmField val ptsUs: Long,
         @JvmField val durationUs: Long,
         internal val map: FloatArray,
+        @JvmField val analysisStartedNs: Long,
+        @JvmField val analysisCompletedNs: Long,
+        @JvmField val planCompletedNs: Long,
     ) {
         fun copyMap(): FloatArray = map.copyOf()
     }
@@ -32,17 +35,21 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
         worker = Thread({
             try {
                 session.use {
+                    val analysisTimes = java.util.ArrayDeque<Pair<Long, Long>>()
                     fun drain() {
                         while (true) {
                             val ready = session.takeReady() ?: break
                             val map = session.takeReadyMap()
-                            outputs.put(PlannedFrame(ready.index, ready.ptsUs, ready.durationUs, map))
+                            val times = analysisTimes.removeFirst()
+                            outputs.put(PlannedFrame(ready.index, ready.ptsUs, ready.durationUs, map, times.first, times.second, System.nanoTime()))
                         }
                     }
                     while (true) {
                         val input = inputs.take()
                         if (input.frame == null) break
+                        val start = System.nanoTime()
                         check(session.tryPush(input.frame, input.pts, input.duration)) { "Analysis buffer was not drained" }
+                        analysisTimes.addLast(Pair(start, System.nanoTime()))
                         drain()
                     }
                     session.finishStream()

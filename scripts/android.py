@@ -90,6 +90,7 @@ def run(args):
     config = android_input(media)
     config.update(
         realtime=args.realtime,
+        paced=args.paced,
         bitrate=args.bitrate,
         horizontalScan=args.horizontal_scan,
         settings={},
@@ -269,6 +270,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
     parser.add_argument("--realtime", action="store_true")
+    parser.add_argument("--paced", action="store_true", help="Pace streaming input by source PTS")
     parser.add_argument("--lookahead", type=float, help="Streaming lookahead in seconds, 0..10")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)

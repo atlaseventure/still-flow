@@ -61,11 +61,7 @@ struct sf_analyzer {
 struct sf_stream {
     c_api::Runtime runtime;
     std::unique_ptr<StreamAnalyzer> analyzer;
-    struct Statistics {
-        uint64_t count = 0;
-        double total = 0, minimum = 0, maximum = 0;
-    };
-    std::map<std::string, Statistics> profile;
+    std::map<std::string, Profile::Statistics> profile;
     bool finished = false;
     Size source;
     void record(const Profile& call) {
@@ -73,10 +69,7 @@ struct sf_stream {
             if (!sample.count)
                 continue;
             auto& stats = profile[name];
-            stats.minimum = stats.count ? std::min(stats.minimum, sample.minimum) : sample.minimum;
-            stats.maximum = stats.count ? std::max(stats.maximum, sample.maximum) : sample.maximum;
-            stats.total += sample.total;
-            stats.count += sample.count;
+            stats.merge(sample);
         }
     }
     StabilizationSettings settings;
@@ -392,7 +385,9 @@ sf_status sf_stream_get_profile(const sf_stream* stream, sf_profile_visitor visi
         if (!stream || !visitor)
             throw std::invalid_argument("Missing stream or profile visitor");
         for (const auto& [stage, stats] : stream->profile) {
-            const sf_profile_entry entry{stage.c_str(), stats.count, stats.total, stats.minimum, stats.maximum};
+            const sf_profile_entry entry{stage.c_str(),          stats.count,           stats.total,
+                                         stats.minimum,          stats.maximum,         stats.percentile(0.50),
+                                         stats.percentile(0.95), stats.percentile(0.99)};
             visitor(data, &entry);
         }
     });
