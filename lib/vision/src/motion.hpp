@@ -1,6 +1,7 @@
 #pragma once
 #include "stillflow/application/profile.hpp"
 #include "stillflow/domain/motion.hpp"
+#include "stillflow/vision/tracking.hpp"
 #include <opencv2/core.hpp>
 namespace stillflow {
 struct FeatureFrame {
@@ -12,11 +13,13 @@ struct FeatureFrame {
 };
 class MotionEstimator {
   public:
-    MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental = false);
+    MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental = false,
+                    std::unique_ptr<SparseTracker> tracker = {});
     Motion estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive = false,
                     const Motion* prediction = nullptr, FeatureFrame* before = nullptr, FeatureFrame* after = nullptr);
 
   private:
+    std::unique_ptr<SparseTracker> tracker_;
     StabilizationSettings options_;
     bool horizontal_, incremental_;
     size_t pairs_ = 0;

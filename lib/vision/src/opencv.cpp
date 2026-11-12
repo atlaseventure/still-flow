@@ -5,8 +5,9 @@ namespace stillflow {
 namespace {
 class OpenCvMotionAnalyzer final : public MotionAnalyzer {
   public:
-    OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal, bool incremental)
-        : incremental_(incremental), estimator_(settings, horizontal, incremental) {}
+    OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal, bool incremental,
+                         std::unique_ptr<SparseTracker> tracker)
+        : incremental_(incremental), estimator_(settings, horizontal, incremental, std::move(tracker)) {}
     Motion estimate(const Image& previous, const Image& current, Profile& profile) override {
         auto before = map_host_image(previous), after = map_host_image(current);
         if (before.format != PixelFormat::gray8 || after.format != PixelFormat::gray8)
@@ -52,8 +53,8 @@ class OpenCvMotionAnalyzer final : public MotionAnalyzer {
 
 } // namespace
 std::unique_ptr<MotionAnalyzer> make_opencv_analyzer(const StabilizationSettings& settings, bool horizontal,
-                                                     bool incremental) {
-    return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal, incremental);
+                                                     bool incremental, std::unique_ptr<SparseTracker> tracker) {
+    return std::make_unique<OpenCvMotionAnalyzer>(settings, horizontal, incremental, std::move(tracker));
 }
 void configure_opencv_threads(int threads) {
     if (threads < 1 || threads > 64)

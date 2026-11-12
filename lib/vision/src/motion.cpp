@@ -1,4 +1,5 @@
 #include "motion.hpp"
+#include "stillflow/application/rendering.hpp"
 #include <Eigen/Dense>
 #include <algorithm>
 #include <array>
@@ -231,8 +232,9 @@ bool scene_cut(const cv::Mat& previous, const cv::Mat& current, double support, 
 }
 
 } // namespace
-MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental)
-    : options_(options), horizontal_(horizontal_scan), incremental_(incremental) {}
+MotionEstimator::MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental,
+                                 std::unique_ptr<SparseTracker> tracker)
+    : tracker_(std::move(tracker)), options_(options), horizontal_(horizontal_scan), incremental_(incremental) {}
 
 Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive,
                                  const Motion* prediction, FeatureFrame* before, FeatureFrame* after) {
@@ -315,7 +317,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
     std::vector<float> forward_error, backward_error;
     {
         ScopeTimer timer(profile, "analysis.track");
-        {
+        const auto build_pyramids = [&] {
             ScopeTimer pyramid_timer(profile, "analysis.pyramid");
             before_.swap(pyramid_);
             if (before && !before->pyramid.empty())
@@ -336,7 +338,9 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
             }
             if (after)
                 after->pyramid = pyramid_;
-        }
+        };
+        if (!tracker_)
+            build_pyramids();
         const bool predicted = incremental_ && consecutive && prediction && prediction->confidence >= 0.7 &&
                                !prediction->reset && prediction->state == MotionState::tracked;
         const bool mobile = options_.analysis_width <= 640 && options_.features <= 600;
@@ -355,6 +359,36 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                 }
             const cv::Size window = fast && mobile ? cv::Size(15, 15) : cv::Size(21, 21);
             const int levels = fast ? 2 : 3;
+            if (tracker_) {
+                std::vector<Point> points, initial;
+                for (size_t i = 0; i < source.size(); ++i) {
+                    points.push_back({source[i].x, source[i].y});
+                    initial.push_back({destination[i].x, destination[i].y});
+                }
+                try {
+                    const auto matches = tracker_->track({{previous.cols, previous.rows}, previous.data, previous.step},
+                                                         {{current.cols, current.rows}, current.data, current.step},
+                                                         points, initial, levels, window.width, profile);
+                    if (matches.size() != source.size())
+                        throw BackendError("Invalid sparse tracking result count");
+                    backward.resize(source.size());
+                    forward_status.resize(source.size());
+                    backward_status.resize(source.size());
+                    forward_error.resize(source.size());
+                    for (size_t i = 0; i < matches.size(); ++i) {
+                        const auto& m = matches[i];
+                        destination[i] = {float(m.destination.x), float(m.destination.y)};
+                        backward[i] = {float(m.backward.x), float(m.backward.y)};
+                        forward_error[i] = float(m.error);
+                        forward_status[i] = backward_status[i] = m.valid;
+                    }
+                    return;
+                } catch (const BackendError&) {
+                    profile.add("analysis.gpu_fallback", 0);
+                    tracker_.reset();
+                    build_pyramids();
+                }
+            }
             const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
             {
                 ScopeTimer forward_timer(profile, "analysis.lk_forward");
