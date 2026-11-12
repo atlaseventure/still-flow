@@ -3,6 +3,7 @@
 #include <cmath>
 
 namespace stillflow {
+
 void validate_stream_settings(const StreamSettings& s) {
     if (!std::isfinite(s.lookahead_seconds) || s.lookahead_seconds < 0 || s.lookahead_seconds > 10 ||
         s.max_buffered_frames < 2 || s.max_buffered_frames > 600)
@@ -212,7 +213,7 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
             candidate.seconds - analysis_.frames[next_].seconds + pts_tolerance >= required)
             break;
     }
-    const auto frames = std::span<const FrameMotion>(analysis_.frames).first(limit);
+    auto frames = std::span<const FrameMotion>(analysis_.frames).first(limit);
     const auto& current = frames[next_];
     const double ahead = frames.back().seconds - current.seconds;
     const bool shot_ended = frames.back().segment != current.segment;
@@ -224,6 +225,12 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
         Profile profile;
         settle_recovery(output_profile ? *output_profile : profile);
     }
+    // The final preview duration cannot depend on whether the producer has
+    // already submitted a frame outside this fixed lookahead window.
+    std::vector<FrameMotion> window(frames.begin(), frames.end());
+    if (limit > next_ + 1 && window.size() > 1)
+        window.back().duration = window.back().seconds - window[window.size() - 2].seconds;
+    frames = window;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
     // Fixed cropping retains the offline constraint neighborhoods. Adaptive
