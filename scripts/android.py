@@ -89,11 +89,10 @@ def run(args):
     media = probe(source)
     config = android_input(media)
     config.update(
-        gpu_surface=args.gpu_surface,
         realtime=args.realtime,
         bitrate=args.bitrate,
         horizontalScan=args.horizontal_scan,
-        settings={"backend": args.backend.upper()},
+        settings={},
     )
     if args.mobile:
         config["settings"].update(analysisWidth=640, features=600)
@@ -218,8 +217,8 @@ def run(args):
         pts_error = matching_timeline(media, probe(output / "output.mp4"))
         if result["frames"] != len(media["timestamps"]):
             raise RuntimeError("Reported frame count mismatch")
-        if args.backend == "gles" and (not result["gpu"] or result["backend"] != "gles"):
-            raise RuntimeError("Requested GLES execution was not active")
+        if not result["gpu"] or result["backend"] != "gles" or not result.get("gpu_surface"):
+            raise RuntimeError("GPU Surface execution was not active")
         manifest.update(device=result, output_sha256=expected, max_pts_difference_seconds=pts_error)
         if args.reference:
             from compare_video import compare
@@ -268,11 +267,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=12)
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
-    parser.add_argument(
-        "--gpu-surface", action="store_true", help="GPU-resident rendering to encoder Surface (Android 10+)"
-    )
     parser.add_argument("--realtime", action="store_true")
-    parser.add_argument("--backend", choices=("auto", "cpu", "gles"), default="gles")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
     parser.add_argument("--features", type=int)
@@ -292,8 +287,6 @@ def main():
     )
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
-    if args.gpu_surface and args.backend == "cpu":
-        parser.error("gpu-surface requires the auto or gles backend")
     if min(args.jobs, args.timeout, args.bitrate) <= 0:
         parser.error("jobs, timeout and bitrate must be positive")
     if args.max_displacement is not None and (
