@@ -10,20 +10,39 @@ import android.opengl.EGLContext
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES30
+import android.opengl.GLES31
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /** Thread-confined GLES context. Frames own textures independently of decoder buffers. */
 @RequiresApi(29)
-class GpuFrames(
+class GpuFrames @JvmOverloads constructor(
     private val width: Int,
     private val height: Int,
     private val capacity: Int,
     encoderSurface: Surface,
+    preferComputeReadback: Boolean = true,
 ) : AutoCloseable {
-    class Frame internal constructor(internal val owner: GpuFrames, internal val texture: Int, internal val buffer: ByteBuffer, val luma: StillFlow.Frame) {
+    internal class Readback(val id: Int) {
+        var bytes = 0
+        var bufferBytes = 0
+        var fence = 0L
+        var texture = 0
+        var textureWidth = 0
+        var textureHeight = 0
+        var compute = false
+        var pixel = false
+    }
+    class Frame internal constructor(
+        internal val owner: GpuFrames, internal val texture: Int,
+        internal val analysisWidth: Int, internal val analysisHeight: Int,
+        internal var transfer: Readback?,
+    ) {
         internal var rendered = false
+        internal var buffer: ByteBuffer? = null
+        internal var analysis: StillFlow.Frame? = null
+        val luma: StillFlow.Frame get() = analysis ?: checkNotNull(owner.readLuma(this, true))
     }
     private val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
     private val version = IntArray(2)
@@ -33,16 +52,24 @@ class GpuFrames(
     private var window: EGLSurface = EGL14.EGL_NO_SURFACE
     private val fbo = IntArray(1)
     private val external = IntArray(1)
-    private val proxy = IntArray(1)
+    private val horizontal = IntArray(1)
     private val free = ConcurrentLinkedQueue<Int>()
     private val proxies = ConcurrentLinkedQueue<ByteBuffer>()
     private val owned = mutableListOf<Int>()
     private var copyProgram = 0
     private var proxyProgram = 0
+    private var horizontalProgram = 0
+    private var verticalProgram = 0
+    private var directCompute = 0
+    private var verticalCompute = 0
+    private var computeCapture = false
+    private var pixelCapture = false
     private var warpProgram = 0
     private var offlineTexture = 0
     private var proxyWidth = 0
     private var proxyHeight = 0
+    private val readbacks = mutableListOf<Readback>()
+    private val availableReadbacks = java.util.ArrayDeque<Readback>()
     private val ownerThread = Thread.currentThread()
     private val previousDisplay = EGL14.eglGetCurrentDisplay()
     private val previousContext = EGL14.eglGetCurrentContext()
@@ -53,11 +80,16 @@ class GpuFrames(
         private set
     var proxyReadbackMs = 0.0
         private set
+    var sourceReleaseWaitMs = 0.0
+        private set
+    var proxyTransferMs = 0.0
+        private set
     var renderSubmitMs = 0.0
         private set
     var surfaceSubmitMs = 0.0
         private set
     val retainedTextureBytes: Long get() = owned.size.toLong() * width * height * 4
+    val readbackBackend: String get() = if (computeCapture) "compute_buffer" else if (pixelCapture) "pixel_buffer" else "texture_readback"
     var device: String = ""
         private set
 
@@ -88,7 +120,15 @@ class GpuFrames(
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         copyProgram = program(YUV_HEADER + COPY)
-        proxyProgram = program(YUV_HEADER + PROXY)
+        proxyProgram = program(PROXY_HEADER + PROXY)
+        horizontalProgram = program(PROXY_HEADER.replace("out vec4 color;", "out uvec4 color;") + HORIZONTAL)
+        verticalProgram = program(VERTICAL)
+        val minor = IntArray(1)
+        GLES30.glGetIntegerv(GLES30.GL_MINOR_VERSION, minor, 0)
+        if (preferComputeReadback && minor[0] >= 1) {
+            directCompute = compute(COMPUTE_HEADER + AREA_LUMA + COMPUTE_DIRECT)
+            verticalCompute = compute(COMPUTE_HEADER.replace("sampler2D", "usampler2D") + VERTICAL_LUMA + COMPUTE_VERTICAL)
+        }
         warpProgram = program(WARP)
         } catch (error: Throwable) {
             close()
@@ -98,8 +138,22 @@ class GpuFrames(
 
     /** Captures exactly one acquired Image. Only the reduced source-Y proxy is read by the CPU. */
     fun capture(image: Image, analysisWidth: Int, analysisHeight: Int, bt709: Boolean, fullRange: Boolean): Frame {
+        val frame = captureAsync(image, analysisWidth, analysisHeight, bt709, fullRange)
+        readLuma(frame, true)
+        return frame
+    }
+
+    /** Releases source reads before returning; finish at most three pending transfers with readLuma(). */
+    fun captureAsync(image: Image, analysisWidth: Int, analysisHeight: Int, bt709: Boolean, fullRange: Boolean): Frame {
         checkThread()
+        require(analysisWidth in 1..width && analysisHeight in 1..height)
         val began = System.nanoTime()
+        val transfer = availableReadbacks.poll() ?: run {
+            check(readbacks.size < minOf(3, capacity)) { "Drain pending luma transfers before capturing another frame" }
+            val id = IntArray(1)
+            GLES30.glGenBuffers(1, id, 0)
+            Readback(id[0]).also { readbacks.add(it) }
+        }
         val texture = free.poll() ?: run {
             check(owned.size < capacity) { "GPU frame cache is full" }
             allocate(width, height).also { owned.add(it) }
@@ -111,39 +165,160 @@ class GpuFrames(
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
             GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, external[0])
             val imported = nativeImport(buffer)
+            var sourceFence = 0L
+            var sourceComplete = false
             try {
                 target(texture, width, height)
                 source(copyProgram, buffer, crop)
                 GLES30.glUniform2f(GLES30.glGetUniformLocation(copyProgram, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
                 GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "fullRange"), if (fullRange) 1 else 0)
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                sourceFence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+                check(sourceFence != 0L)
                 val packedWidth = (analysisWidth + 3) / 4
+                val bytes = packedWidth * analysisHeight * 4
+                // Small storage buffers avoid a pixel transfer; larger two-pass proxies defer texture readback.
+                computeCapture = directCompute != 0 && bytes <= 64 * 1024
+                val separable = width > analysisWidth * 2 || height > analysisHeight * 2
+                pixelCapture = !computeCapture && !separable
                 if (proxyWidth != packedWidth || proxyHeight != analysisHeight) {
-                    if (proxy[0] != 0) GLES30.glDeleteTextures(1, proxy, 0)
-                    proxy[0] = allocate(packedWidth, analysisHeight)
+                    if (horizontal[0] != 0) GLES30.glDeleteTextures(1, horizontal, 0)
+                    horizontal[0] = if (separable) allocate(packedWidth, height, GLES30.GL_RGBA16UI) else 0
                     proxyWidth = packedWidth
                     proxyHeight = analysisHeight
                 }
-                target(proxy[0], packedWidth, analysisHeight)
-                source(proxyProgram, buffer, crop)
-                GLES30.glUniform2f(GLES30.glGetUniformLocation(proxyProgram, "analysisSize"), analysisWidth.toFloat(), analysisHeight.toFloat())
-                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
-                val bytes = packedWidth * analysisHeight * 4
-                val pixels = proxies.poll()?.takeIf { it.capacity() == bytes } ?: ByteBuffer.allocateDirect(bytes)
-                pixels.clear()
+                transfer.compute = computeCapture
+                transfer.pixel = pixelCapture
+                transfer.bytes = bytes
+                if ((computeCapture || pixelCapture) && transfer.bufferBytes != bytes) {
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, transfer.id)
+                    GLES30.glBufferData(GLES30.GL_PIXEL_PACK_BUFFER, bytes, null, GLES30.GL_STREAM_READ)
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+                    transfer.bufferBytes = bytes
+                }
+                if (!computeCapture && (transfer.textureWidth != packedWidth || transfer.textureHeight != analysisHeight)) {
+                    if (transfer.texture != 0) GLES30.glDeleteTextures(1, intArrayOf(transfer.texture), 0)
+                    transfer.texture = allocate(packedWidth, analysisHeight)
+                    transfer.textureWidth = packedWidth
+                    transfer.textureHeight = analysisHeight
+                }
+                if (separable) {
+                    if (horizontal[0] == 0) horizontal[0] = allocate(packedWidth, height, GLES30.GL_RGBA16UI)
+                    target(horizontal[0], packedWidth, height)
+                    proxySource(horizontalProgram, texture, analysisWidth, analysisHeight)
+                    GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                }
+                if (computeCapture) {
+                    proxySource(if (separable) verticalCompute else directCompute,
+                        if (separable) horizontal[0] else texture, analysisWidth, analysisHeight)
+                    GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, transfer.id)
+                    GLES31.glDispatchCompute((packedWidth + 7) / 8, (analysisHeight + 7) / 8, 1)
+                    GLES31.glMemoryBarrier(GLES31.GL_BUFFER_UPDATE_BARRIER_BIT)
+                    GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 0)
+                    GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+                } else if (separable) {
+                    target(transfer.texture, packedWidth, analysisHeight)
+                    proxySource(verticalProgram, horizontal[0], analysisWidth, analysisHeight)
+                    GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                } else {
+                    target(transfer.texture, packedWidth, analysisHeight)
+                    proxySource(proxyProgram, texture, analysisWidth, analysisHeight)
+                    GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                }
+                if (pixelCapture) {
+                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, transfer.id)
+                    GLES30.glReadPixels(0, 0, packedWidth, analysisHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, 0)
+                }
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+                transfer.fence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+                check(transfer.fence != 0L)
+                GLES30.glFlush()
                 val submitted = System.nanoTime()
                 captureSubmitMs = (submitted - began) / 1e6
-                GLES30.glReadPixels(0, 0, packedWidth, analysisHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
+                waitFence(sourceFence, true)
+                sourceComplete = true
+                sourceReleaseWaitMs = (System.nanoTime() - submitted) / 1e6
                 checkGl()
-                proxyReadbackMs = (System.nanoTime() - submitted) / 1e6
-                // Readback orders both capture draws before the decoder buffer is released.
-                return Frame(this, texture, pixels, StillFlow.Frame(analysisWidth, analysisHeight, StillFlow.PixelFormat.GRAY8, packedWidth * 4, pixels))
+                return Frame(this, texture, analysisWidth, analysisHeight, transfer)
             } finally {
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+                if (!sourceComplete) GLES30.glFinish()
+                if (sourceFence != 0L) GLES30.glDeleteSync(sourceFence)
                 nativeRelease(imported)
             }
         } finally {
             buffer.close()
         }
+    }
+
+    /** Poll on the GPU thread; returned luma owns CPU memory until its frame is rendered. */
+    @JvmOverloads
+    fun readLuma(frame: Frame, wait: Boolean = false): StillFlow.Frame? {
+        checkThread()
+        require(frame.owner === this && !frame.rendered)
+        frame.analysis?.let { return it }
+        val transfer = checkNotNull(frame.transfer)
+        val began = System.nanoTime()
+        if (!waitFence(transfer.fence, wait)) return null
+        val ready = System.nanoTime()
+        val pixels = proxies.poll()?.takeIf { it.capacity() == transfer.bytes } ?: ByteBuffer.allocateDirect(transfer.bytes)
+        pixels.clear()
+        if (transfer.compute || transfer.pixel) {
+            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, transfer.id)
+            try {
+                val mapped = GLES30.glMapBufferRange(GLES30.GL_PIXEL_PACK_BUFFER, 0, transfer.bytes, GLES30.GL_MAP_READ_BIT) as? ByteBuffer
+                checkNotNull(mapped) { "GPU luma readback mapping failed" }
+                try {
+                    pixels.clear()
+                    mapped.position(0)
+                    mapped.limit(transfer.bytes)
+                    pixels.put(mapped)
+                    pixels.flip()
+                } finally {
+                    check(GLES30.glUnmapBuffer(GLES30.GL_PIXEL_PACK_BUFFER)) { "GPU luma readback was invalidated" }
+                }
+            } finally {
+                GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+            }
+        } else {
+            target(transfer.texture, (frame.analysisWidth + 3) / 4, frame.analysisHeight)
+            GLES30.glReadPixels(0, 0, (frame.analysisWidth + 3) / 4, frame.analysisHeight,
+                GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
+            pixels.position(0)
+            pixels.limit(transfer.bytes)
+        }
+        GLES30.glDeleteSync(transfer.fence)
+        transfer.fence = 0
+        frame.transfer = null
+        availableReadbacks.add(transfer)
+        frame.buffer = pixels
+        val luma = StillFlow.Frame(frame.analysisWidth, frame.analysisHeight, StillFlow.PixelFormat.GRAY8,
+            ((frame.analysisWidth + 3) / 4) * 4, pixels)
+        frame.analysis = luma
+        proxyReadbackMs = (System.nanoTime() - began) / 1e6
+        proxyTransferMs = (System.nanoTime() - ready) / 1e6
+        checkGl()
+        return luma
+    }
+
+    private fun waitFence(fence: Long, wait: Boolean): Boolean {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        do {
+            when (GLES30.glClientWaitSync(fence, 0, if (wait) 1_000_000L else 0L)) {
+                GLES30.GL_ALREADY_SIGNALED, GLES30.GL_CONDITION_SATISFIED -> return true
+                GLES30.GL_TIMEOUT_EXPIRED -> if (!wait) return false
+                else -> error("GPU synchronization failed")
+            }
+        } while (System.nanoTime() < deadline)
+        error("GPU synchronization timed out")
+    }
+
+    private fun proxySource(program: Int, texture: Int, analysisWidth: Int, analysisHeight: Int) {
+        GLES30.glUseProgram(program)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "source"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "sourceSize"), width.toFloat(), height.toFloat())
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "analysisSize"), analysisWidth.toFloat(), analysisHeight.toFloat())
     }
 
     fun render(frame: Frame, plan: StreamPlanner.PlannedFrame, originUs: Long) = render(frame, plan.map, plan.ptsUs - originUs)
@@ -152,10 +327,11 @@ class GpuFrames(
     fun render(frame: Frame, map: FloatArray, ptsUs: Long) {
         checkThread()
         require(frame.owner === this && !frame.rendered) { "Frame is foreign or already consumed" }
+        readLuma(frame, true)
         renderTexture(frame.texture, map, ptsUs)
         frame.rendered = true
         free.add(frame.texture)
-        proxies.add(frame.buffer)
+        proxies.add(checkNotNull(frame.buffer))
     }
 
     /** Render one decoded Image with an offline map; the caller may close the Image on return. */
@@ -236,11 +412,18 @@ class GpuFrames(
         GLES30.glFinish()
         GLES30.glDeleteProgram(copyProgram)
         GLES30.glDeleteProgram(proxyProgram)
+        GLES30.glDeleteProgram(horizontalProgram)
+        GLES30.glDeleteProgram(verticalProgram)
+        GLES30.glDeleteProgram(directCompute)
+        GLES30.glDeleteProgram(verticalCompute)
         GLES30.glDeleteProgram(warpProgram)
         GLES30.glDeleteTextures(owned.size, owned.toIntArray(), 0)
         GLES30.glDeleteTextures(1, intArrayOf(offlineTexture), 0)
         GLES30.glDeleteTextures(1, external, 0)
-        GLES30.glDeleteTextures(1, proxy, 0)
+        GLES30.glDeleteTextures(readbacks.size, readbacks.map { it.texture }.toIntArray(), 0)
+        GLES30.glDeleteTextures(1, horizontal, 0)
+        readbacks.forEach { if (it.fence != 0L) GLES30.glDeleteSync(it.fence) }
+        GLES30.glDeleteBuffers(readbacks.size, readbacks.map { it.id }.toIntArray(), 0)
         GLES30.glDeleteFramebuffers(1, fbo, 0)
         }
         EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
@@ -254,13 +437,14 @@ class GpuFrames(
         @JvmStatic private external fun nativeImport(buffer: HardwareBuffer): Long
         @JvmStatic private external fun nativeRelease(image: Long)
         private fun checkGl() { check(GLES30.glGetError() == GLES30.GL_NO_ERROR) { "GLES operation failed" } }
-        private fun allocate(width: Int, height: Int): Int {
+        private fun allocate(width: Int, height: Int, format: Int = GLES30.GL_RGBA8): Int {
             val id = IntArray(1)
             GLES30.glGenTextures(1, id, 0)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, id[0])
-            GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, GLES30.GL_RGBA8, width, height)
-            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, format, width, height)
+            val filter = if (format == GLES30.GL_RGBA8) GLES30.GL_LINEAR else GLES30.GL_NEAREST
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, filter)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, filter)
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
             return id[0]
@@ -290,6 +474,21 @@ class GpuFrames(
             check(status[0] != 0) { GLES30.glGetProgramInfoLog(id) }
             return id
         }
+        private fun compute(source: String): Int {
+            val shader = GLES30.glCreateShader(GLES31.GL_COMPUTE_SHADER)
+            GLES30.glShaderSource(shader, source)
+            GLES30.glCompileShader(shader)
+            val status = IntArray(1)
+            GLES30.glGetShaderiv(shader, GLES30.GL_COMPILE_STATUS, status, 0)
+            check(status[0] != 0) { GLES30.glGetShaderInfoLog(shader) }
+            val id = GLES30.glCreateProgram()
+            GLES30.glAttachShader(id, shader)
+            GLES30.glLinkProgram(id)
+            GLES30.glDeleteShader(shader)
+            GLES30.glGetProgramiv(id, GLES30.GL_LINK_STATUS, status, 0)
+            check(status[0] != 0) { GLES30.glGetProgramInfoLog(id) }
+            return id
+        }
         private val YUV_HEADER = """#version 300 es
             #extension GL_EXT_YUV_target : require
             precision highp float;
@@ -307,24 +506,92 @@ class GpuFrames(
                 float y=fullRange!=0 ? yuv.x : (yuv.x-16.0/255.0)*255.0/219.0;
                 vec2 uv=(yuv.yz-vec2(128.0/255.0))*(fullRange!=0 ? 1.0 : 255.0/224.0);
                 float kr=coefficients.x,kb=coefficients.y,kg=1.0-kr-kb;
-                color=vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,1);
+                color=vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,yuv.x);
             }
         """.trimIndent()
-        private val PROXY = """
+        private val PROXY_HEADER = """#version 300 es
+            precision highp float;
+            precision highp int;
+            uniform highp sampler2D source;
+            uniform vec2 sourceSize;
             uniform vec2 analysisSize;
+            out vec4 color;
+        """.trimIndent() + "\n"
+        private val AREA_LUMA = """
             float luma(vec2 at) {
-                vec2 scale=crop.zw/analysisSize;
+                at=min(at,analysisSize-1.0);
+                vec2 scale=sourceSize/analysisSize;
                 vec2 lo=at*scale,hi=(at+1.0)*scale;
                 float sum=0.0;
                 for(int y=int(floor(lo.y));y<int(ceil(hi.y));++y)
                     for(int x=int(floor(lo.x));x<int(ceil(hi.x));++x) {
                         vec2 p=vec2(x,y);
                         vec2 weight=max(vec2(0),min(hi,p+1.0)-max(lo,p));
-                        sum+=sampleYuv(p+0.5).x*255.0*weight.x*weight.y;
+                        sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).a*255.0*weight.x*weight.y;
                     }
                 return floor(sum/(scale.x*scale.y)+0.5)/255.0;
             }
+        """.trimIndent() + "\n"
+        private val PROXY = AREA_LUMA + """
             void main() { vec2 at=vec2(floor(gl_FragCoord.x)*4.0,floor(gl_FragCoord.y)); color=vec4(luma(at),luma(at+vec2(1,0)),luma(at+vec2(2,0)),luma(at+vec2(3,0))); }
+        """.trimIndent()
+        // Preserve fractional horizontal averages in 8.8 fixed point, rounding to gray8 only after the vertical pass.
+        private val HORIZONTAL = """
+            uint luma(int at,int y) {
+                at=min(at,int(analysisSize.x)-1);
+                float scale=sourceSize.x/analysisSize.x;
+                float lo=float(at)*scale,hi=float(at+1)*scale,sum=0.0;
+                for(int x=int(floor(lo));x<int(ceil(hi));++x)
+                    sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).a*255.0*max(0.0,min(hi,float(x+1))-max(lo,float(x)));
+                return uint(floor(sum*256.0/scale+0.5));
+            }
+            void main() {
+                ivec2 at=ivec2(gl_FragCoord.xy);
+                int x=at.x*4;
+                color=uvec4(luma(x,at.y),luma(x+1,at.y),luma(x+2,at.y),luma(x+3,at.y));
+            }
+        """.trimIndent()
+        private val VERTICAL_LUMA = """
+            vec4 verticalLuma(ivec2 at) {
+                float scale=sourceSize.y/analysisSize.y;
+                float lo=float(at.y)*scale,hi=float(at.y+1)*scale;
+                vec4 sum=vec4(0);
+                for(int y=int(floor(lo));y<int(ceil(hi));++y)
+                    sum+=vec4(texelFetch(source,ivec2(at.x,min(y,int(sourceSize.y)-1)),0))*max(0.0,min(hi,float(y+1))-max(lo,float(y)));
+                return floor(sum/(scale*256.0)+0.5)/255.0;
+            }
+        """.trimIndent() + "\n"
+        private val VERTICAL = PROXY_HEADER.replace("sampler2D", "usampler2D") + VERTICAL_LUMA + """
+            void main() { color=verticalLuma(ivec2(gl_FragCoord.xy)); }
+        """.trimIndent()
+        private val COMPUTE_HEADER = """#version 310 es
+            precision highp float;
+            precision highp int;
+            layout(local_size_x=8,local_size_y=8) in;
+            uniform highp sampler2D source;
+            uniform vec2 sourceSize;
+            uniform vec2 analysisSize;
+            layout(std430,binding=0) writeonly buffer Luma { uint pixels[]; };
+            void storeLuma(ivec2 at,vec4 value) {
+                uvec4 bytes=uvec4(floor(value*255.0+0.5));
+                int stride=(int(analysisSize.x)+3)/4;
+                pixels[at.y*stride+at.x]=bytes.x|(bytes.y<<8)|(bytes.z<<16)|(bytes.w<<24);
+            }
+        """.trimIndent() + "\n"
+        private val COMPUTE_DIRECT = """
+            void main() {
+                ivec2 at=ivec2(gl_GlobalInvocationID.xy);
+                if(at.x>=(int(analysisSize.x)+3)/4 || at.y>=int(analysisSize.y)) return;
+                vec2 p=vec2(at.x*4,at.y);
+                storeLuma(at,vec4(luma(p),luma(p+vec2(1,0)),luma(p+vec2(2,0)),luma(p+vec2(3,0))));
+            }
+        """.trimIndent()
+        private val COMPUTE_VERTICAL = """
+            void main() {
+                ivec2 at=ivec2(gl_GlobalInvocationID.xy);
+                if(at.x>=(int(analysisSize.x)+3)/4 || at.y>=int(analysisSize.y)) return;
+                storeLuma(at,verticalLuma(at));
+            }
         """.trimIndent()
         private val WARP = """#version 300 es
             precision highp float;
@@ -365,7 +632,7 @@ class GpuFrames(
                     int a=cell.y*meshSize.x+cell.x,b=a+meshSize.x;
                     p=target-mix(mix(offsets[a],offsets[a+1],f.x),mix(offsets[b],offsets[b+1],f.x),f.y);
                 }
-                color=reconstruct(p);
+                color=vec4(reconstruct(p).rgb,1.0);
             }
         """.trimIndent()
     }

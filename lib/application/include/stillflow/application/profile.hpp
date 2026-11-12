@@ -21,17 +21,17 @@ class Profile {
         uint64_t count = 0;
         double total = 0, minimum = 0, maximum = 0;
 
-        void add(double ms) {
+        void add(double ms, uint64_t occurrences = 1) {
             int bucket = 0;
             if (ms >= histogram_min_ms) {
                 const double position = std::log2(ms / histogram_min_ms) * histogram_bins_per_octave;
                 bucket = position >= histogram_bins ? histogram_bins + 1 : 1 + static_cast<int>(position);
             }
-            ++buckets_[bucket];
+            buckets_[bucket] += occurrences;
             minimum = count ? std::min(minimum, ms) : ms;
             maximum = count ? std::max(maximum, ms) : ms;
-            total += ms;
-            ++count;
+            total += ms * occurrences;
+            count += occurrences;
         }
         void merge(const Statistics& other) {
             if (!other.count)
@@ -78,6 +78,10 @@ class Profile {
     void add(const std::string& stage, double ms) {
         if (std::isfinite(ms) && ms >= 0)
             stages_[stage].add(ms);
+    }
+    void count(const std::string& stage, uint64_t occurrences) {
+        if (occurrences)
+            stages_[stage].add(0, occurrences);
     }
     // Profiles are single-threaded; each pipeline thread records its own and merges after joining.
     void merge(const Profile& other) {

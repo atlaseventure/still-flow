@@ -1,5 +1,6 @@
 package io.stillflow
 
+import android.os.Debug
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -7,6 +8,9 @@ import java.util.concurrent.atomic.AtomicReference
 
 /** Bounded analysis worker. Retain input storage until its planned frame is consumed. */
 class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolean, settings: StillFlow.Settings) : AutoCloseable {
+    class CpuProfile internal constructor(@JvmField val analysisMs: Double, @JvmField val planningMs: Double)
+    private var analysisCpuNs = 0L
+    private var planningCpuNs = 0L
     class PlannedFrame internal constructor(
         @JvmField val index: Long,
         @JvmField val ptsUs: Long,
@@ -38,7 +42,10 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
                     val analysisTimes = java.util.ArrayDeque<Pair<Long, Long>>()
                     fun drain() {
                         while (true) {
-                            val ready = session.takeReady() ?: break
+                            val cpuStart = Debug.threadCpuTimeNanos()
+                            val ready = session.takeReady()
+                            planningCpuNs += Debug.threadCpuTimeNanos() - cpuStart
+                            if (ready == null) break
                             val map = session.takeReadyMap()
                             val times = analysisTimes.removeFirst()
                             outputs.put(PlannedFrame(ready.index, ready.ptsUs, ready.durationUs, map, times.first, times.second, System.nanoTime()))
@@ -48,7 +55,9 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
                         val input = inputs.take()
                         if (input.frame == null) break
                         val start = System.nanoTime()
+                        val cpuStart = Debug.threadCpuTimeNanos()
                         check(session.tryPush(input.frame, input.pts, input.duration)) { "Analysis buffer was not drained" }
+                        analysisCpuNs += Debug.threadCpuTimeNanos() - cpuStart
                         analysisTimes.addLast(Pair(start, System.nanoTime()))
                         drain()
                     }
@@ -90,6 +99,7 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
 
     val finished: Boolean get() { checkFailure(); return done.get() && outputs.isEmpty() }
     fun profile(): String { check(finished); return profile.get() }
+    fun cpuProfile(): CpuProfile { check(finished); return CpuProfile(analysisCpuNs / 1e6, planningCpuNs / 1e6) }
     private fun checkFailure() {
         failure.get()?.let { throw IllegalStateException("Streaming analysis failed", it) }
         check(!closing.get()) { "Planner is closed" }

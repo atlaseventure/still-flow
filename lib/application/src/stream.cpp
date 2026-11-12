@@ -247,8 +247,18 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
     // streaming needs no offline viewport or historical crop meshes.
     const bool plan_viewports = settings_.crop_mode == CropMode::fixed || initialize_path;
     const size_t output_first = plan_viewports ? static_cast<size_t>(first - frames.begin()) : next_;
-    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0, &planning_, output_first,
-                            std::dynamic_extent, plan_viewports);
+    Profile unused_profile;
+    auto& profile = output_profile ? *output_profile : unused_profile;
+    std::vector<Warp> warps;
+    {
+        ScopeTimer timer(profile, "plan.trajectory");
+        warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0, &planning_, output_first,
+                           std::dynamic_extent, plan_viewports);
+    }
+    const auto work = planning_.work();
+    profile.count("plan.forward_steps", work.forward_steps);
+    profile.count("plan.reused_steps", work.reused_steps);
+    profile.count("plan.reverse_steps", work.reverse_steps);
     const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - frames[next_ - 1].seconds;
     size_t end = next_ + 1;
@@ -256,9 +266,11 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
         ++end;
     auto warp = warps[next_];
     warp.boundary_search_steps = 0;
-    if (settings_.crop_mode != CropMode::fixed)
+    if (settings_.crop_mode != CropMode::fixed) {
+        ScopeTimer timer(profile, "plan.crop");
         crop_.apply(warp, std::span<const Warp>(warps).subspan(next_, end - next_), frames.subspan(next_, end - next_),
                     analysis_.size, settings_, dt, reset);
+    }
     output = {base_ + next_,
               analysis_.origin_us + static_cast<int64_t>(std::llround(current.seconds * 1000000)),
               static_cast<int64_t>(std::llround(current.duration * 1000000)),

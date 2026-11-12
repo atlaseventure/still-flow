@@ -351,11 +351,12 @@ class ExportRunner : Instrumentation() {
                         encoded.put(JSONObject().put("pts_us", pts).put("output_ns", ns - began))
                     }
                     encoder.start()
-                    GpuFrames(width, height, settings.maxBufferedFrames, surface).use { gpu ->
+                    GpuFrames(width, height, settings.maxBufferedFrames, surface, config.optBoolean("computeReadback", true)).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
                             StreamPlanner(width, height, fps, config.getBoolean("horizontalScan"), settings).use { planner ->
                                 data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
                                 val pending = java.util.ArrayDeque<Pending>()
+                                val awaitingAnalysis = java.util.ArrayDeque<Pending>()
                                 val stages = linkedMapOf<String, TimingStatistics>()
                                 fun mark(name: String, start: Long) { stages.getOrPut(name) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6) }
                                 var received = 0
@@ -394,31 +395,49 @@ class ExportRunner : Instrumentation() {
                                         rendered++
                                     }
                                 }
+                                fun submitAnalysis(wait: Boolean) {
+                                    while (awaitingAnalysis.isNotEmpty()) {
+                                        val item = awaitingAnalysis.first()
+                                        val luma = gpu.readLuma(item.frame, wait) ?: break
+                                        stages.getOrPut("decode.proxy_readback_wait") { TimingStatistics() }.add(gpu.proxyReadbackMs)
+                                        stages.getOrPut("decode.proxy_transfer") { TimingStatistics() }.add(gpu.proxyTransferMs)
+                                        while (!planner.trySubmit(luma, item.pts, duration)) {
+                                            drain(false)
+                                            Thread.sleep(1)
+                                        }
+                                        awaitingAnalysis.removeFirst()
+                                    }
+                                }
                                 val decoded = decode(input, images = images) { image, pts, _ ->
                                     if (received == 0) origin = pts else check(pts > latest)
                                     latest = pts
                                     if (config.optBoolean("paced")) {
                                         val target = began + (pts - origin) * 1000
                                         while (System.nanoTime() < target) {
+                                            submitAnalysis(false)
                                             drain(false)
                                             Thread.sleep(1)
                                         }
                                     }
+                                    if (awaitingAnalysis.size >= 2) submitAnalysis(true)
                                     val start = System.nanoTime()
-                                    val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
-                                    mark("decode.capture_proxy", start)
+                                    val synchronous = config.optBoolean("synchronousCapture", false)
+                                    val frame = if (synchronous) gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                                        else gpu.captureAsync(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                                    stages.getOrPut("decode.capture_proxy") { TimingStatistics() }.add(
+                                        (System.nanoTime() - start) / 1e6 - if (synchronous) gpu.proxyReadbackMs else 0.0)
                                     stages.getOrPut("decode.capture_cpu_submit") { TimingStatistics() }.add(gpu.captureSubmitMs)
-                                    stages.getOrPut("decode.proxy_readback_wait") { TimingStatistics() }.add(gpu.proxyReadbackMs)
-                                    pending.addLast(Pending(received.toLong(), pts, frame, start))
-                                    while (!planner.trySubmit(frame.luma, pts, duration)) {
-                                        drain(false)
-                                        Thread.sleep(1)
-                                    }
+                                    stages.getOrPut("decode.source_release_wait") { TimingStatistics() }.add(gpu.sourceReleaseWaitMs)
+                                    val item = Pending(received.toLong(), pts, frame, start)
+                                    pending.addLast(item)
+                                    awaitingAnalysis.addLast(item)
                                     received++
                                     peak = maxOf(peak, pending.size)
+                                    submitAnalysis(false)
                                     drain(false)
                                     if (received % 60 == 0) progress("gpu_stream", received)
                                 }
+                                submitAnalysis(true)
                                 val beforeFlush = rendered
                                 while (!planner.tryFinish()) { drain(false); Thread.sleep(1) }
                                 while (!planner.finished) { drain(true); Thread.sleep(1) }
@@ -428,6 +447,9 @@ class ExportRunner : Instrumentation() {
                                     ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
                                 report.put("peak_rss_mib", peakRss ?: JSONObject.NULL)
                                 report.put("retained_texture_bytes", gpu.retainedTextureBytes)
+                                report.put("readback_backend", gpu.readbackBackend)
+                                val cpu = planner.cpuProfile()
+                                report.put("worker_cpu", JSONObject().put("analysis_ms", cpu.analysisMs).put("planning_ms", cpu.planningMs))
                                 report.put("frames", received).put("width", width).put("height", height)
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)

@@ -87,6 +87,7 @@ template <size_t Passes> class CausalPath {
 using SymmetricPath = CausalPath<trajectory_smoothing_passes / 2>;
 static_assert(trajectory_smoothing_passes % 2 == 0);
 struct PathCache {
+    TrajectoryWork work;
     double seconds = 0;
     int segment = -1;
     bool scanline = false;
@@ -102,6 +103,16 @@ struct TrajectoryCache::Impl {
 };
 TrajectoryCache::TrajectoryCache() : impl(std::make_unique<Impl>()) {}
 TrajectoryCache::~TrajectoryCache() = default;
+TrajectoryWork TrajectoryCache::work() const {
+    TrajectoryWork result;
+    for (size_t i = 0; i < impl->cursor; ++i) {
+        const auto& work = impl->paths[i].work;
+        result.forward_steps += work.forward_steps;
+        result.reused_steps += work.reused_steps;
+        result.reverse_steps += work.reverse_steps;
+    }
+    return result;
+}
 namespace {
 PathCache* cache_slot(TrajectoryCache* cache) {
     if (!cache)
@@ -156,6 +167,8 @@ void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMo
                 Size size, int columns, int rows, double seconds, bool scanline, bool horizontal, PathCache* cache,
                 size_t output_first, size_t output_last) {
     const size_t n = last - first, count = static_cast<size_t>(columns) * rows;
+    if (cache)
+        cache->work = {};
     for (size_t i = std::max(first, output_first); i < std::min(last, output_last); ++i)
         output[i].assign(count, Point{});
     if (seconds <= 0 || n < 2)
@@ -284,12 +297,15 @@ void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMo
         SymmetricPath path;
         for (size_t k = 0; k < total; ++k) {
             if (k == reuse_begin) {
+                next.work.reused_steps += reuse_end - reuse_begin + 1;
                 for (size_t i = k; i <= reuse_end; ++i)
                     forward[i] = cache->forward[vertex][old_begin + i - k];
                 path = cache->snapshot[vertex];
                 k = reuse_end;
-            } else
+            } else {
+                ++next.work.forward_steps;
                 forward[k] = path.advance(delta[k], forward_kernels[k]);
+            }
             if (cache && k == next.at)
                 next.snapshot[vertex] = path;
         }
@@ -302,6 +318,7 @@ void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMo
         SymmetricPath reverse;
         const size_t reverse_end = pad + (std::max(first, output_first) - first);
         for (size_t k = total; k-- > reverse_end;) {
+            ++next.work.reverse_steps;
             const bool last_sample = k + 1 == total;
             const Point delta = last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
             const Point correction = forward[k] + reverse.advance(delta, reverse_kernels[k]);

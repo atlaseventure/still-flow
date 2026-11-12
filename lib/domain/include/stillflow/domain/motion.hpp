@@ -4,12 +4,16 @@
 #include <span>
 
 namespace stillflow {
+struct TrajectoryWork {
+    size_t forward_steps = 0, reused_steps = 0, reverse_steps = 0;
+};
 // Per-stream forward trajectory state. Unchanged evidence is reused after exact FIR support.
 class TrajectoryCache {
   public:
     struct Impl;
     TrajectoryCache();
     ~TrajectoryCache();
+    TrajectoryWork work() const;
     TrajectoryCache(const TrajectoryCache&) = delete;
     TrajectoryCache& operator=(const TrajectoryCache&) = delete;
     std::unique_ptr<Impl> impl;
