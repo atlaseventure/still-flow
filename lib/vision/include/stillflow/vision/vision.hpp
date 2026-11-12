@@ -5,6 +5,7 @@ namespace stillflow {
 class MotionAnalyzer {
   public:
     virtual ~MotionAnalyzer() = default;
+    virtual void adaptive_tracking(bool) {}
     virtual Motion estimate(const Image& previous, const Image& current, Profile& profile) = 0;
 };
 class ImageProcessing {

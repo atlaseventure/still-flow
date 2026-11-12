@@ -19,6 +19,7 @@ class StillFlow(
 
     /** Settings are copied when the session is created. Public fields also support Java callers. */
     class Settings {
+        @JvmField var adaptiveTracking = true
         @JvmField var realtime = false
         @JvmField var lookaheadSeconds = 1.35
         @JvmField var maxBufferedFrames = 120
@@ -89,7 +90,7 @@ class StillFlow(
         width, height, fps, horizontalScan, settings.backend.ordinal, settings.motionEstimator.ordinal,
         settings.analysisWidth, settings.features, settings.bands, settings.cropMode.ordinal,
         settings.rollingShutter, settings.smoothSeconds, settings.rsSeconds, settings.crop, settings.rsStrength,
-        settings.realtime, settings.lookaheadSeconds, settings.maxBufferedFrames,
+        settings.realtime, settings.lookaheadSeconds, settings.maxBufferedFrames, settings.realtime && settings.adaptiveTracking,
     )
 
     constructor(width: Int, height: Int, fps: Double) : this(width, height, fps, false, Settings())
@@ -224,7 +225,7 @@ class StillFlow(
     private fun requireOpen() = check(handle != 0L) { "StillFlow session is closed" }
 
     companion object {
-        init { System.loadLibrary("stillflow_jni") }
+        init { System.loadLibrary("stillflow_jni"); nativeThreads(4) }
 
         /** Configure once before starting analysis workers. */
         @JvmStatic fun configureThreads(threads: Int) = nativeThreads(threads)
@@ -237,7 +238,7 @@ class StillFlow(
             width: Int, height: Int, fps: Double, horizontalScan: Boolean, backend: Int, motionEstimator: Int,
             analysisWidth: Int, features: Int, bands: Int, cropMode: Int, rollingShutter: Boolean,
             smoothSeconds: Double, rsSeconds: Double, crop: Double, rsStrength: Double,
-            realtime: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int,
+            realtime: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int, adaptiveTracking: Boolean,
         ): Long
         @JvmStatic private external fun nativeStreamPush(
             handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,

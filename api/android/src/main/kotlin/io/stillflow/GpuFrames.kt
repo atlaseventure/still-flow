@@ -49,6 +49,15 @@ class GpuFrames(
     private val previousDraw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
     private val previousRead = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
     private var closed = false
+    var captureSubmitMs = 0.0
+        private set
+    var proxyReadbackMs = 0.0
+        private set
+    var renderSubmitMs = 0.0
+        private set
+    var surfaceSubmitMs = 0.0
+        private set
+    val retainedTextureBytes: Long get() = owned.size.toLong() * width * height * 4
     var device: String = ""
         private set
 
@@ -90,6 +99,7 @@ class GpuFrames(
     /** Captures exactly one acquired Image. Only the reduced source-Y proxy is read by the CPU. */
     fun capture(image: Image, analysisWidth: Int, analysisHeight: Int, bt709: Boolean, fullRange: Boolean): Frame {
         checkThread()
+        val began = System.nanoTime()
         val texture = free.poll() ?: run {
             check(owned.size < capacity) { "GPU frame cache is full" }
             allocate(width, height).also { owned.add(it) }
@@ -121,8 +131,11 @@ class GpuFrames(
                 val bytes = packedWidth * analysisHeight * 4
                 val pixels = proxies.poll()?.takeIf { it.capacity() == bytes } ?: ByteBuffer.allocateDirect(bytes)
                 pixels.clear()
+                val submitted = System.nanoTime()
+                captureSubmitMs = (submitted - began) / 1e6
                 GLES30.glReadPixels(0, 0, packedWidth, analysisHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels)
                 checkGl()
+                proxyReadbackMs = (System.nanoTime() - submitted) / 1e6
                 // Readback orders both capture draws before the decoder buffer is released.
                 return Frame(this, texture, pixels, StillFlow.Frame(analysisWidth, analysisHeight, StillFlow.PixelFormat.GRAY8, packedWidth * 4, pixels))
             } finally {
@@ -181,6 +194,7 @@ class GpuFrames(
     }
 
     private fun renderTexture(texture: Int, map: FloatArray, ptsUs: Long) {
+        val began = System.nanoTime()
         require(map.size >= 8 && ptsUs >= 0 && map.all { it.isFinite() })
         val vertices = map[0].toInt() * map[1].toInt()
         require(map[0].toInt() in 2..32 && map[1].toInt() in 2..32 && vertices <= 288 && map.size == 8 + 2 * vertices)
@@ -198,7 +212,10 @@ class GpuFrames(
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
         checkGl()
         check(EGLExt.eglPresentationTimeANDROID(display, window, Math.multiplyExact(ptsUs, 1000)))
+        val submitted = System.nanoTime()
+        renderSubmitMs = (submitted - began) / 1e6
         check(EGL14.eglSwapBuffers(display, window))
+        surfaceSubmitMs = (System.nanoTime() - submitted) / 1e6
     }
 
     private fun target(texture: Int, width: Int, height: Int) {

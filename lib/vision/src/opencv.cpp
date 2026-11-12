@@ -8,6 +8,7 @@ class OpenCvMotionAnalyzer final : public MotionAnalyzer {
     OpenCvMotionAnalyzer(const StabilizationSettings& settings, bool horizontal, bool incremental,
                          std::unique_ptr<SparseTracker> tracker)
         : incremental_(incremental), estimator_(settings, horizontal, incremental, std::move(tracker)) {}
+    void adaptive_tracking(bool enabled) override { estimator_.adaptive_tracking(enabled); }
     Motion estimate(const Image& previous, const Image& current, Profile& profile) override {
         auto before = map_host_image(previous), after = map_host_image(current);
         if (before.format != PixelFormat::gray8 || after.format != PixelFormat::gray8)

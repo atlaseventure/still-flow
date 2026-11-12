@@ -15,6 +15,7 @@ class MotionEstimator {
   public:
     MotionEstimator(const StabilizationSettings& options, bool horizontal_scan, bool incremental = false,
                     std::unique_ptr<SparseTracker> tracker = {});
+    void adaptive_tracking(bool enabled) { adaptive_ = enabled; }
     Motion estimate(const cv::Mat& previous, const cv::Mat& current, Profile& profile, bool consecutive = false,
                     const Motion* prediction = nullptr, FeatureFrame* before = nullptr, FeatureFrame* after = nullptr);
 
@@ -22,6 +23,9 @@ class MotionEstimator {
     std::unique_ptr<SparseTracker> tracker_;
     StabilizationSettings options_;
     bool horizontal_, incremental_;
+    bool adaptive_ = false;
+    int stable_pairs_ = 0, budget_cooldown_ = 0;
+    double information_ = 0;
     size_t pairs_ = 0;
     std::vector<cv::Mat> pyramid_, before_;
     std::vector<cv::Point2f> tracked_;

@@ -332,6 +332,13 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
         *out = result.release();
     });
 }
+sf_status sf_stream_adaptive_tracking(sf_stream* stream, int32_t enabled, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(stream);
+        c_api::boolean(enabled);
+        stream->analyzer->adaptive_tracking(enabled != 0);
+    });
+}
 sf_status sf_stream_push(sf_stream* stream, const sf_image* image, int64_t pts, int64_t duration, sf_error* error) {
     return c_api::boundary(error, [&]() -> sf_status {
         c_api::require(stream);

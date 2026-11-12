@@ -101,6 +101,7 @@ def run(args):
         "motion_estimator": "motionEstimator",
         "vision_threads": "visionThreads",
         "analysis_width": "analysisWidth",
+        "adaptive_tracking": "adaptiveTracking",
         "features": "features",
         "bands": "bands",
         "crop_mode": "cropMode",
@@ -274,8 +275,9 @@ def main():
     parser.add_argument("--lookahead", type=float, help="Streaming lookahead in seconds, 0..10")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
+    parser.add_argument("--adaptive-tracking", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--features", type=int)
-    parser.add_argument("--vision-threads", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--vision-threads", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--mobile", action="store_true")
     parser.add_argument("--bands", type=int)
     parser.add_argument("--crop-mode", choices=("auto", "fixed", "adaptive"))

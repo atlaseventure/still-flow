@@ -169,10 +169,11 @@ class ExportRunner : Instrumentation() {
         val fps = config.getDouble("fps")
         require(width in 32..4096 && height in 32..4096 && width % 2 == 0 && height % 2 == 0 && fps.isFinite() && fps > 0)
         val options = config.getJSONObject("settings")
-        StillFlow.configureThreads(options.optInt("visionThreads", 2))
+        StillFlow.configureThreads(options.optInt("visionThreads", 4))
         val settings = StillFlow.Settings().apply {
             backend = StillFlow.Backend.GLES
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
+            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
             analysisWidth = options.optInt("analysisWidth", analysisWidth)
             features = options.optInt("features", features)
             bands = options.optInt("bands", bands)
@@ -186,6 +187,7 @@ class ExportRunner : Instrumentation() {
         report.put("settings", JSONObject().apply {
             put("backend", settings.backend.name)
             put("motionEstimator", settings.motionEstimator.name)
+            put("adaptiveTracking", settings.adaptiveTracking)
             put("analysisWidth", settings.analysisWidth)
             put("features", settings.features)
             put("bands", settings.bands)
@@ -292,11 +294,12 @@ class ExportRunner : Instrumentation() {
         val fps = config.getDouble("fps")
         require(width in 32..4096 && height in 32..4096 && width % 2 == 0 && height % 2 == 0 && fps.isFinite() && fps > 0)
         val options = config.getJSONObject("settings")
-        StillFlow.configureThreads(options.optInt("visionThreads", 2))
+        StillFlow.configureThreads(options.optInt("visionThreads", 4))
         val settings = StillFlow.Settings().apply {
             lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
             backend = StillFlow.Backend.GLES
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
+            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
             analysisWidth = options.optInt("analysisWidth", analysisWidth)
             features = options.optInt("features", features)
             bands = options.optInt("bands", bands)
@@ -310,6 +313,7 @@ class ExportRunner : Instrumentation() {
         report.put("settings", JSONObject().apply {
             put("backend", settings.backend.name)
             put("motionEstimator", settings.motionEstimator.name)
+            put("adaptiveTracking", settings.adaptiveTracking)
             put("analysisWidth", settings.analysisWidth)
             put("features", settings.features)
             put("bands", settings.bands)
@@ -370,6 +374,9 @@ class ExportRunner : Instrumentation() {
                                         val start = System.nanoTime()
                                         sink.drain(0)
                                         gpu.render(item.frame, ready, origin)
+                                        val renderCompleted = System.nanoTime()
+                                        stages.getOrPut("render.cpu_submit") { TimingStatistics() }.add(gpu.renderSubmitMs)
+                                        stages.getOrPut("render.surface_submit_wait") { TimingStatistics() }.add(gpu.surfaceSubmitMs)
                                         sink.drain(0)
                                         mark("render.surface", start)
                                         events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
@@ -378,7 +385,7 @@ class ExportRunner : Instrumentation() {
                                             .put("analysis_start_ns", ready.analysisStartedNs - began)
                                             .put("analysis_complete_ns", ready.analysisCompletedNs - began)
                                             .put("plan_complete_ns", ready.planCompletedNs - began)
-                                            .put("render_start_ns", start - began).put("render_complete_ns", System.nanoTime() - began))
+                                            .put("render_start_ns", start - began).put("render_complete_ns", renderCompleted - began))
                                         stages.getOrPut("stream.residence") { TimingStatistics() }.add((System.nanoTime()-item.receivedNs)/1e6)
                                         if (rendered == 0) {
                                             firstOutputSeconds = (System.nanoTime()-began)/1e9
@@ -400,6 +407,8 @@ class ExportRunner : Instrumentation() {
                                     val start = System.nanoTime()
                                     val frame = gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
                                     mark("decode.capture_proxy", start)
+                                    stages.getOrPut("decode.capture_cpu_submit") { TimingStatistics() }.add(gpu.captureSubmitMs)
+                                    stages.getOrPut("decode.proxy_readback_wait") { TimingStatistics() }.add(gpu.proxyReadbackMs)
                                     pending.addLast(Pending(received.toLong(), pts, frame, start))
                                     while (!planner.trySubmit(frame.luma, pts, duration)) {
                                         drain(false)
@@ -418,6 +427,7 @@ class ExportRunner : Instrumentation() {
                                 val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
                                     ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
                                 report.put("peak_rss_mib", peakRss ?: JSONObject.NULL)
+                                report.put("retained_texture_bytes", gpu.retainedTextureBytes)
                                 report.put("frames", received).put("width", width).put("height", height)
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)

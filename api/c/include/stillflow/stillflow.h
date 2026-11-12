@@ -138,6 +138,8 @@ typedef struct sf_stream_settings {
 SF_API sf_stream_settings sf_stream_settings_default(void);
 SF_API sf_status sf_stream_create(const sf_settings*, const sf_stream_settings*, const sf_video*, const sf_runtime*,
                                   sf_stream**, sf_error*);
+/* Configure adaptive feature quotas before the first input. */
+SF_API sf_status sf_stream_adaptive_tracking(sf_stream*, int32_t enabled, sf_error*);
 /* OK accepts one frame; AGAIN means full and consumes nothing. Drain after
    pushes, then retry the same frame or drop it. The host retains full-sized
    frames until their frame plan arrives. Capacity/shot boundaries can shorten

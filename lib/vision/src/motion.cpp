@@ -242,10 +242,33 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         pyramid_.clear();
         tracked_.clear();
         descriptors_ready_ = false;
+        stable_pairs_ = 0;
+        information_ = 0;
     }
     const bool cached_descriptors = descriptors_ready_;
     descriptors_ready_ = false;
-    const auto carried = incremental_ && (++pairs_ % 15 != 0) ? std::move(tracked_) : std::vector<cv::Point2f>{};
+    ++pairs_;
+    const bool stable = adaptive_ && consecutive && prediction && prediction->state == MotionState::tracked &&
+                        !prediction->reset && prediction->confidence >= 0.6 && prediction->model_consistency >= 0.7 &&
+                        prediction->coverage >= 0.6 && prediction->spatial_span >= 0.14 && information_ >= 0.04 &&
+                        (options_.bands == 0 || prediction->rs_confidence >= 0.6);
+    if (prediction && (prediction->state != MotionState::tracked || prediction->confidence < .55 ||
+                       prediction->model_consistency < .4))
+        budget_cooldown_ = 60;
+    else if (budget_cooldown_ > 0)
+        --budget_cooldown_;
+    stable_pairs_ = stable && budget_cooldown_ == 0 ? stable_pairs_ + 1 : 0;
+    const bool budgeted = adaptive_ && stable_pairs_ >= 6;
+    const int budget = std::min(options_.features, stable_pairs_ >= 12  ? 600
+                                                   : stable_pairs_ >= 6 ? 900
+                                                                        : options_.features);
+    if (adaptive_)
+        profile.add(budget <= 600   ? "analysis.budget_600"
+                    : budget <= 900 ? "analysis.budget_900"
+                                    : "analysis.budget_full",
+                    0);
+    const auto carried =
+        incremental_ && (budgeted || pairs_ % 15 != 0) ? std::move(tracked_) : std::vector<cv::Point2f>{};
     tracked_.clear();
     Motion result;
     result.row_delta.resize(options_.bands);
@@ -284,11 +307,12 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                     cv::Rect roi(x * previous.cols / columns, y * previous.rows / rows,
                                  (x + 1) * previous.cols / columns - x * previous.cols / columns,
                                  (y + 1) * previous.rows / rows - y * previous.rows / rows);
-                    const size_t quota = static_cast<size_t>(std::max(1, options_.features / (columns * rows)));
+                    const size_t quota = static_cast<size_t>(std::max(1, budget / (columns * rows)));
                     std::vector<cv::Point2f> cell;
                     for (const auto point : carried)
-                        if (cell.size() < quota && point.x >= roi.x && point.x < roi.x + roi.width &&
-                            point.y >= roi.y && point.y < roi.y + roi.height)
+                        if ((!budgeted || (y * columns + x) % 15 != pairs_ % 15) && cell.size() < quota &&
+                            point.x >= roi.x && point.x < roi.x + roi.width && point.y >= roi.y &&
+                            point.y < roi.y + roi.height)
                             cell.push_back(point);
                     if (cell.size() < quota / 2 || cell.empty()) {
                         std::vector<cv::Point2f> points;
@@ -590,6 +614,22 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         const double trust = std::clamp((result.rs_confidence - 0.25) / 0.45, 0.0, 1.0);
         for (int j = 0; j < bands; ++j)
             result.row_delta[j] = Point(parameters(4 + 2 * j), parameters(5 + 2 * j)) * trust;
+    }
+    if (adaptive_) {
+        // Normalized similarity-model information. Keep the weakest direction
+        // observable before reducing per-cell quotas; row-band coverage is gated separately.
+        Eigen::Matrix4d information = Eigen::Matrix4d::Zero();
+        double total = 0;
+        for (size_t i = 0; i < p.size(); ++i) {
+            const double x = (p[i].x - center.x) / norm, y = (p[i].y - center.y) / norm;
+            Eigen::Matrix<double, 2, 4> jacobian;
+            jacobian << x, -y, 1, 0, y, x, 0, 1;
+            const double weight = reliability[i] / (1 + std::pow(residuals[i] / (3 * pixel_scale), 2));
+            information.noalias() += weight * jacobian.transpose() * jacobian;
+            total += weight;
+        }
+        information_ =
+            total > 0 ? Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d>(information / total).eigenvalues()(0) : 0;
     }
     if (incremental_)
         for (size_t i = 0; i < q.size(); ++i)

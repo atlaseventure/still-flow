@@ -193,7 +193,7 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
     JNIEnv* env, jclass, jint width, jint height, jdouble fps, jboolean horizontal_scan, jint backend,
     jint motion_estimator, jint analysis_width, jint features, jint bands, jint crop_mode, jboolean rolling_shutter,
     jdouble smooth_seconds, jdouble rs_seconds, jdouble crop, jdouble rs_strength, jboolean realtime,
-    jdouble lookahead_seconds, jint max_buffered_frames) {
+    jdouble lookahead_seconds, jint max_buffered_frames, jboolean adaptive_tracking) {
     jlong result = 0;
     boundary(env, [&] {
         sf_settings settings{analysis_width,   features,       bands,      crop_mode, rolling_shutter,
@@ -216,7 +216,10 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeCreate(
             const auto status = sf_stream_create(&settings, &streaming, &video, nullptr, &stream, &error);
             owner->stream.reset(stream);
             check(status, error);
+            check(sf_stream_adaptive_tracking(stream, adaptive_tracking, &error), error);
         } else {
+            if (adaptive_tracking)
+                throw Failure(SF_INVALID_ARGUMENT, "Adaptive tracking requires streaming");
             sf_analyzer* analyzer = nullptr;
             const auto status = sf_analyzer_create(&settings, &video, nullptr, &analyzer, &error);
             owner->analyzer.reset(analyzer);

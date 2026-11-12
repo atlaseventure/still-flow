@@ -41,6 +41,12 @@ void StreamAnalyzer::settle_recovery(Profile& profile) {
             frame.motion = std::move(result.frames[i].motion);
     }
 }
+void StreamAnalyzer::adaptive_tracking(bool enabled) {
+    if (!analysis_.frames.empty() || finished_)
+        throw std::logic_error("Configure tracking before input");
+    if (motion_)
+        motion_->adaptive_tracking(enabled);
+}
 bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
     execution_.check();
     if (finished_)
