@@ -260,6 +260,8 @@ namespace {
 void advance_inset(double& inset, double& velocity, double desired, double budget, double dt) {
     // Integrate at bounded steps so irregular presentation times use the same
     // acceleration limit. Zoom out slowly; preview starts zooming in early.
+    // Longer intervals exceed the slowest full-budget travel and settling time.
+    dt = std::min(dt, 2 * budget / 0.003 + 1);
     while (dt > 1e-9) {
         const double step = std::min(dt, 1.0 / 120);
         const double error = desired - inset;
@@ -285,7 +287,8 @@ void StreamCrop::apply(Warp& warp, std::span<const Warp> future, std::span<const
     double desired = 0;
     for (const auto& item : future) {
         edges.push_back(measure_edges(item, size));
-        strengths.push_back(std::min(item.geometry_strength, item.tracking_strength));
+        const double gradient = gradient_bound(item, size);
+        strengths.push_back(std::min(gradient > 0.25 ? 0.25 / gradient : 1, item.tracking_strength));
         const auto bounds = edges.back().at(strengths.back());
         desired = std::max({desired, bounds.left, bounds.top, 1 - bounds.right, 1 - bounds.bottom});
     }
@@ -354,6 +357,8 @@ void StreamCrop::apply(Warp& warp, std::span<const Warp> future, std::span<const
             break;
     }
     previous_bias_ = bias_.front();
+    const double gradient = gradient_bound(warp, size);
+    warp.geometry_strength = gradient > 0.25 ? 0.25 / gradient : 1;
     const double base = strengths.front();
     if (base > 1e-6) {
         const Point adjustment{previous_bias_.x * (size.width - 1) / base, previous_bias_.y * (size.height - 1) / base};

@@ -53,14 +53,18 @@ template <size_t Passes> class CausalPath {
   public:
     Point advance(Point delta, const PathKernel& kernel) {
         Point correction;
+        std::array<size_t, 6> indices{};
+        for (size_t lag = 0; lag < kernel.count; ++lag)
+            indices[lag] = (cursor_ + 5 - lag) % 6;
+        const double reciprocal = 1 / kernel.denominator;
         for (auto& pass : passes_) {
             const Point input = correction;
             for (size_t lag = 0; lag < kernel.count; ++lag) {
-                auto& position = pass[(cursor_ + 5 - lag) % 6];
+                auto& position = pass[indices[lag]];
                 position = position - delta;
                 correction = correction + position * kernel.weights[lag];
             }
-            correction = correction * (1 / kernel.denominator);
+            correction = correction * reciprocal;
             pass[cursor_] = input;
         }
         cursor_ = (cursor_ + 1) % 6;
@@ -296,7 +300,8 @@ void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMo
         // Smooth S_f = X + forward in reversed time. The step from k+1 to k is
         // S_f[k] - S_f[k+1]; the result is relative to S_f, so both add up.
         SymmetricPath reverse;
-        for (size_t k = total; k-- > 0;) {
+        const size_t reverse_end = pad + (std::max(first, output_first) - first);
+        for (size_t k = total; k-- > reverse_end;) {
             const bool last_sample = k + 1 == total;
             const Point delta = last_sample ? Point{} : extended[k] + forward[k] - extended[k + 1] - forward[k + 1];
             const Point correction = forward[k] + reverse.advance(delta, reverse_kernels[k]);
@@ -325,7 +330,7 @@ void plan_paths(std::vector<std::vector<Point>>& output, std::span<const FrameMo
 
 std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size size, const StabilizationSettings& options,
                              bool horizontal, bool first_shot_start, TrajectoryCache* cache, size_t output_first,
-                             size_t output_last) {
+                             size_t output_last, bool plan_viewports) {
     if (size.width < 2 || size.height < 2 || options.bands < 4 || options.bands > 32)
         throw std::invalid_argument("Invalid trajectory geometry");
     output_last = std::min(output_last, frames.size());
@@ -386,6 +391,11 @@ std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size size, con
                 row_energy += r.dot(r);
             }
         warp.row_correction_rms = std::sqrt(row_energy / count);
+    }
+    if (!plan_viewports) {
+        if (cache)
+            cache->impl->paths.resize(cache->impl->cursor);
+        return output;
     }
     plan_crops(frames.subspan(output_first, output_last - output_first),
                std::span<Warp>(output).subspan(output_first, output_last - output_first), size, options);

@@ -170,11 +170,22 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
         return false;
     auto fixed = settings_;
     fixed.crop_mode = CropMode::fixed;
-    // Two crop passes each have one second of finite constraint support.
+    // Fixed cropping retains the offline constraint neighborhoods. Adaptive
+    // streams constrain only the preview meshes with their own controller.
     const auto first = std::lower_bound(frames.begin(), frames.end(), current.seconds - 2.0 - 2e-6,
                                         [](const auto& frame, double seconds) { return frame.seconds < seconds; });
-    const size_t output_first = static_cast<size_t>(first - frames.begin());
-    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0, &planning_, output_first);
+    size_t shot_start = next_;
+    while (shot_start > 0 && frames[shot_start - 1].segment == current.segment && !frames[shot_start].motion.reset)
+        --shot_start;
+    const bool known_start = base_ == 0 || shot_start > 0 || frames[shot_start].motion.reset;
+    const bool initialize_path =
+        known_start && current.seconds - frames[shot_start].seconds < 3 * settings_.smooth_seconds;
+    // Keep endpoint path relaxation for fast opening pans; steady-state
+    // streaming needs no offline viewport or historical crop meshes.
+    const bool plan_viewports = settings_.crop_mode == CropMode::fixed || initialize_path;
+    const size_t output_first = plan_viewports ? static_cast<size_t>(first - frames.begin()) : next_;
+    auto warps = plan_warps(frames, analysis_.size, fixed, analysis_.horizontal, base_ == 0, &planning_, output_first,
+                            std::dynamic_extent, plan_viewports);
     const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - frames[next_ - 1].seconds;
     size_t end = next_ + 1;

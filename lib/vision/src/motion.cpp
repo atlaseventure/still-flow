@@ -288,7 +288,12 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         cv::buildOpticalFlowPyramid(current, pyramid_, {21, 21}, 3);
         const bool predicted = incremental_ && consecutive && prediction && prediction->confidence >= 0.7 &&
                                !prediction->reset && prediction->state == MotionState::tracked;
-        const bool light = predicted && options_.analysis_width <= 640 && options_.features <= 600 &&
+        const bool mobile = options_.analysis_width <= 640 && options_.features <= 600;
+        // Strong parallax needs the full coarse search even when most matches
+        // pass the round-trip check. Reserve the shallow desktop search for
+        // spatially supported, nearly rigid motion.
+        const bool light = predicted &&
+                           (mobile || (prediction->model_consistency >= 0.9 && prediction->coverage >= 0.8)) &&
                            stillflow::norm(transform(prediction->step, center) - center) < norm * 0.04;
         const auto track = [&](bool fast) {
             destination = source;
@@ -297,7 +302,7 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                     const auto p = transform(prediction->step, {source[i].x, source[i].y});
                     destination[i] = {static_cast<float>(p.x), static_cast<float>(p.y)};
                 }
-            const cv::Size window = fast ? cv::Size(15, 15) : cv::Size(21, 21);
+            const cv::Size window = fast && mobile ? cv::Size(15, 15) : cv::Size(21, 21);
             const int levels = fast ? 2 : 3;
             const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
             cv::calcOpticalFlowPyrLK(before_, pyramid_, source, destination, forward_status, forward_error, window,
@@ -306,6 +311,8 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
             cv::calcOpticalFlowPyrLK(pyramid_, before_, destination, backward, backward_status, backward_error, window,
                                      levels, criteria, cv::OPTFLOW_USE_INITIAL_FLOW);
         };
+        if (light)
+            profile.add("analysis.predicted_track", 0);
         track(light);
         if (light) {
             size_t good = 0;
