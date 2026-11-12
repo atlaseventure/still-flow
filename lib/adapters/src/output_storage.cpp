@@ -6,7 +6,6 @@
 #include <fstream>
 #include <iomanip>
 #include <nlohmann/json.hpp>
-#include <numeric>
 #include <opencv2/core/version.hpp>
 #include <set>
 #include <stdexcept>
@@ -85,16 +84,16 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
 
 nlohmann::json profile_json(const Profile& profile) {
     auto result = nlohmann::json::object();
-    for (const auto& [name, values] : profile.samples()) {
-        if (values.empty())
+    for (const auto& [name, stats] : profile.stages()) {
+        if (!stats.count)
             continue;
-        auto sorted = values;
-        std::sort(sorted.begin(), sorted.end());
-        const double total = std::accumulate(sorted.begin(), sorted.end(), 0.0);
-        auto percentile = [&](double p) { return sorted[static_cast<size_t>(p * (sorted.size() - 1))]; };
-        result[name] = {{"calls", sorted.size()},     {"total_ms", total},          {"mean_ms", total / sorted.size()},
-                        {"p50_ms", percentile(0.50)}, {"p95_ms", percentile(0.95)}, {"p99_ms", percentile(0.99)},
-                        {"max_ms", sorted.back()}};
+        result[name] = {{"calls", stats.count},
+                        {"total_ms", stats.total},
+                        {"mean_ms", stats.total / stats.count},
+                        {"p50_ms", stats.percentile(0.50)},
+                        {"p95_ms", stats.percentile(0.95)},
+                        {"p99_ms", stats.percentile(0.99)},
+                        {"max_ms", stats.maximum}};
     }
     return result;
 }
@@ -179,7 +178,7 @@ class LocalOutputStorage final : public OutputStorage {
             }
         }
         nlohmann::json report{
-            {"schema_version", 9},
+            {"schema_version", 10},
             {"version", STILLFLOW_VERSION},
             {"input", fs::absolute(options.input).string()},
             {"output", fs::absolute(options.output).string()},
@@ -259,6 +258,11 @@ class LocalOutputStorage final : public OutputStorage {
               {"configuration", "debug"}
 #endif
              }},
+            {"profiling",
+             {{"percentile_method", "logarithmic_histogram_midpoint"},
+              {"histogram_min_ms", Profile::histogram_min_ms},
+              {"histogram_bins_per_octave", Profile::histogram_bins_per_octave},
+              {"histogram_bins", Profile::histogram_bins}}},
             {"stages", profile_json(data.profile)}};
         if (options.realtime) {
             report["trajectory"]["method"] = "fixed_lag_confidence_mesh";

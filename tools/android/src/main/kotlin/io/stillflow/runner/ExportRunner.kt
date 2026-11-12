@@ -50,6 +50,21 @@ class ExportRunner : Instrumentation() {
         }
     }
 
+    private fun timingJson(stages: Map<String, TimingStatistics>) = JSONObject().apply {
+        stages.forEach { (name, stats) ->
+            put(name, JSONObject().put("calls", stats.count).put("total_ms", stats.total)
+                .put("mean_ms", if (stats.count == 0L) 0.0 else stats.total / stats.count)
+                .put("p50_ms", stats.percentile(0.50)).put("p95_ms", stats.percentile(0.95))
+                .put("p99_ms", stats.percentile(0.99)).put("max_ms", stats.maximum))
+        }
+    }
+
+    private fun profilingJson() = JSONObject()
+        .put("percentile_method", "logarithmic_histogram_midpoint")
+        .put("histogram_min_ms", TimingStatistics.HISTOGRAM_MIN_MS)
+        .put("histogram_bins_per_octave", TimingStatistics.HISTOGRAM_BINS_PER_OCTAVE)
+        .put("histogram_bins", TimingStatistics.HISTOGRAM_BINS)
+
     private fun progress(stage: String, frames: Int) {
         val event = JSONObject().put("stage", stage).put("frames", frames)
         sendStatus(0, Bundle().apply { putString("stream", "STILLFLOW_EVENT $event\n") })
@@ -291,9 +306,9 @@ class ExportRunner : Instrumentation() {
             .put("lookaheadSeconds", settings.lookaheadSeconds).put("maxBufferedFrames", settings.maxBufferedFrames)
         val durationUs = Math.round(1_000_000 / fps)
         val began = System.nanoTime()
-        val stages = linkedMapOf<String, MutableList<Double>>()
+        val stages = linkedMapOf<String, TimingStatistics>()
         fun mark(stage: String, start: Long) {
-            stages.getOrPut(stage) { mutableListOf() }.add((System.nanoTime() - start) / 1e6)
+            stages.getOrPut(stage) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6)
         }
         data class Pending(val index: Long, val pts: Long, val pixels: ByteBuffer, val received: Long)
         val pending = java.util.ArrayDeque<Pending>()
@@ -349,8 +364,8 @@ class ExportRunner : Instrumentation() {
                         val ahead = (latestPts - ready.ptsUs) / 1e6
                         if (ahead + 2e-6 < settings.lookaheadSeconds) shortened++
                         val residence = (System.nanoTime() - item.received) / 1e6
-                        stages.getOrPut("stream.residence") { mutableListOf() }.add(residence)
-                        stages.getOrPut("stream.lookahead") { mutableListOf() }.add(ahead * 1000)
+                        stages.getOrPut("stream.residence") { TimingStatistics() }.add(residence)
+                        stages.getOrPut("stream.lookahead") { TimingStatistics() }.add(ahead * 1000)
                         frameEvents.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
                             .put("duration_us", ready.durationUs).put("lookahead_seconds", ahead)
                             .put("residence_ms", residence).put("flushing", flushing))
@@ -396,21 +411,13 @@ class ExportRunner : Instrumentation() {
                 report.put("native_profile", org.json.JSONArray(session.profile()))
                 val renderer = session.rendererInfo()
                 val total = (System.nanoTime() - began) / 1e9
-                val stageJson = JSONObject()
-                stages.forEach { (name, values) ->
-                    val ordered = values.sorted()
-                    fun percentile(p: Double) = ordered[((ordered.size - 1) * p).toInt()]
-                    stageJson.put(name, JSONObject().put("calls", values.size).put("total_ms", values.sum())
-                        .put("mean_ms", values.average()).put("p50_ms", percentile(0.50))
-                        .put("p95_ms", percentile(0.95)).put("p99_ms", percentile(0.99)).put("max_ms", ordered.last()))
-                }
                 val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
                     ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
                 report.put("frames", received).put("width", width).put("height", height)
                     .put("backend", renderer.backend).put("gpu", renderer.gpu).put("device", renderer.device)
                     .put("fallback_reason", renderer.fallbackReason).put("total_seconds", total)
                     .put("mode", "realtime").put("peak_rss_mib", peakRss ?: JSONObject.NULL)
-                    .put("stages", stageJson).put("frame_events", frameEvents)
+                    .put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", frameEvents)
                     .put("streaming", JSONObject().put("lookahead_seconds", settings.lookaheadSeconds)
                         .put("max_buffered_frames", settings.maxBufferedFrames).put("peak_buffered_frames", peakBuffered)
                         .put("first_output_after_inputs", firstOutputAfterInputs).put("first_output_seconds", firstOutputSeconds)
@@ -488,8 +495,8 @@ class ExportRunner : Instrumentation() {
                             StreamPlanner(width, height, fps, config.getBoolean("horizontalScan"), settings).use { planner ->
                                 data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
                                 val pending = java.util.ArrayDeque<Pending>()
-                                val stages = linkedMapOf<String, MutableList<Double>>()
-                                fun mark(name: String, start: Long) { stages.getOrPut(name) { mutableListOf() }.add((System.nanoTime() - start) / 1e6) }
+                                val stages = linkedMapOf<String, TimingStatistics>()
+                                fun mark(name: String, start: Long) { stages.getOrPut(name) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6) }
                                 var received = 0
                                 var rendered = 0
                                 var peak = 0
@@ -510,7 +517,7 @@ class ExportRunner : Instrumentation() {
                                         mark("render.surface", start)
                                         events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
                                             .put("duration_us", ready.durationUs).put("flushing", flushing))
-                                        stages.getOrPut("stream.residence") { mutableListOf() }.add((System.nanoTime()-item.receivedNs)/1e6)
+                                        stages.getOrPut("stream.residence") { TimingStatistics() }.add((System.nanoTime()-item.receivedNs)/1e6)
                                         if (rendered == 0) {
                                             firstOutputSeconds = (System.nanoTime()-began)/1e9
                                             firstOutputAfterInputs = received
@@ -539,19 +546,13 @@ class ExportRunner : Instrumentation() {
                                 while (!planner.finished) { drain(true); Thread.sleep(1) }
                                 sink.finishSurface()
                                 check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
-                                val timings = JSONObject()
-                                stages.forEach { (name, values) ->
-                                    val sorted = values.sorted()
-                                    timings.put(name, JSONObject().put("calls", values.size).put("total_ms", values.sum())
-                                        .put("mean_ms", values.average()).put("p95_ms", sorted[((sorted.size - 1) * 0.95).toInt()]))
-                                }
                                 val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
                                     ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
                                 report.put("peak_rss_mib", peakRss ?: JSONObject.NULL)
                                 report.put("frames", received).put("width", width).put("height", height)
                                     .put("backend", "gles").put("gpu", true).put("device", gpu.device)
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
-                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timings).put("frame_events", events)
+                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events)
                                     .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
                                         .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
                                         .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))

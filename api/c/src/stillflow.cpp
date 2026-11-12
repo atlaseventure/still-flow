@@ -69,14 +69,14 @@ struct sf_stream {
     bool finished = false;
     Size source;
     void record(const Profile& call) {
-        for (const auto& [name, samples] : call.samples()) {
+        for (const auto& [name, sample] : call.stages()) {
+            if (!sample.count)
+                continue;
             auto& stats = profile[name];
-            for (double ms : samples) {
-                stats.minimum = stats.count ? std::min(stats.minimum, ms) : ms;
-                stats.maximum = stats.count ? std::max(stats.maximum, ms) : ms;
-                stats.total += ms;
-                ++stats.count;
-            }
+            stats.minimum = stats.count ? std::min(stats.minimum, sample.minimum) : sample.minimum;
+            stats.maximum = stats.count ? std::max(stats.maximum, sample.maximum) : sample.maximum;
+            stats.total += sample.total;
+            stats.count += sample.count;
         }
     }
     StabilizationSettings settings;
