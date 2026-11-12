@@ -1,6 +1,6 @@
 #pragma once
-#include "stillflow/adapters/report.hpp"
-#include "stillflow/vision/vision.hpp"
+#include "stillflow/application/report.hpp"
+#include "stillflow/application/vision.hpp"
 #include <functional>
 #include <span>
 

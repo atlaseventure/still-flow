@@ -1,10 +1,11 @@
-#include "stillflow/adapters/options.hpp"
+#include "stillflow/application/options.hpp"
 #include <cmath>
 #include <stdexcept>
 
 namespace stillflow {
 namespace {
 void validate_options(const Options& o) {
+    validate_settings(o);
     if (o.input.empty() || o.output.empty())
         throw std::invalid_argument("input and output paths are required");
     if (o.backend.empty())
@@ -14,16 +15,8 @@ void validate_options(const Options& o) {
             throw std::invalid_argument(std::string(name) + " is out of range");
     };
     range(o.analysis_width, 160, 4096, "analysis_width");
-    range(o.features, 96, 10000, "features");
-    range(o.bands, 4, 32, "bands");
     range(o.threads, 1, 64, "threads");
     range(o.crf, 0, 51, "crf");
-    range(o.smooth_seconds, 0, 10, "smooth_seconds");
-    range(o.rs_seconds, 0, 10, "rs_seconds");
-    range(o.rs_strength, 0, 1, "rs_strength");
-    range(o.crop, 0, 0.25, "crop");
-    if (o.crop_mode != CropMode::automatic && o.crop_mode != CropMode::fixed && o.crop_mode != CropMode::adaptive)
-        throw std::invalid_argument("crop_mode must be auto, fixed or adaptive");
     if (o.scan_axis != "auto" && o.scan_axis != "x" && o.scan_axis != "y")
         throw std::invalid_argument("scan_axis must be auto, x or y");
     if (o.audio < AudioMode::automatic || o.audio > AudioMode::drop)

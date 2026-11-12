@@ -1,6 +1,7 @@
 #include "stillflow/application/engine.hpp"
 #include "stillflow/application/stream.hpp"
 #include "stillflow/backends/cpu.hpp"
+#include "stillflow/vision/portable.hpp"
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <cmath>

@@ -6,7 +6,8 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(Catch2)
 add_executable(stillflow_tests domain.cpp engine.cpp)
-target_link_libraries(stillflow_tests PRIVATE StillFlow::application StillFlow::backend_cpu Catch2::Catch2WithMain)
+target_link_libraries(stillflow_tests PRIVATE StillFlow::application StillFlow::backend_cpu StillFlow::vision_portable
+                                              Catch2::Catch2WithMain)
 target_compile_definitions(stillflow_tests
                            PRIVATE STILLFLOW_GOLDEN_FILE="${CMAKE_CURRENT_SOURCE_DIR}/golden/trajectory.txt")
 if(STILLFLOW_BUILD_ADAPTERS)

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 
@@ -21,6 +22,7 @@ class Executor {
     virtual ~Executor() = default;
     virtual void for_each(size_t count, const std::function<void(size_t)>& work) = 0;
 };
+std::unique_ptr<Executor> make_thread_executor(int workers);
 class Logger {
   public:
     virtual ~Logger() = default;

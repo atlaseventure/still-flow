@@ -1,3 +1,7 @@
+#include "stillflow/vision/portable.hpp"
+#ifdef STILLFLOW_C_OPENCV
+#include "stillflow/vision/opencv.hpp"
+#endif
 #include "internal.hpp"
 #include "stillflow/application/stream.hpp"
 #include "stillflow/backends/cpu.hpp"

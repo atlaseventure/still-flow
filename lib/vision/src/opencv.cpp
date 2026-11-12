@@ -1,5 +1,5 @@
+#include "stillflow/vision/opencv.hpp"
 #include "motion.hpp"
-#include "stillflow/vision/vision.hpp"
 #include <deque>
 namespace stillflow {
 namespace {

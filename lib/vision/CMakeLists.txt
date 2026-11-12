@@ -1,3 +1,18 @@
+add_library(stillflow_vision_portable STATIC src/portable.cpp)
+add_library(StillFlow::vision_portable ALIAS stillflow_vision_portable)
+set_target_properties(stillflow_vision_portable PROPERTIES EXPORT_NAME vision_portable POSITION_INDEPENDENT_CODE ON)
+target_include_directories(stillflow_vision_portable PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                                                            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(stillflow_vision_portable PUBLIC StillFlow::application)
+install(
+    TARGETS stillflow_vision_portable
+    EXPORT StillFlowTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/stillflow/vision/portable.hpp DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/stillflow/vision)
+if(NOT STILLFLOW_WITH_OPENCV)
+    return()
+endif()
+
 if(ANDROID AND NOT STILLFLOW_DEPS_ROOT)
     include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/AndroidOpenCV.cmake")
 elseif(STILLFLOW_DEPS_ROOT)
@@ -26,6 +41,10 @@ install(FILES "${opencv_notice_dir}/SoftFloat-COPYING.txt"
         DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/opencv")
 install(DIRECTORY "${opencv_notice_dir}/" DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/stillflow/opencv")
 add_library(stillflow_vision_opencv STATIC src/motion.cpp src/opencv.cpp)
+target_include_directories(stillflow_vision_opencv PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                                                          $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+install(FILES include/stillflow/vision/opencv.hpp include/stillflow/vision/tracking.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/stillflow/vision)
 target_include_directories(stillflow_vision_opencv SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_compile_definitions(stillflow_vision_opencv PRIVATE EIGEN_MPL2_ONLY)
 target_link_libraries(

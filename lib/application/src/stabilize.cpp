@@ -1,4 +1,4 @@
-#include "stillflow/adapters/stabilize.hpp"
+#include "stillflow/application/stabilize.hpp"
 #include "pipeline.hpp"
 #include "stillflow/application/engine.hpp"
 #include <algorithm>

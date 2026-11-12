@@ -1,6 +1,9 @@
 #pragma once
-#include "stillflow/application/rendering.hpp"
-#include "stillflow/vision/tracking.hpp"
+#include "stillflow/application/image.hpp"
+#include "stillflow/application/profile.hpp"
+#include "stillflow/domain/motion.hpp"
+#include "stillflow/domain/settings.hpp"
+
 namespace stillflow {
 class MotionAnalyzer {
   public:
@@ -19,13 +22,4 @@ class ImageProcessing {
     virtual Image comparison(const Image& input, const Image& stabilized) = 0;
 };
 
-// Dependency-free translation estimator for constrained hosts.
-std::unique_ptr<MotionAnalyzer> make_translation_analyzer(const StabilizationSettings& settings);
-// Optional OpenCV implementation of the full tracking algorithm.
-std::unique_ptr<MotionAnalyzer> make_opencv_analyzer(const StabilizationSettings& settings, bool horizontal,
-                                                     bool incremental = false,
-                                                     std::unique_ptr<SparseTracker> tracker = {});
-// Process-wide setting; configure before creating analysis workers.
-void configure_opencv_threads(int threads);
-Image gray_proxy(const Image& image, Size size);
 } // namespace stillflow

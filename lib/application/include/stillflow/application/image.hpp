@@ -58,6 +58,7 @@ class ImageData {
 using Image = std::shared_ptr<const ImageData>;
 HostImageView map_host_image(const Image& image);
 Image borrow_host_image(HostImageView view);
+Image gray_proxy(const Image& image, Size size);
 Image luma_view(const Image& image);
 Image make_host_image(Size size, PixelFormat format, std::vector<uint8_t> bytes, size_t row_stride = 0);
 } // namespace stillflow

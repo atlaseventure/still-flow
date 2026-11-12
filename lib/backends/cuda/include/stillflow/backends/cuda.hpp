@@ -1,6 +1,6 @@
 #pragma once
 #include "stillflow/application/rendering.hpp"
-#include "stillflow/vision/vision.hpp"
+#include "stillflow/application/vision.hpp"
 
 namespace stillflow {
 std::unique_ptr<RenderBackend> make_cuda_backend();

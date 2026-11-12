@@ -1,7 +1,7 @@
 #include "stillflow/desktop.h"
 #include "internal.hpp"
 #include "stillflow/adapters/backends.hpp"
-#include "stillflow/adapters/stabilize.hpp"
+#include "stillflow/application/stabilize.hpp"
 #include "stillflow/backends/cpu.hpp"
 #ifdef STILLFLOW_C_CUDA
 #include "stillflow/backends/cuda.hpp"

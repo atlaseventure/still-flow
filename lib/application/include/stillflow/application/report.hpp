@@ -1,6 +1,6 @@
 #pragma once
-#include "stillflow/adapters/options.hpp"
 #include "stillflow/application/media.hpp"
+#include "stillflow/application/options.hpp"
 #include "stillflow/application/profile.hpp"
 #include "stillflow/application/rendering.hpp"
 #include "stillflow/domain/types.hpp"

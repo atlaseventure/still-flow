@@ -1,6 +1,6 @@
 #include "image.hpp"
 #include "stillflow/adapters/backends.hpp"
-#include "stillflow/vision/vision.hpp"
+#include "stillflow/vision/opencv.hpp"
 #include <opencv2/imgproc.hpp>
 
 namespace stillflow {

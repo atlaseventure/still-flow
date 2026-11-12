@@ -1,5 +1,6 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
+find_dependency(Threads)
 if(@STILLFLOW_WITH_OPENCV@ AND (NOT @STILLFLOW_C_API_SHARED@ OR "vision_opencv" IN_LIST StillFlow_FIND_COMPONENTS))
     if(NOT OpenCV_DIR AND EXISTS "${PACKAGE_PREFIX_DIR}/lib/cmake/opencv5/OpenCVConfig.cmake")
         set(OpenCV_DIR "${PACKAGE_PREFIX_DIR}/lib/cmake/opencv5")
@@ -24,6 +25,7 @@ foreach(
     backend_gles
     c
     desktop_c
+    vision_portable
     vision_opencv)
     if(TARGET StillFlow::${component})
         set(StillFlow_${component}_FOUND TRUE)

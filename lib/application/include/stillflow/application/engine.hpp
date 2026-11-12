@@ -1,6 +1,7 @@
 #pragma once
+#include "stillflow/application/rendering.hpp"
 #include "stillflow/application/runtime.hpp"
-#include "stillflow/vision/vision.hpp"
+#include "stillflow/application/vision.hpp"
 
 namespace stillflow {
 class TrackingRecovery;
