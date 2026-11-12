@@ -14,7 +14,7 @@ constexpr std::string_view help = R"(stillflow - video stabilization with scanli
 Usage: stillflow INPUT OUTPUT [options]
 
   --mode offline|realtime Single-pass fixed-lag streaming (default offline)
-  --lookahead SECONDS     Streaming lookahead, 0..10 (default 1.5)
+  --lookahead SECONDS     Streaming lookahead, 0..10 (default 1.35)
   --buffer-frames N       Maximum delayed frames, 2..600 (default 120)
   --compare PATH          Side-by-side input/output video (adds encoding cost)
   --report PATH           JSON profile; default OUTPUT.profile.json

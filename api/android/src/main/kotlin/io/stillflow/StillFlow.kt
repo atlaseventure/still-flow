@@ -20,7 +20,7 @@ class StillFlow(
     /** Settings are copied when the session is created. Public fields also support Java callers. */
     class Settings {
         @JvmField var realtime = false
-        @JvmField var lookaheadSeconds = 1.5
+        @JvmField var lookaheadSeconds = 1.35
         @JvmField var maxBufferedFrames = 120
         @JvmField var backend = Backend.AUTO
         @JvmField var motionEstimator = MotionEstimator.OPENCV

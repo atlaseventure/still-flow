@@ -12,7 +12,7 @@ The desktop source build requires Linux amd64, a C++20 compiler, CMake, Ninja, M
 cmake --preset linux-gcc
 cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow input.mp4 output.mp4 --compare comparison.mp4
-./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.5
+./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.35
 ./build/linux-gcc/stillflow --help
 ```
 
@@ -22,7 +22,7 @@ Offline CLI processing displays staged progress. File API consumers receive stru
 
 The default crop budget is 8% per edge. `--crop-mode fixed` applies the exact centered crop; `auto` selects a fixed window per shot, and `adaptive` permits slow viewport motion. `--rs off` disables rolling shutter correction. `--crf` controls OpenH264 QP or NVENC CQ; values across encoders are not quality-equivalent. `--preset` applies to NVENC.
 
-Realtime mode decodes once, with 1.5 seconds of lookahead and a 120-frame buffer by default. `auto` and `adaptive` follow a slowly moving viewport; `fixed` keeps a centered crop. Capacity pressure, cuts and final draining shorten lookahead. Tracking recovery needs about 0.2 seconds plus two frames of context. Original PTS and audio synchronization are preserved. File processing keeps every frame; reports include throughput and per-frame timings. Live hosts use the streaming API's capacity feedback to drop incoming frames.
+Realtime mode decodes once, with 1.35 seconds of lookahead and a 120-frame buffer by default. `auto` and `adaptive` anticipate crop demand across the lookahead window; `fixed` keeps a centered crop. Capacity pressure, cuts and final draining shorten lookahead. Tracking recovery needs about 0.2 seconds plus two frames of context. Original PTS and audio synchronization are preserved. File processing keeps every frame; reports include throughput and per-frame timings. Live hosts use the streaming API's capacity feedback to drop incoming frames.
 
 ## Core SDK
 

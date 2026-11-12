@@ -294,6 +294,7 @@ class ExportRunner : Instrumentation() {
         val options = config.getJSONObject("settings")
         StillFlow.configureThreads(options.optInt("visionThreads", 2))
         val settings = StillFlow.Settings().apply {
+            lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
             backend = StillFlow.Backend.GLES
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
             analysisWidth = options.optInt("analysisWidth", analysisWidth)

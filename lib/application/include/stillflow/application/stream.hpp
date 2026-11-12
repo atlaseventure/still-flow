@@ -4,7 +4,7 @@
 
 namespace stillflow {
 struct StreamSettings {
-    double lookahead_seconds = 1.5;
+    double lookahead_seconds = 1.35;
     size_t max_buffered_frames = 120;
 };
 void validate_stream_settings(const StreamSettings& settings);

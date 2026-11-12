@@ -68,7 +68,9 @@ class CudaBackend final : public RenderBackend {
         return {"cuda",
                 name_,
                 {{PixelFormat::bgr8}, {std::string(cuda_image_api), "host"}},
-                {{"compiler", STILLFLOW_CUDA_VERSION}, {"output", "bgr8 + nv12 bt709 (device)"}}};
+                {{"compiler", STILLFLOW_CUDA_VERSION},
+                 {"sampler", "catmull-rom luma/RGB, bilinear chroma"},
+                 {"output", "bgr8 + nv12 bt709 (device)"}}};
     }
     void upload(const Image& input) override {
         lease_.reset();

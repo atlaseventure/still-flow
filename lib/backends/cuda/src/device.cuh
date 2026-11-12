@@ -148,19 +148,41 @@ __device__ inline float bilinear(const unsigned char* plane, size_t pitch, int s
     return upper * (1 - fy) + lower * fy;
 }
 
-// Samples the logical width x height image at (x, y); returns B, G, R in [0, 255].
+__device__ inline float4 cubic_weights(float t) {
+    const float t2 = t * t, t3 = t2 * t;
+    return {-0.5f * t + t2 - 0.5f * t3, 1 - 2.5f * t2 + 1.5f * t3, 0.5f * t + 2 * t2 - 1.5f * t3,
+            -0.5f * t2 + 0.5f * t3};
+}
+
+__device__ inline float bicubic(const unsigned char* plane, size_t pitch, int stride, int width, int height, float x,
+                                float y) {
+    x = fminf(fmaxf(x, 0), width - 1);
+    y = fminf(fmaxf(y, 0), height - 1);
+    const int ix = static_cast<int>(x), iy = static_cast<int>(y);
+    const auto wx = cubic_weights(x - ix), wy = cubic_weights(y - iy);
+    float rows[4];
+    for (int row = 0; row < 4; ++row) {
+        const auto* p = plane + static_cast<size_t>(min(max(iy + row - 1, 0), height - 1)) * pitch;
+        rows[row] = p[static_cast<ptrdiff_t>(max(ix - 1, 0)) * stride] * wx.x +
+                    p[static_cast<ptrdiff_t>(ix) * stride] * wx.y +
+                    p[static_cast<ptrdiff_t>(min(ix + 1, width - 1)) * stride] * wx.z +
+                    p[static_cast<ptrdiff_t>(min(ix + 2, width - 1)) * stride] * wx.w;
+    }
+    return fminf(fmaxf(rows[0] * wy.x + rows[1] * wy.y + rows[2] * wy.z + rows[3] * wy.w, 0), 255);
+}
+
+// Catmull-Rom luma/RGB reconstruction; subsampled chroma stays bilinear.
+// Border replication preserves constant images and integer samples at edges.
 template <bool yuv> __device__ float3 sample(const DeviceSource& s, float x, float y, int width, int height) {
     if constexpr (!yuv) {
-        // OpenCV 5 uses full floating-point weights for float remap inputs.
-        // Neighbours at the last row/column have zero extra weight.
         const size_t pitch = static_cast<size_t>(width) * 3;
-        return {bilinear(s.bgr, pitch, 3, width, height, x, y), bilinear(s.bgr + 1, pitch, 3, width, height, x, y),
-                bilinear(s.bgr + 2, pitch, 3, width, height, x, y)};
+        return {bicubic(s.bgr, pitch, 3, width, height, x, y), bicubic(s.bgr + 1, pitch, 3, width, height, x, y),
+                bicubic(s.bgr + 2, pitch, 3, width, height, x, y)};
     } else {
         const float2 p = coded_position(x, y, s.rotation, s.coded_width, s.coded_height);
         const int chroma_width = (s.coded_width + 1) / 2, chroma_height = (s.coded_height + 1) / 2;
         const float cx = (p.x - s.chroma_x) * 0.5f, cy = (p.y - s.chroma_y) * 0.5f;
-        float luma = bilinear(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y);
+        float luma = bicubic(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y);
         float cb = bilinear(s.chroma, s.chroma_pitch, 2, chroma_width, chroma_height, cx, cy) - 128;
         float cr = bilinear(s.chroma + 1, s.chroma_pitch, 2, chroma_width, chroma_height, cx, cy) - 128;
         if (s.full_range) {

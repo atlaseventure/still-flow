@@ -108,6 +108,7 @@ def run(args):
         "rs_seconds": "rsSeconds",
         "crop": "crop",
         "rs_strength": "rsStrength",
+        "lookahead": "lookaheadSeconds",
     }
     for name, field in keys.items():
         value = getattr(args, name)
@@ -268,6 +269,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
     parser.add_argument("--realtime", action="store_true")
+    parser.add_argument("--lookahead", type=float, help="Streaming lookahead in seconds, 0..10")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
     parser.add_argument("--features", type=int)
@@ -287,6 +289,8 @@ def main():
     )
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    if args.lookahead is not None and (not math.isfinite(args.lookahead) or not 0 <= args.lookahead <= 10):
+        parser.error("lookahead must be finite and between 0 and 10")
     if min(args.jobs, args.timeout, args.bitrate) <= 0:
         parser.error("jobs, timeout and bitrate must be positive")
     if args.max_displacement is not None and (

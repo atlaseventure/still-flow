@@ -12,7 +12,7 @@
 cmake --preset linux-gcc
 cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow input.mp4 output.mp4 --compare comparison.mp4
-./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.5
+./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.35
 ./build/linux-gcc/stillflow --help
 ```
 
@@ -22,7 +22,7 @@ cmake --build --preset linux-gcc
 
 默认裁剪预算为每边 8%。`--crop-mode fixed` 使用精确居中裁剪，`auto` 为每个镜头选择固定窗口，`adaptive` 允许窗口缓慢移动。`--rs off` 关闭滚动快门校正。`--crf` 分别控制 OpenH264 QP 或 NVENC CQ，相同数值的画质并不等价。`--preset` 用于 NVENC。
 
-实时模式单遍解码，默认前视 1.5 秒、最多缓存 120 帧。`auto` 与 `adaptive` 使用缓慢调整的裁剪窗口，`fixed` 保持居中固定裁剪。容量耗尽、镜头切换及结束排空时会缩短前视；跟踪恢复至少需要约 0.2 秒及两帧上下文。输出保留原始 PTS 和音画同步。文件处理保留全部帧，实际吞吐与逐帧耗时见报告；直播宿主通过流式 API 的容量反馈决定丢帧。
+实时模式单遍解码，默认前视 1.35 秒、最多缓存 120 帧。`auto` 与 `adaptive` 利用前视窗口提前调整裁剪范围，`fixed` 保持居中固定裁剪。容量耗尽、镜头切换及结束排空时会缩短前视；跟踪恢复至少需要约 0.2 秒及两帧上下文。输出保留原始 PTS 和音画同步。文件处理保留全部帧，实际吞吐与逐帧耗时见报告；直播宿主通过流式 API 的容量反馈决定丢帧。
 
 ## 核心 SDK
 

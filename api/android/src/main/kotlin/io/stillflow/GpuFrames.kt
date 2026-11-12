@@ -318,6 +318,25 @@ class GpuFrames(
             uniform vec4 viewport;
             uniform vec2 offsets[288];
             out vec4 color;
+            vec4 weights(float t) {
+                float t2=t*t,t3=t2*t;
+                return vec4(-0.5*t+t2-0.5*t3,1.0-2.5*t2+1.5*t3,0.5*t+2.0*t2-1.5*t3,-0.5*t2+0.5*t3);
+            }
+            vec4 reconstruct(vec2 p) {
+                p=clamp(p,vec2(0),dimensions-1.0);
+                vec2 lo=floor(p),f=p-lo;
+                vec4 wx=weights(f.x),wy=weights(f.y);
+                // Combine the two positive center taps with hardware linear
+                // filtering: nine reads implement the sixteen-tap cubic kernel.
+                vec3 x=vec3(lo.x-1.0,lo.x+wx.z/(wx.y+wx.z),lo.x+2.0);
+                vec3 y=vec3(lo.y-1.0,lo.y+wy.z/(wy.y+wy.z),lo.y+2.0);
+                vec3 ax=vec3(wx.x,wx.y+wx.z,wx.w),ay=vec3(wy.x,wy.y+wy.z,wy.w);
+                vec4 value=vec4(0);
+                for(int j=0;j<3;++j)
+                    for(int i=0;i<3;++i)
+                        value+=texture(source,(vec2(x[i],y[j])+0.5)/dimensions)*ax[i]*ay[j];
+                return clamp(value,0.0,1.0);
+            }
             void main() {
                 vec2 at=vec2(gl_FragCoord.x-0.5,dimensions.y-gl_FragCoord.y-0.5);
                 vec2 target=viewport.xy+at*viewport.zw;
@@ -329,7 +348,7 @@ class GpuFrames(
                     int a=cell.y*meshSize.x+cell.x,b=a+meshSize.x;
                     p=target-mix(mix(offsets[a],offsets[a+1],f.x),mix(offsets[b],offsets[b+1],f.x),f.y);
                 }
-                color=texture(source,(p+0.5)/dimensions);
+                color=reconstruct(p);
             }
         """.trimIndent()
     }

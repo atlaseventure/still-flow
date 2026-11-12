@@ -104,7 +104,7 @@ uniform vec2 gridScale;
 uniform vec4 viewport;
 
 uvec4 samplePixel(ivec2 p) {
-    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, dimensions))) return uvec4(0);
+    p = clamp(p, ivec2(0), dimensions - 1);
     uint base = uint(p.y) * stride + uint(p.x) * channels;
     uvec4 result = uvec4(0);
     for (uint c = 0u; c < channels; ++c) {
@@ -112,6 +112,10 @@ uvec4 samplePixel(ivec2 p) {
         result[c] = (inputPixels[address / 4u] >> ((address % 4u) * 8u)) & 255u;
     }
     return result;
+}
+vec4 weights(float t) {
+    float t2=t*t, t3=t2*t;
+    return vec4(-0.5*t+t2-0.5*t3, 1.0-2.5*t2+1.5*t3, 0.5*t+2.0*t2-1.5*t3, -0.5*t2+0.5*t3);
 }
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
@@ -134,14 +138,14 @@ void main() {
     }
     if (any(lessThan(p, vec2(0))) || any(greaterThan(p, vec2(dimensions - 1))))
         atomicAdd(invalidCount, 1u);
-    ivec2 q = ivec2(roundEven(p * 32.0));
-    ivec2 lo = ivec2(floor(vec2(q) / 32.0));
-    uvec2 f = uvec2(q - lo * 32);
-    uvec4 value = samplePixel(lo) * (32u-f.x) * (32u-f.y)
-                + samplePixel(lo + ivec2(1,0)) * f.x * (32u-f.y)
-                + samplePixel(lo + ivec2(0,1)) * (32u-f.x) * f.y
-                + samplePixel(lo + ivec2(1,1)) * f.x * f.y;
-    value = (value + 512u) >> 10u;
+    p = clamp(p, vec2(0), vec2(dimensions - 1));
+    ivec2 lo = ivec2(floor(p));
+    vec4 wx = weights(p.x-float(lo.x)), wy = weights(p.y-float(lo.y));
+    vec4 sum = vec4(0);
+    for (int y=0; y<4; ++y)
+        for (int x=0; x<4; ++x)
+            sum += vec4(samplePixel(lo+ivec2(x-1,y-1))) * wx[x] * wy[y];
+    uvec4 value = uvec4(roundEven(clamp(sum, 0.0, 255.0)));
     outputPixels[at.y * dimensions.x + at.x] = value.x | (value.y << 8u) | (value.z << 16u) | (value.w << 24u);
 }
 )glsl";
@@ -202,7 +206,7 @@ class GlesBackend final : public RenderBackend {
         return {"gles",
                 name_,
                 {{PixelFormat::gray8, PixelFormat::bgr8, PixelFormat::rgba8}, {"host"}},
-                {{"sampler", "bilinear-5bit"}, {"api", "OpenGL ES 3.1 compute"}}};
+                {{"sampler", "catmull-rom"}, {"api", "OpenGL ES 3.1 compute"}}};
     }
 
     void upload(const Image& input) override {

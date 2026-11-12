@@ -297,7 +297,7 @@ sf_status sf_frame_plan_get_map(const sf_frame_plan* plan, int32_t width, int32_
 }
 void sf_frame_plan_destroy(sf_frame_plan* plan) { delete plan; }
 void sf_plan_destroy(sf_plan* plan) { delete plan; }
-sf_stream_settings sf_stream_settings_default(void) { return {1.5, 120}; }
+sf_stream_settings sf_stream_settings_default(void) { return {1.35, 120}; }
 sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* stream, const sf_video* video,
                            const sf_runtime* callbacks, sf_stream** out, sf_error* error) {
     if (out)
