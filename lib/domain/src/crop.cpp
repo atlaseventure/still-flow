@@ -256,50 +256,125 @@ void plan_shot(std::span<const FrameMotion> frames, std::span<Warp> warps, Size 
 }
 } // namespace
 
-void StreamCrop::apply(Warp& warp, std::span<const Warp> future, Size size, const StabilizationSettings& settings,
-                       double dt, bool reset) {
-    const double minimum_scale = 1 - 2 * settings.crop;
-    CropWindow desired{settings.crop, settings.crop, minimum_scale};
-    if (settings.crop_mode != CropMode::fixed) {
-        std::vector<Edges> edges;
-        std::vector<double> strengths;
-        for (const auto& item : future) {
-            edges.push_back(measure_edges(item, size));
-            strengths.push_back(std::min(item.geometry_strength, item.tracking_strength));
-        }
-        desired = choose_window(edges, strengths, minimum_scale);
+namespace {
+void advance_inset(double& inset, double& velocity, double desired, double budget, double dt) {
+    // Integrate at bounded steps so irregular presentation times use the same
+    // acceleration limit. Zoom out slowly; preview starts zooming in early.
+    while (dt > 1e-9) {
+        const double step = std::min(dt, 1.0 / 120);
+        const double error = desired - inset;
+        constexpr double acceleration = 0.04;
+        const double braking =
+            std::sqrt(acceleration * acceleration * step * step + 2 * acceleration * std::abs(error)) -
+            acceleration * step;
+        const double speed = std::min({std::abs(error) / 0.25, braking, error > 0 ? 0.02 : 0.003});
+        const double target = std::copysign(speed, error);
+        velocity += std::clamp(target - velocity, -acceleration * step, acceleration * step);
+        inset = std::clamp(inset + velocity * step, 0.0, budget);
+        dt -= step;
     }
-    if (reset || !initialized_) {
-        target_ = window_ = desired;
+}
+} // namespace
+
+void StreamCrop::apply(Warp& warp, std::span<const Warp> future, std::span<const FrameMotion> frames, Size size,
+                       const StabilizationSettings& settings, double dt, bool reset) {
+    if (future.empty() || future.size() != frames.size() || !std::isfinite(dt) || dt <= 0)
+        throw std::invalid_argument("Invalid streaming crop preview");
+    std::vector<Edges> edges;
+    std::vector<double> strengths;
+    double desired = 0;
+    for (const auto& item : future) {
+        edges.push_back(measure_edges(item, size));
+        strengths.push_back(std::min(item.geometry_strength, item.tracking_strength));
+        const auto bounds = edges.back().at(strengths.back());
+        desired = std::max({desired, bounds.left, bounds.top, 1 - bounds.right, 1 - bounds.bottom});
+    }
+    desired = settings.crop_mode == CropMode::fixed ? settings.crop : std::min(desired, settings.crop);
+    const bool start = reset || !initialized_;
+    if (start) {
+        inset_ = desired;
+        velocity_ = 0;
+        previous_bias_ = {};
+        bias_.clear();
         strength_ = 1;
         initialized_ = true;
     }
-    // Range <= 2*crop on each coordinate: tau >= range / velocity,
-    // tau >= sqrt(2*range / acceleration). Convex updates cannot overshoot.
-    const double tau = std::max({0.5, 2 * settings.crop / 0.02, std::sqrt(4 * settings.crop / 0.04)});
-    const double alpha = dt / (tau + dt);
-    const auto blend = [alpha](CropWindow a, CropWindow b) {
-        return CropWindow{a.left + alpha * (b.left - a.left), a.top + alpha * (b.top - a.top),
-                          a.scale + alpha * (b.scale - a.scale)};
+    advance_inset(inset_, velocity_, desired, settings.crop, dt);
+    warp.window = {inset_, inset_, 1 - 2 * inset_};
+
+    // Box-constrained least squares over the available preview. Penalizing
+    // temporal changes in a translation bias lets the low-frequency target
+    // approach the observed path without scaling its high-frequency correction.
+    // Predict the viewport with the same controller used for the current frame.
+    std::vector<Point> lower(future.size()), upper(future.size());
+    std::vector<double> link(future.size());
+    double inset = inset_, velocity = velocity_;
+    for (size_t i = 0; i < future.size(); ++i) {
+        const double step = i ? frames[i].seconds - frames[i - 1].seconds : dt;
+        if (!std::isfinite(step) || step <= 0)
+            throw std::invalid_argument("Invalid streaming crop timestamps");
+        if (i)
+            advance_inset(inset, velocity, desired, settings.crop, step);
+        const auto bounds = edges[i].at(strengths[i]);
+        lower[i] = {1 - inset - bounds.right, 1 - inset - bounds.bottom};
+        upper[i] = {inset - bounds.left, inset - bounds.top};
+        // Non-translational deformations may exceed the entire budget. Center
+        // the feasible image and leave the remaining limit to the safety cap.
+        if (lower[i].x > upper[i].x)
+            lower[i].x = upper[i].x = (lower[i].x + upper[i].x) * 0.5;
+        if (lower[i].y > upper[i].y)
+            lower[i].y = upper[i].y = (lower[i].y + upper[i].y) * 0.5;
+        link[i] = i == 0 && start ? 0 : 0.25 / (step * step);
+    }
+    if (!bias_.empty())
+        bias_.erase(bias_.begin());
+    bias_.resize(future.size(), bias_.empty() ? Point{} : bias_.back());
+    const auto project = [&](Point p, size_t i) {
+        return Point{std::clamp(p.x, lower[i].x, upper[i].x), std::clamp(p.y, lower[i].y, upper[i].y)};
     };
-    target_ = blend(target_, desired);
-    window_ = blend(window_, target_);
-    warp.window = window_;
-    const auto edges = measure_edges(warp, size);
-    const double base = std::min(warp.geometry_strength, warp.tracking_strength);
+    for (size_t i = 0; i < bias_.size(); ++i)
+        bias_[i] = project(bias_[i], i);
+    // Warm-started symmetric coordinate descent; bounded work at all horizons.
+    for (int pass = 0; pass < 32; ++pass) {
+        double change = 0;
+        const auto update = [&](size_t i) {
+            const double left = link[i], right = i + 1 < bias_.size() ? link[i + 1] : 0;
+            Point target = (i ? bias_[i - 1] : previous_bias_) * left;
+            if (i + 1 < bias_.size())
+                target = target + bias_[i + 1] * right;
+            target = project(target * (1 / (1 + left + right)), i);
+            change = std::max(change, norm(target - bias_[i]));
+            bias_[i] = target;
+        };
+        for (size_t i = 0; i < bias_.size(); ++i)
+            update(i);
+        for (size_t i = bias_.size(); i-- > 0;)
+            update(i);
+        if (change < 1e-8)
+            break;
+    }
+    previous_bias_ = bias_.front();
+    const double base = strengths.front();
+    if (base > 1e-6) {
+        const Point adjustment{previous_bias_.x * (size.width - 1) / base, previous_bias_.y * (size.height - 1) / base};
+        for (auto& point : warp.displacement)
+            point = point + adjustment;
+        warp.global_offset = warp.global_offset + adjustment;
+    }
+    const auto boundary = measure_edges(warp, size);
     double low = 0, high = 1;
-    if (edges.at(base).contains(window_))
+    if (boundary.at(base).contains(warp.window))
         low = 1;
     else
         for (int iteration = 0; iteration < 20; ++iteration) {
             const double middle = (low + high) * 0.5;
-            if (edges.at(base * middle).contains(window_))
+            if (boundary.at(base * middle).contains(warp.window))
                 low = middle;
             else
                 high = middle;
         }
     warp.crop_strength = warp.smoothed_crop_strength = low;
-    // Safety reductions take effect immediately; recovery is rate limited.
+    // Tracking loss or an infeasible deformation still needs a safe final cap.
     strength_ = std::min(base * low, strength_ + dt / 0.25);
     warp.strength = warp.planned_strength = strength_;
 }

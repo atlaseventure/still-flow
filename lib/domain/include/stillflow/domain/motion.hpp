@@ -23,15 +23,17 @@ std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size analysis_
 void plan_crops(std::span<const FrameMotion> frames, std::span<Warp> warps, Size size,
                 const StabilizationSettings& options);
 
-// Stateful viewport follower. Two convex low-pass stages bound viewport
-// velocity and acceleration while preserving crop budget and image bounds.
+// Preview-driven viewport with bounded zoom speed and acceleration. A constrained
+// translation path preserves shake correction when the viewport is under pressure.
 class StreamCrop {
   public:
-    void apply(Warp& warp, std::span<const Warp> future, Size size, const StabilizationSettings& settings, double dt,
-               bool reset);
+    void apply(Warp& warp, std::span<const Warp> future, std::span<const FrameMotion> frames, Size size,
+               const StabilizationSettings& settings, double dt, bool reset);
 
   private:
-    CropWindow target_, window_;
+    double inset_ = 0, velocity_ = 0;
+    Point previous_bias_;
+    std::vector<Point> bias_;
     double strength_ = 1;
     bool initialized_ = false;
 };

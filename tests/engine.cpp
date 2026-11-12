@@ -1,7 +1,10 @@
 #include "stillflow/application/engine.hpp"
+#include "stillflow/application/stream.hpp"
 #include "stillflow/backends/cpu.hpp"
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <cmath>
+#include <numbers>
 
 namespace {
 struct Token : stillflow::CancellationToken {
@@ -89,4 +92,63 @@ TEST_CASE("Timestamp gaps begin a new segment", "[engine]") {
     REQUIRE(result.frames[1].segment == 1);
     REQUIRE(result.frames[1].motion.state == stillflow::MotionState::time_gap);
     REQUIRE(result.frames[0].duration == 1);
+}
+
+TEST_CASE("Streaming anticipates a growing shake envelope without leaking high-frequency motion", "[stream]") {
+    constexpr stillflow::Size size{320, 180};
+    stillflow::StabilizationSettings settings;
+    settings.rolling_shutter = false;
+    std::vector<stillflow::FrameMotion> frames(450);
+    std::vector<double> observed(frames.size());
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const double t = i / 30.0;
+        const double amplitude = 1 + 8 * std::clamp((t - 5) / 0.5, 0.0, 1.0);
+        observed[i] = 3 * t + amplitude * std::sin(8 * std::numbers::pi * t);
+        auto& f = frames[i];
+        f.seconds = t;
+        f.duration = 1 / 30.0;
+        f.motion.confidence = 1;
+        f.motion.step(0, 2) = i ? observed[i] - observed[i - 1] : 0;
+    }
+    const auto offline = stillflow::plan_warps(frames, size, settings, false);
+    stillflow::StreamAnalyzer stream(settings, {}, size, 30, false);
+    std::vector<stillflow::Warp> streaming;
+    const auto drain = [&] {
+        stillflow::ReadyWarp ready;
+        while (stream.take_ready(ready)) {
+            REQUIRE(ready.index == streaming.size());
+            REQUIRE(ready.pts_us == std::llround(frames[ready.index].seconds * 1000000));
+            REQUIRE(ready.warp.window.left >= 0);
+            REQUIRE(ready.warp.window.left <= settings.crop);
+            streaming.push_back(ready.warp);
+        }
+    };
+    for (const auto& f : frames) {
+        REQUIRE(stream.push_observation(f.motion, std::llround(f.seconds * 1000000), 33333));
+        drain();
+    }
+    stream.finish();
+    drain();
+    REQUIRE(streaming.size() == frames.size());
+    const auto energy = [&](const std::vector<stillflow::Warp>& warps) {
+        std::vector<double> path = observed;
+        for (size_t i = 0; i < path.size() && !warps.empty(); ++i)
+            path[i] += warps[i].global_offset.x * warps[i].strength;
+        double sum = 0;
+        for (size_t i = 151; i < 390; ++i) {
+            const double acceleration = path[i + 1] - 2 * path[i] + path[i - 1];
+            sum += acceleration * acceleration;
+        }
+        return std::sqrt(sum);
+    };
+    const double input = energy({});
+    REQUIRE(1 - energy(streaming) / input >= 0.85 * (1 - energy(offline) / input));
+    for (size_t i = 2; i < streaming.size(); ++i) {
+        const auto time = [&](size_t j) { return std::llround(frames[j].seconds * 1000000) / 1000000.0; };
+        const double dt = time(i) - time(i - 1), previous_dt = time(i - 1) - time(i - 2);
+        const double speed = (streaming[i].window.scale - streaming[i - 1].window.scale) / dt;
+        const double previous = (streaming[i - 1].window.scale - streaming[i - 2].window.scale) / previous_dt;
+        REQUIRE(std::abs(speed) <= 0.04001);
+        REQUIRE(2 * std::abs(speed - previous) / (dt + previous_dt) <= 0.08001);
+    }
 }

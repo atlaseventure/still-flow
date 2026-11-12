@@ -178,14 +178,13 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output) {
     const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - frames[next_ - 1].seconds;
     size_t end = next_ + 1;
-    while (end < frames.size() && frames[end].segment == current.segment &&
-           frames[end].seconds - current.seconds <= 0.5)
+    while (end < frames.size() && frames[end].segment == current.segment)
         ++end;
     auto warp = warps[next_];
     warp.boundary_search_steps = 0;
     if (settings_.crop_mode != CropMode::fixed)
-        crop_.apply(warp, std::span<const Warp>(warps).subspan(next_, end - next_), analysis_.size, settings_, dt,
-                    reset);
+        crop_.apply(warp, std::span<const Warp>(warps).subspan(next_, end - next_), frames.subspan(next_, end - next_),
+                    analysis_.size, settings_, dt, reset);
     output = {base_ + next_,
               analysis_.origin_us + static_cast<int64_t>(std::llround(current.seconds * 1000000)),
               static_cast<int64_t>(std::llround(current.duration * 1000000)),
