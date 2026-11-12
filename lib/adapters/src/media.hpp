@@ -87,8 +87,8 @@ class Reader {
 class Writer {
   public:
     Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
-           int threads, int crf, const std::string& preset, bool audio, AudioMode audio_mode,
-           const CodecRequest& encoder, HardwareDevices& devices);
+           int threads, int crf, const std::string& preset, AudioMode audio, const CodecRequest& encoder,
+           HardwareDevices& devices);
     ~Writer();
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;

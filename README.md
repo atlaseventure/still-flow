@@ -18,7 +18,7 @@ cmake --build --preset linux-gcc
 
 `--backend auto` prefers CUDA and falls back to CPU. Hardware codecs are selected when GPU rendering is used; `--backend cpu --decoder cpu --encoder openh264` forces software processing. Input must be progressive 8-bit SDR with square pixels and even dimensions. Output preserves presentation timestamps; missing reordered AVI timestamps use the fixed-rate stream clock. `--audio auto` copies container-compatible tracks and converts others to AAC. Use `--audio aac` to encode all audio as AAC, `copy` to require stream copying, or `none` to omit audio.
 
-Offline CLI processing displays staged progress. File API consumers receive structured progress through `sf_progress.event`; completion is reported after output and reports are published.
+Offline CLI processing displays staged progress. File API consumers receive structured progress through `sf_file_callbacks.progress`; completion is reported after output and reports are published.
 
 The default crop budget is 8% per edge. `--crop-mode fixed` applies the exact centered crop; `auto` selects a fixed window per shot, and `adaptive` permits slow viewport motion. `--rs off` disables rolling shutter correction. `--crf` controls OpenH264 QP or NVENC CQ; values across encoders are not quality-equivalent. `--preset` applies to NVENC.
 
@@ -35,7 +35,7 @@ cmake --build --preset core
 cmake --install build/core-sdk --prefix /path/to/sdk
 ```
 
-Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Push frames into an analyzer, replay requested recovery frames, finish the plan, then render by index. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. C API structures, ownership and callbacks are documented in the installed headers.
+Consumers use `find_package(StillFlow CONFIG REQUIRED)` and link `StillFlow::c` for the C API or `StillFlow::application` for C++. Push frames into an analyzer, replay requested recovery frames, finish the plan, then extract frame plans by index and render them. The portable estimator handles translation; the optional OpenCV estimator provides full tracking. The CPU renderer accepts gray8, BGR8 and RGBA8; analysis also accepts YUV luma planes. Use C headers and binaries from the same build. Default functions return initialized settings; ownership and callback contracts are documented in the installed headers.
 
 For a static C SDK, configure with `-DSTILLFLOW_C_API_SHARED=OFF`. For Android native consumers, set `ANDROID_NDK_HOME` to an installed NDK directory:
 
@@ -44,7 +44,7 @@ cmake --preset android-arm64
 cmake --build --preset android-arm64
 ```
 
-Use C++ `StreamAnalyzer` or C `sf_stream_*` for streaming: push, drain ready plans, finish, then drain again. Hosts retain full-resolution frames until their index is ready. Each C plan is independently owned and renders its frame at index 0.
+Use C++ `StreamAnalyzer` or C `sf_stream_*` for streaming: push, drain ready plans, finish, then drain again. Hosts retain full-resolution frames until their index is ready. `SF_AGAIN` means wait or relieve capacity; `SF_END` means draining is complete. Owned `sf_frame_plan` handles carry frame indices and timestamps and are passed directly to the renderer.
 
 ## Android
 

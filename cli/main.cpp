@@ -82,17 +82,14 @@ int main(int argc, char** argv) {
         }
         if (argc < 3)
             throw std::runtime_error("Expected INPUT and OUTPUT; see --help");
-        sf_file_options o{};
-        o.struct_size = sizeof(o);
-        if (sf_file_options_default(&o) != SF_OK)
-            throw std::runtime_error("Cannot initialize options");
+        auto o = sf_file_options_default();
         o.input = argv[1];
         o.output = argv[2];
         bool backend_selected = false;
         for (int i = 3; i < argc; ++i) {
             const std::string option = argv[i];
             if (option == "--no-audio") {
-                o.audio = false;
+                o.audio = SF_AUDIO_DROP;
                 continue;
             }
             if (option == "--overwrite") {
@@ -109,14 +106,14 @@ int main(int argc, char** argv) {
             if (option == "--mode") {
                 if (value != "offline" && value != "realtime")
                     throw std::runtime_error("--mode must be offline or realtime");
-                o.realtime = value == "realtime";
+                o.mode = value == "realtime" ? SF_FILE_STREAM : SF_FILE_OFFLINE;
             } else if (option == "--lookahead")
-                o.lookahead_seconds = number(value, option);
+                o.stream.lookahead_seconds = number(value, option);
             else if (option == "--buffer-frames") {
                 const int capacity = integer(value, option);
                 if (capacity < 2 || capacity > 600)
                     throw std::runtime_error("--buffer-frames must be 2..600");
-                o.max_buffered_frames = static_cast<size_t>(capacity);
+                o.stream.max_buffered_frames = static_cast<size_t>(capacity);
             } else if (option == "--compare")
                 o.compare = argv[i];
             else if (option == "--report")
@@ -153,30 +150,38 @@ int main(int argc, char** argv) {
             else if (option == "--decoder") {
                 if (value != "auto" && value != "cpu" && value != "nvdec")
                     throw std::runtime_error("--decoder must be auto, cpu or nvdec");
-                o.decoder = argv[i];
+                o.decoder = value == "auto" ? SF_DECODER_AUTO : value == "cpu" ? SF_DECODER_CPU : SF_DECODER_NVDEC;
             } else if (option == "--audio") {
                 if (value == "auto")
-                    o.audio_mode = SF_AUDIO_AUTO;
+                    o.audio = SF_AUDIO_AUTO;
                 else if (value == "copy")
-                    o.audio_mode = SF_AUDIO_COPY;
+                    o.audio = SF_AUDIO_COPY;
                 else if (value == "aac")
-                    o.audio_mode = SF_AUDIO_AAC;
+                    o.audio = SF_AUDIO_AAC;
                 else if (value == "none")
-                    o.audio_mode = SF_AUDIO_DROP;
+                    o.audio = SF_AUDIO_DROP;
                 else
                     throw std::runtime_error("--audio must be auto, copy, aac or none");
-                o.audio = true;
             } else if (option == "--encoder") {
                 if (value != "auto" && value != "openh264" && value != "nvenc")
                     throw std::runtime_error("--encoder must be auto, openh264 or nvenc");
-                o.encoder = argv[i];
+                o.encoder = value == "auto"       ? SF_ENCODER_AUTO
+                            : value == "openh264" ? SF_ENCODER_OPENH264
+                                                  : SF_ENCODER_NVENC;
             } else if (option == "--backend") {
-                if (backend_selected && value != o.backend)
+                if (value != "auto" && value != "cpu" && value != "cuda")
+                    throw std::runtime_error("--backend must be auto, cpu or cuda");
+                const sf_backend backend = value == "auto"  ? SF_BACKEND_AUTO
+                                           : value == "cpu" ? SF_BACKEND_CPU
+                                                            : SF_BACKEND_CUDA;
+                if (backend_selected && backend != o.backend)
                     throw std::runtime_error("Conflicting rendering backend selections");
-                o.backend = argv[i];
+                o.backend = backend;
                 backend_selected = true;
             } else if (option == "--scan-axis") {
-                o.scan_axis = argv[i];
+                if (value != "auto" && value != "x" && value != "y")
+                    throw std::runtime_error("--scan-axis must be auto, x or y");
+                o.scan_axis = value == "auto" ? SF_SCAN_AUTO : value == "x" ? SF_SCAN_X : SF_SCAN_Y;
             } else if (option == "--rs") {
                 if (value != "on" && value != "off")
                     throw std::runtime_error("--rs must be on or off");
@@ -185,42 +190,41 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Unknown option: " + option);
         }
         sf_run_summary result{};
-        result.struct_size = sizeof(result);
         sf_error error{};
-        error.struct_size = sizeof(error);
         struct Display {
             bool terminal = isatty(STDERR_FILENO);
             int percent = -1, stage = -1;
         } display;
-        sf_progress progress{sizeof(progress), &display,
-                             [](void* context, const char* text) {
-                                 if (static_cast<Display*>(context)->terminal)
-                                     std::cerr << "\r\033[K";
-                                 std::cerr << text << '\n';
-                             },
-                             [](void* context, const sf_progress_event* event) {
-                                 auto& state = *static_cast<Display*>(context);
-                                 const int percent = static_cast<int>(event->fraction * 100);
-                                 if (state.percent == percent && state.stage == event->stage && !event->stage_complete)
-                                     return;
-                                 state.percent = percent;
-                                 state.stage = event->stage;
-                                 constexpr const char* stages[]{"analyze", "recover",  "plan",
-                                                                "render",  "finalize", "complete"};
-                                 if (state.terminal)
-                                     std::cerr << "\r\033[K";
-                                 std::cerr << '[' << std::string(percent / 5, '=') << std::string(20 - percent / 5, ' ')
-                                           << "] " << percent << "% " << stages[event->stage];
-                                 if (event->processed_frames || event->total_frames) {
-                                     std::cerr << ' ' << event->processed_frames;
-                                     if (event->total_frames)
-                                         std::cerr << '/' << event->total_frames;
-                                 }
-                                 if (!state.terminal || event->stage == SF_PROGRESS_COMPLETE)
-                                     std::cerr << '\n';
-                                 std::cerr.flush();
-                             }};
-        if (sf_stabilize_file(&o, nullptr, &progress, &result, &error) != SF_OK)
+        sf_file_callbacks callbacks{
+            {&display, nullptr,
+             [](void* context, const char* text) {
+                 if (static_cast<Display*>(context)->terminal)
+                     std::cerr << "\r\033[K";
+                 std::cerr << text << '\n';
+             },
+             nullptr},
+            [](void* context, const sf_progress_event* event) {
+                auto& state = *static_cast<Display*>(context);
+                const int percent = static_cast<int>(event->fraction * 100);
+                if (state.percent == percent && state.stage == event->stage && !event->stage_complete)
+                    return;
+                state.percent = percent;
+                state.stage = event->stage;
+                constexpr const char* stages[]{"analyze", "recover", "plan", "render", "finalize", "complete"};
+                if (state.terminal)
+                    std::cerr << "\r\033[K";
+                std::cerr << '[' << std::string(percent / 5, '=') << std::string(20 - percent / 5, ' ') << "] "
+                          << percent << "% " << stages[event->stage];
+                if (event->processed_frames || event->total_frames) {
+                    std::cerr << ' ' << event->processed_frames;
+                    if (event->total_frames)
+                        std::cerr << '/' << event->total_frames;
+                }
+                if (!state.terminal || event->stage == SF_PROGRESS_COMPLETE)
+                    std::cerr << '\n';
+                std::cerr.flush();
+            }};
+        if (sf_stabilize_file(&o, &callbacks, &result, &error) != SF_OK)
             throw std::runtime_error(error.message);
         const std::string report = o.report ? o.report : std::string(o.output) + ".profile.json";
         std::cout << std::fixed << std::setprecision(2) << result.frames << " frames, " << result.wall_ms / 1000

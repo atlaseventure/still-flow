@@ -1,4 +1,4 @@
-STILLFLOW_1 {
+{
     global: sf_*;
     local: *;
 };

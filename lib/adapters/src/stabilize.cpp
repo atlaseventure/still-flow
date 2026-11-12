@@ -352,8 +352,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
                     break;
             }
             if (!writer) {
-                const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio,
-                                                options.audio_mode};
+                const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
                 writer = services.media.writer(output->temporary(), size, info.fps, *reader, frame.pts_us, encoding,
                                                {options.encoder, gpu});
                 if (comparison)
@@ -483,8 +482,7 @@ RunSummary stabilize(const Options& request, Services services) {
         auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         const Size size(info.width, info.height);
         const CodecRequest encoder{options.encoder, gpu};
-        const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio,
-                                        options.audio_mode};
+        const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
         auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, encoding, encoder);
         std::unique_ptr<VideoWriter> compare_writer;
         if (comparison)

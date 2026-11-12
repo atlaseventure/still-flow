@@ -764,8 +764,8 @@ EncoderContext open_nvenc(const EncoderSettings& settings, AVBufferRef* device) 
 } // namespace
 
 Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
-               int threads, int crf, const std::string& preset, bool audio, AudioMode audio_mode,
-               const CodecRequest& request, HardwareDevices& devices)
+               int threads, int crf, const std::string& preset, AudioMode audio, const CodecRequest& request,
+               HardwareDevices& devices)
     : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
     for (unsigned i = 0; i < source->nb_streams; ++i)
@@ -815,17 +815,17 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
         s.video->codecpar->format = AV_PIX_FMT_YUV420P; // What decoders of the stream produce.
     s.stream_map.assign(source->nb_streams, -1);
     s.audio_transcoders.resize(source->nb_streams);
-    if (audio && audio_mode != AudioMode::drop) {
+    if (audio != AudioMode::drop) {
         for (unsigned i = 0; i < source->nb_streams; ++i) {
             const auto* input = source->streams[i];
             if (input->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
                 continue;
             const bool compatible =
                 avformat_query_codec(s.format->oformat, input->codecpar->codec_id, FF_COMPLIANCE_NORMAL) > 0;
-            if (!compatible && audio_mode == AudioMode::copy)
+            if (!compatible && audio == AudioMode::copy)
                 throw std::runtime_error(
                     "Audio codec is incompatible with output container; use --audio auto, aac or none");
-            const bool transcode = audio_mode == AudioMode::aac || !compatible;
+            const bool transcode = audio == AudioMode::aac || !compatible;
             auto* stream = avformat_new_stream(s.format, nullptr);
             if (!stream)
                 throw std::bad_alloc();

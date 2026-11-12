@@ -34,8 +34,7 @@ struct EncodingSettings {
     int threads = 12;
     int crf = 18;
     std::string preset = "fast";
-    bool audio = true;
-    AudioMode audio_mode = AudioMode::automatic;
+    AudioMode audio = AudioMode::automatic;
 };
 // The codec a reader or writer actually used. A hardware decoder may hand
 // individual streams back to software, so frames are counted separately.

@@ -19,8 +19,7 @@ struct Options : StabilizationSettings {
     std::string decoder = "auto", encoder = "auto";
     bool realtime = false;
     StreamSettings stream;
-    bool audio = true;
-    AudioMode audio_mode = AudioMode::automatic;
+    AudioMode audio = AudioMode::automatic;
     bool overwrite = false;
 };
 // Resolve derived paths and validate the use-case request before invoking services.

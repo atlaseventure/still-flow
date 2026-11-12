@@ -139,7 +139,12 @@ class StillFlow(
 
     /** Render the last ready index using the corresponding retained full frame. */
     @Synchronized
-    fun renderReady(frame: Frame, destination: ByteBuffer): Frame = render(0, frame, destination)
+    fun renderReady(frame: Frame, destination: ByteBuffer): Frame {
+        requireOpen()
+        val output = outputBuffer(frame, destination)
+        nativeRenderReady(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
+        return Frame(frame.width, frame.height, frame.format, frame.width * frame.format.bytesPerPixel, output)
+    }
 
     class RecoveryFrame internal constructor(values: LongArray) {
         @JvmField val index = values[0]
@@ -176,15 +181,21 @@ class StillFlow(
     @Synchronized
     fun render(index: Int, frame: Frame, destination: ByteBuffer): Frame {
         requireOpen()
+        require(index >= 0) { "Invalid frame index" }
+        val output = outputBuffer(frame, destination)
+        nativeRender(handle, index, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
+        return Frame(frame.width, frame.height, frame.format, frame.width * frame.format.bytesPerPixel, output)
+    }
+
+    private fun outputBuffer(frame: Frame, destination: ByteBuffer): ByteBuffer {
         val rowBytes = frame.width.toLong() * frame.format.bytesPerPixel
         val size = rowBytes * frame.height
-        require(index >= 0 && destination.isDirect && !destination.isReadOnly && rowBytes <= Int.MAX_VALUE && size <= destination.remaining()) {
-            "Invalid index or writable direct destination extent"
+        require(destination.isDirect && !destination.isReadOnly && rowBytes <= Int.MAX_VALUE && size <= destination.remaining()) {
+            "Invalid writable direct destination extent"
         }
         val output = destination.slice()
         output.limit(size.toInt())
-        nativeRender(handle, index, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
-        return Frame(frame.width, frame.height, frame.format, rowBytes.toInt(), output)
+        return output
     }
 
     @Synchronized
@@ -195,7 +206,7 @@ class StillFlow(
         }
     }
 
-    /** Native streaming stage samples as JSON pairs [stage, milliseconds]. */
+    /** Native streaming stage aggregates as JSON objects with count, total_ms, min_ms and max_ms. */
     @Synchronized
     fun profile(): String {
         requireOpen()
@@ -237,6 +248,9 @@ class StillFlow(
         @JvmStatic private external fun nativeRendererInfo(handle: Long): Array<String>
         @JvmStatic private external fun nativeRender(
             handle: Long, index: Int, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, destination: ByteBuffer,
+        )
+        @JvmStatic private external fun nativeRenderReady(
+            handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, destination: ByteBuffer,
         )
         @JvmStatic private external fun nativeDestroy(handle: Long)
         @JvmStatic private external fun nativeBuildDescription(): String

@@ -7,21 +7,17 @@
 
 namespace {
 struct Api {
-    sf_settings settings{};
-    sf_video video{sizeof(sf_video), 64, 64, 0, 30};
-    sf_image image{};
+    sf_settings settings = sf_settings_default();
+    sf_video video{64, 64, 0, 30};
+    sf_image image = sf_image_default();
     sf_error error{};
     std::vector<uint8_t> pixels = std::vector<uint8_t>(4096);
     sf_analyzer* analyzer = nullptr;
     sf_plan* plan = nullptr;
+    sf_frame_plan* frame_plan = nullptr;
     sf_renderer* renderer = nullptr;
     sf_frame* frame = nullptr;
     Api() {
-        settings.struct_size = sizeof(settings);
-        REQUIRE(sf_settings_default(&settings) == SF_OK);
-        image.struct_size = sizeof(image);
-        REQUIRE(sf_image_default(&image) == SF_OK);
-        error.struct_size = sizeof(error);
         uint32_t seed = 42;
         for (auto& p : pixels) {
             seed = seed * 1664525 + 1013904223;
@@ -31,11 +27,12 @@ struct Api {
         image.height = 64;
         image.format = SF_GRAY8;
         image.plane_count = 1;
-        image.planes[0] = {sizeof(sf_plane), pixels.data(), pixels.size(), 64};
+        image.planes[0] = {pixels.data(), pixels.size(), 64};
     }
     ~Api() {
         sf_frame_destroy(frame);
         sf_renderer_destroy(renderer);
+        sf_frame_plan_destroy(frame_plan);
         sf_plan_destroy(plan);
         sf_analyzer_destroy(analyzer);
     }
@@ -44,10 +41,10 @@ struct Api {
     }
 };
 } // namespace
-TEST_CASE("C ABI validates structure sizes and contains exceptions", "[c-api]") {
+TEST_CASE("C API validates arguments and contains exceptions", "[c-api]") {
     Api api;
     auto bad = api.settings;
-    bad.struct_size = 1;
+    bad.analysis_width = 1;
     REQUIRE(sf_analyzer_create(&bad, &api.video, nullptr, &api.analyzer, &api.error) == SF_INVALID_ARGUMENT);
     REQUIRE(api.analyzer == nullptr);
     REQUIRE(std::strlen(api.error.message) > 0);
@@ -61,14 +58,6 @@ TEST_CASE("C ABI validates structure sizes and contains exceptions", "[c-api]") 
     sf_plan* extra = nullptr;
     REQUIRE(sf_analyzer_finish(api.analyzer, &extra, &api.error) == SF_INVALID_STATE);
     REQUIRE(extra == nullptr);
-    struct Extended {
-        sf_settings settings;
-        std::array<uint8_t, 16> tail;
-    } extended{};
-    extended.settings.struct_size = sizeof(extended);
-    extended.tail.fill(0xAB);
-    REQUIRE(sf_settings_default(&extended.settings) == SF_OK);
-    REQUIRE(extended.tail[0] == 0xAB);
 }
 TEST_CASE("C ABI retains input leases and renders independently owned output", "[c-api]") {
     int leases = 0;
@@ -87,13 +76,14 @@ TEST_CASE("C ABI retains input leases and renders independently owned output", "
     REQUIRE(sf_analyzer_finish(api.analyzer, &api.plan, &api.error) == SF_OK);
     REQUIRE(leases == 0);
     sf_plan_info info{};
-    info.struct_size = sizeof(info);
     REQUIRE(sf_plan_get_info(api.plan, &info, &api.error) == SF_OK);
     REQUIRE(info.frames == 2);
-    REQUIRE(sf_renderer_create(nullptr, &api.renderer, &api.error) == SF_OK);
-    REQUIRE(sf_renderer_render(api.renderer, api.plan, 0, &api.image, &api.frame, &api.error) == SF_OK);
+    REQUIRE(sf_renderer_create(SF_BACKEND_CPU, nullptr, &api.renderer, &api.error) == SF_OK);
+    REQUIRE(sf_plan_get_frame(api.plan, 0, &api.frame_plan, &api.error) == SF_OK);
+    sf_plan_destroy(api.plan);
+    api.plan = nullptr;
+    REQUIRE(sf_renderer_render(api.renderer, api.frame_plan, &api.image, &api.frame, &api.error) == SF_OK);
     sf_image output{};
-    output.struct_size = sizeof(output);
     REQUIRE(sf_frame_get_image(api.frame, &output, &api.error) == SF_OK);
     REQUIRE(output.kr == api.image.kr);
     REQUIRE(output.kb == api.image.kb);
@@ -107,8 +97,7 @@ TEST_CASE("C ABI retains input leases and renders independently owned output", "
 TEST_CASE("C ABI translates cancellation and invalid host scheduler behavior into status codes", "[c-api]") {
     Api api;
     bool stop = false;
-    sf_runtime runtime{sizeof(runtime), &stop, [](void* p) -> int32_t { return *static_cast<bool*>(p); }, nullptr,
-                       nullptr};
+    sf_runtime runtime{&stop, [](void* p) -> int32_t { return *static_cast<bool*>(p); }, nullptr, nullptr};
     api.create(&runtime);
     stop = true;
     REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 0, 33333, &api.error) == SF_CANCELLED);
@@ -130,7 +119,7 @@ TEST_CASE("C ABI copies borrowed frames and validates YUV plane extents", "[c-ap
     api.image.format = SF_NV12;
     api.image.plane_count = 2;
     std::vector<uint8_t> chroma(2048, 128);
-    api.image.planes[1] = {sizeof(sf_plane), chroma.data(), 10, 64};
+    api.image.planes[1] = {chroma.data(), 10, 64};
     REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 66666, 33333, &api.error) == SF_INVALID_ARGUMENT);
     api.image.planes[1].size_bytes = chroma.size();
     REQUIRE(sf_analyzer_push(api.analyzer, &api.image, 66666, 33333, &api.error) == SF_OK);

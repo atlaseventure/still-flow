@@ -33,7 +33,7 @@ if(STILLFLOW_BUILD_CLI AND NOT STILLFLOW_BUILD_ADAPTERS)
 endif()
 
 option(STILLFLOW_BUILD_EXAMPLES "Build the in-memory C example" ON)
-option(STILLFLOW_BUILD_C_API "Build the stable C interface" ON)
+option(STILLFLOW_BUILD_C_API "Build the C interface" ON)
 option(STILLFLOW_C_API_SHARED "Build the C interface as a shared library" ON)
 option(STILLFLOW_WITH_CUDA "Build CUDA rendering when a toolkit is available" ${stillflow_desktop_default})
 option(STILLFLOW_WITH_NVCODEC "Build FFmpeg with runtime-loaded NVDEC/NVENC support" ${stillflow_desktop_default})

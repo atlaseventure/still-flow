@@ -60,8 +60,10 @@ void Analyzer::recover(const Image& image, int64_t pts, Profile& profile) {
 }
 void Analyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
     execution_.check();
-    if (finished_ || recovery_ || (!result_.frames.empty() && pts <= last_pts_) || duration < 0)
-        throw std::invalid_argument("Invalid analyzer state or timestamp");
+    if (finished_ || recovery_)
+        throw std::logic_error("Analyzer input is sealed");
+    if ((!result_.frames.empty() && pts <= last_pts_) || duration < 0)
+        throw std::invalid_argument("Invalid analyzer timestamp or duration");
     auto current = gray_proxy(image, result_.size);
     Motion observation;
     observation.row_delta.resize(settings_.bands);
@@ -75,8 +77,10 @@ void Analyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& 
 }
 void Analyzer::push_observation(Motion motion, int64_t pts, int64_t duration) {
     execution_.check();
-    if (finished_ || recovery_ || duration < 0 || (!result_.frames.empty() && pts <= last_pts_))
-        throw std::invalid_argument("Invalid analyzer state or timestamp");
+    if (finished_ || recovery_)
+        throw std::logic_error("Analyzer input is sealed");
+    if (duration < 0 || (!result_.frames.empty() && pts <= last_pts_))
+        throw std::invalid_argument("Invalid analyzer timestamp or duration");
     if (result_.frames.empty())
         result_.origin_us = pts;
     const double seconds = static_cast<double>((static_cast<long double>(pts) - result_.origin_us) / 1000000);

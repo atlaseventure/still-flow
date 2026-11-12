@@ -18,12 +18,16 @@ set_target_properties(
     PROPERTIES EXPORT_NAME c
                POSITION_INDEPENDENT_CODE ON
                VERSION ${PROJECT_VERSION}
-               SOVERSION 1)
+               SOVERSION 0)
 target_compile_definitions(stillflow_c PRIVATE STILLFLOW_VERSION="${PROJECT_VERSION}")
 target_include_directories(stillflow_c PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
                                               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 if(STILLFLOW_C_API_SHARED)
     target_link_options(stillflow_c PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+    set_property(
+        TARGET stillflow_c
+        APPEND
+        PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
 endif()
 install(
     TARGETS stillflow_c
@@ -47,10 +51,14 @@ if(STILLFLOW_BUILD_ADAPTERS)
         stillflow_desktop_c
         PROPERTIES EXPORT_NAME desktop_c
                    VERSION ${PROJECT_VERSION}
-                   SOVERSION 1
+                   SOVERSION 0
                    INSTALL_RPATH "$ORIGIN")
     target_link_options(stillflow_desktop_c PRIVATE "LINKER:--no-undefined")
     target_link_options(stillflow_desktop_c PRIVATE "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+    set_property(
+        TARGET stillflow_desktop_c
+        APPEND
+        PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
     install(
         TARGETS stillflow_desktop_c
         EXPORT StillFlowTargets

@@ -11,27 +11,22 @@
 namespace {
 class Progress final : public stillflow::Progress {
   public:
-    explicit Progress(const sf_progress* value) {
-        if (value) {
-            if (value->struct_size < offsetof(sf_progress, event))
-                throw std::invalid_argument("Undersized progress callbacks");
-            std::memcpy(&value_, value, offsetof(sf_progress, event));
-            if (value->struct_size >= sizeof(sf_progress))
-                value_.event = value->event;
-        }
-    }
+    explicit Progress(const sf_file_callbacks* callbacks) : callbacks_(callbacks ? *callbacks : sf_file_callbacks{}) {}
     void event(const stillflow::ProgressEvent& value) override {
-        if (value_.event) {
-            const sf_progress_event event{sizeof(sf_progress_event), static_cast<int32_t>(value.stage),
-                                          value.stage_complete,      value.processed_frames,
-                                          value.total_frames,        value.processed_us,
-                                          value.duration_us,         value.fraction};
-            value_.event(value_.user_data, &event);
+        if (callbacks_.progress) {
+            const sf_progress_event event{static_cast<sf_progress_stage>(value.stage),
+                                          value.stage_complete,
+                                          value.processed_frames,
+                                          value.total_frames,
+                                          value.processed_us,
+                                          value.duration_us,
+                                          value.fraction};
+            callbacks_.progress(callbacks_.runtime.user_data, &event);
         }
     }
     void send(const std::string& message) {
-        if (value_.message)
-            value_.message(value_.user_data, message.c_str());
+        if (callbacks_.runtime.log)
+            callbacks_.runtime.log(callbacks_.runtime.user_data, message.c_str());
     }
     void backend(const stillflow::RenderingReport& report) override {
         std::string text = "Render backend: " + report.backend;
@@ -61,36 +56,22 @@ class Progress final : public stillflow::Progress {
     }
 
   private:
-    sf_progress value_{};
+    sf_file_callbacks callbacks_{};
 };
 std::filesystem::path path(const char* text) {
     return text ? std::filesystem::path(reinterpret_cast<const char8_t*>(text)) : std::filesystem::path{};
 }
 } // namespace
 extern "C" {
-sf_status sf_file_options_default(sf_file_options* value) {
-    return stillflow::c_api::boundary(nullptr, [&] {
-        if (!value || value->struct_size < offsetof(sf_file_options, realtime))
-            throw std::invalid_argument("Missing or undersized file options");
-        auto size = value->struct_size;
-        std::memset(value, 0, std::min(size, sizeof(sf_file_options)));
-        value->struct_size = size;
-        value->stabilization.struct_size = sizeof(sf_settings);
-        sf_settings_default(&value->stabilization);
-        value->stabilization.motion_estimator = SF_MOTION_OPENCV;
-        value->scan_axis = "auto";
-        value->preset = "fast";
-        value->backend = "auto";
-        value->decoder = "auto";
-        value->encoder = "auto";
-        value->threads = 12;
-        value->crf = 18;
-        value->audio = 1;
-        if (size >= offsetof(sf_file_options, audio_mode)) {
-            value->lookahead_seconds = 1.5;
-            value->max_buffered_frames = 120;
-        }
-    });
+sf_file_options sf_file_options_default(void) {
+    sf_file_options value{};
+    value.stabilization = sf_settings_default();
+    value.stabilization.motion_estimator = SF_MOTION_OPENCV;
+    value.stream = sf_stream_settings_default();
+    value.preset = "fast";
+    value.threads = 12;
+    value.crf = 18;
+    return value;
 }
 const char* sf_desktop_build_description(void) {
     try {
@@ -100,41 +81,55 @@ const char* sf_desktop_build_description(void) {
         return "stillflow (build description unavailable)";
     }
 }
-sf_status sf_stabilize_file(const sf_file_options* value, const sf_runtime* callbacks, const sf_progress* progress,
-                            sf_run_summary* summary, sf_error* error) {
+sf_status sf_stabilize_file(const sf_file_options* value, const sf_file_callbacks* callbacks, sf_run_summary* summary,
+                            sf_error* error) {
+    if (summary)
+        *summary = {};
     return stillflow::c_api::boundary(error, [&] {
-        if (!value || value->struct_size < offsetof(sf_file_options, realtime))
-            throw std::invalid_argument("Missing or undersized file options");
+        stillflow::c_api::require(value);
         stillflow::c_api::require(summary);
-        if (!value->scan_axis || !value->preset || !value->backend || !value->decoder || !value->encoder)
-            throw std::invalid_argument("Missing file option string");
+        stillflow::c_api::boolean(value->overwrite);
+        if (!value->preset)
+            throw std::invalid_argument("Missing encoder preset");
         if (value->stabilization.motion_estimator != SF_MOTION_OPENCV)
             throw std::invalid_argument("Desktop processing requires the OpenCV estimator");
+        if (value->mode != SF_FILE_OFFLINE && value->mode != SF_FILE_STREAM)
+            throw std::invalid_argument("Invalid file processing mode");
+        if (value->scan_axis < SF_SCAN_AUTO || value->scan_axis > SF_SCAN_Y || value->decoder < SF_DECODER_AUTO ||
+            value->decoder > SF_DECODER_NVDEC || value->encoder < SF_ENCODER_AUTO ||
+            value->encoder > SF_ENCODER_NVENC || value->audio < SF_AUDIO_AUTO || value->audio > SF_AUDIO_DROP)
+            throw std::invalid_argument("Invalid media selector");
+        constexpr const char* scans[]{"auto", "x", "y"};
+        constexpr const char* decoders[]{"auto", "cpu", "nvdec"};
+        constexpr const char* encoders[]{"auto", "openh264", "nvenc"};
         stillflow::Options options;
         static_cast<stillflow::StabilizationSettings&>(options) = stillflow::c_api::settings(&value->stabilization);
         options.input = path(value->input);
         options.output = path(value->output);
         options.compare = path(value->compare);
         options.report = path(value->report);
-        options.scan_axis = value->scan_axis;
+        options.scan_axis = scans[value->scan_axis];
         options.preset = value->preset;
-        options.backend = value->backend;
-        options.decoder = value->decoder;
-        options.encoder = value->encoder;
+        options.backend = stillflow::c_api::backend_name(value->backend);
+        if (value->backend == SF_BACKEND_GLES)
+            throw stillflow::BackendError("GLES is unavailable in the desktop file adapter");
+#ifndef STILLFLOW_C_CUDA
+        if (value->backend == SF_BACKEND_CUDA)
+            throw stillflow::BackendError("CUDA is unavailable in this build");
+#endif
+        options.decoder = decoders[value->decoder];
+        options.encoder = encoders[value->encoder];
         options.threads = value->threads;
         options.crf = value->crf;
-        options.audio = value->audio != 0;
+        options.audio = static_cast<stillflow::AudioMode>(value->audio);
         options.overwrite = value->overwrite != 0;
-        if (value->struct_size >= offsetof(sf_file_options, audio_mode)) {
-            options.realtime = value->realtime != 0;
-            options.stream = {value->lookahead_seconds, value->max_buffered_frames};
-        }
-        if (value->struct_size >= offsetof(sf_file_options, audio_mode) + sizeof(value->audio_mode))
-            options.audio_mode = static_cast<stillflow::AudioMode>(value->audio_mode);
-        stillflow::c_api::Runtime runtime(callbacks);
+        options.realtime = value->mode == SF_FILE_STREAM;
+        options.stream = {value->stream.lookahead_seconds, value->stream.max_buffered_frames};
+        const auto* runtime_callbacks = callbacks ? &callbacks->runtime : nullptr;
+        stillflow::c_api::Runtime runtime(runtime_callbacks);
         auto executor = stillflow::make_thread_executor(options.threads);
         options.execution = runtime.settings();
-        if (!callbacks || !callbacks->execute)
+        if (!runtime_callbacks || !runtime_callbacks->execute)
             options.execution.executor = executor.get();
         auto media = stillflow::make_media_factory();
         auto images = stillflow::make_image_processing();
@@ -149,7 +144,7 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_runtime* call
         auto renderers = stillflow::make_renderer_factory(std::move(providers));
         auto outputs = stillflow::make_output_storage();
         auto host = stillflow::make_runtime();
-        Progress events(progress);
+        Progress events(callbacks);
         auto result = stillflow::stabilize(options, {*media, *images, *renderers, *outputs, *host, events});
         summary->frames = result.frames;
         summary->wall_ms = result.wall_ms;

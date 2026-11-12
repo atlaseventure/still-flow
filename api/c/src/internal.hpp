@@ -7,25 +7,28 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <type_traits>
 
 namespace stillflow::c_api {
 template <class T> void require(const T* value) {
-    if (!value || value->struct_size < sizeof(T))
-        throw std::invalid_argument("Missing or undersized structure");
+    if (!value)
+        throw std::invalid_argument("Missing required argument");
 }
 inline void message(sf_error* error, const char* text) noexcept {
-    if (error && error->struct_size >= sizeof(sf_error)) {
+    if (error) {
         std::strncpy(error->message, text, sizeof(error->message) - 1);
         error->message[sizeof(error->message) - 1] = '\0';
     }
 }
 template <class F> sf_status boundary(sf_error* error, F work) noexcept {
-    if (error && error->struct_size < sizeof(sf_error))
-        return SF_INVALID_ARGUMENT;
     message(error, "");
     try {
-        work();
-        return SF_OK;
+        if constexpr (std::is_void_v<std::invoke_result_t<F>>) {
+            work();
+            return SF_OK;
+        } else {
+            return work();
+        }
     } catch (const Cancelled& e) {
         message(error, e.what());
         return SF_CANCELLED;
@@ -114,8 +117,29 @@ class Runtime final : public CancellationToken, public Logger, public Executor {
   private:
     sf_runtime callbacks_{};
 };
+inline const char* backend_name(sf_backend backend) {
+    switch (backend) {
+    case SF_BACKEND_AUTO:
+        return "auto";
+    case SF_BACKEND_CPU:
+        return "cpu";
+    case SF_BACKEND_GLES:
+        return "gles";
+    case SF_BACKEND_CUDA:
+        return "cuda";
+    default:
+        throw std::invalid_argument("Invalid rendering backend");
+    }
+}
+inline void boolean(int32_t value) {
+    if (value != 0 && value != 1)
+        throw std::invalid_argument("Boolean values must be zero or one");
+}
 inline StabilizationSettings settings(const sf_settings* value) {
     require(value);
+    boolean(value->rolling_shutter);
+    if (value->motion_estimator != SF_MOTION_TRANSLATION && value->motion_estimator != SF_MOTION_OPENCV)
+        throw std::invalid_argument("Invalid motion estimator");
     StabilizationSettings result;
     result.analysis_width = value->analysis_width;
     result.features = value->features;
