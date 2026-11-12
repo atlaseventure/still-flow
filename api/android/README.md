@@ -37,6 +37,8 @@ StillFlow(width, height, fps).use { session ->
 
 For offline recovery, decode again only when requested and feed the requested indices in order. `finish()` requires recovery to be complete. Use the same source luma and timestamps for analysis and replay.
 
+For offline GPU Surface output on Android 10+, finish analysis, then decode again into an `ImageReader` Surface. Pass each decoded `Image`, `session.frameMap(index)` and its relative PTS to `GpuFrames.render(image, map, ptsUs, bt709, fullRange)`. Use the validated source color matrix/range and an encoder input Surface; drain the encoder around rendering. The call completes source reads before returning, so close the Image immediately afterward. This path requires `GL_EXT_YUV_target` and keeps full-resolution pixels on the GPU.
+
 `Frame` accepts direct buffers containing gray8, BGR8 or RGBA8, with an explicit row stride. It captures the buffer's remaining range. Analysis copies input as needed; rendering writes to caller-owned storage. Keep input unchanged during each call and close sessions with Kotlin `use` or Java try-with-resources.
 
 `Settings.backend` defaults to `AUTO`, preferring OpenGL ES 3.1 compute and falling back to CPU on backend failures. `GLES` requires GPU execution; `CPU` selects software rendering. `rendererInfo()` reports the active device and fallback reason. GPU rendering includes upload and readback for the buffer API.

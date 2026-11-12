@@ -1,6 +1,7 @@
 package io.stillflow
 
 import androidx.annotation.RequiresApi
+import android.graphics.Rect
 import android.hardware.HardwareBuffer
 import android.media.Image
 import android.opengl.EGL14
@@ -39,6 +40,7 @@ class GpuFrames(
     private var copyProgram = 0
     private var proxyProgram = 0
     private var warpProgram = 0
+    private var offlineTexture = 0
     private var proxyWidth = 0
     private var proxyHeight = 0
     private val ownerThread = Thread.currentThread()
@@ -100,14 +102,8 @@ class GpuFrames(
             GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, external[0])
             val imported = nativeImport(buffer)
             try {
-                fun source(program: Int) {
-                    GLES30.glUseProgram(program)
-                    GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "source"), 0)
-                    GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "codedSize"), buffer.width.toFloat(), buffer.height.toFloat())
-                    GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "crop"), crop.left.toFloat(), crop.top.toFloat(), width.toFloat(), height.toFloat())
-                }
                 target(texture, width, height)
-                source(copyProgram)
+                source(copyProgram, buffer, crop)
                 GLES30.glUniform2f(GLES30.glGetUniformLocation(copyProgram, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
                 GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "fullRange"), if (fullRange) 1 else 0)
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
@@ -119,7 +115,7 @@ class GpuFrames(
                     proxyHeight = analysisHeight
                 }
                 target(proxy[0], packedWidth, analysisHeight)
-                source(proxyProgram)
+                source(proxyProgram, buffer, crop)
                 GLES30.glUniform2f(GLES30.glGetUniformLocation(proxyProgram, "analysisSize"), analysisWidth.toFloat(), analysisHeight.toFloat())
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
                 val bytes = packedWidth * analysisHeight * 4
@@ -143,6 +139,48 @@ class GpuFrames(
     fun render(frame: Frame, map: FloatArray, ptsUs: Long) {
         checkThread()
         require(frame.owner === this && !frame.rendered) { "Frame is foreign or already consumed" }
+        renderTexture(frame.texture, map, ptsUs)
+        frame.rendered = true
+        free.add(frame.texture)
+        proxies.add(frame.buffer)
+    }
+
+    /** Render one decoded Image with an offline map; the caller may close the Image on return. */
+    fun render(image: Image, map: FloatArray, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
+        checkThread()
+        val crop = image.cropRect
+        require(crop.width() == width && crop.height() == height)
+        val buffer = checkNotNull(image.hardwareBuffer) { "Decoder image has no HardwareBuffer" }
+        try {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, external[0])
+            val imported = nativeImport(buffer)
+            try {
+                if (offlineTexture == 0) offlineTexture = allocate(width, height)
+                target(offlineTexture, width, height)
+                source(copyProgram, buffer, crop)
+                GLES30.glUniform2f(GLES30.glGetUniformLocation(copyProgram, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
+                GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "fullRange"), if (fullRange) 1 else 0)
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                renderTexture(offlineTexture, map, ptsUs)
+            } finally {
+                // Complete source reads before the decoder recycles this Image, including on failure.
+                GLES30.glFinish()
+                nativeRelease(imported)
+            }
+        } finally {
+            buffer.close()
+        }
+    }
+
+    private fun source(program: Int, buffer: HardwareBuffer, crop: Rect) {
+        GLES30.glUseProgram(program)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "source"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "codedSize"), buffer.width.toFloat(), buffer.height.toFloat())
+        GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "crop"), crop.left.toFloat(), crop.top.toFloat(), width.toFloat(), height.toFloat())
+    }
+
+    private fun renderTexture(texture: Int, map: FloatArray, ptsUs: Long) {
         require(map.size >= 8 && ptsUs >= 0 && map.all { it.isFinite() })
         val vertices = map[0].toInt() * map[1].toInt()
         require(map[0].toInt() in 2..32 && map[1].toInt() in 2..32 && vertices <= 288 && map.size == 8 + 2 * vertices)
@@ -150,7 +188,7 @@ class GpuFrames(
         GLES30.glViewport(0, 0, width, height)
         GLES30.glUseProgram(warpProgram)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, frame.texture)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "source"), 0)
         GLES30.glUniform2f(GLES30.glGetUniformLocation(warpProgram, "dimensions"), width.toFloat(), height.toFloat())
         GLES30.glUniform2i(GLES30.glGetUniformLocation(warpProgram, "meshSize"), map[0].toInt(), map[1].toInt())
@@ -161,9 +199,6 @@ class GpuFrames(
         checkGl()
         check(EGLExt.eglPresentationTimeANDROID(display, window, Math.multiplyExact(ptsUs, 1000)))
         check(EGL14.eglSwapBuffers(display, window))
-        frame.rendered = true
-        free.add(frame.texture)
-        proxies.add(frame.buffer)
     }
 
     private fun target(texture: Int, width: Int, height: Int) {
@@ -186,6 +221,7 @@ class GpuFrames(
         GLES30.glDeleteProgram(proxyProgram)
         GLES30.glDeleteProgram(warpProgram)
         GLES30.glDeleteTextures(owned.size, owned.toIntArray(), 0)
+        GLES30.glDeleteTextures(1, intArrayOf(offlineTexture), 0)
         GLES30.glDeleteTextures(1, external, 0)
         GLES30.glDeleteTextures(1, proxy, 0)
         GLES30.glDeleteFramebuffers(1, fbo, 0)

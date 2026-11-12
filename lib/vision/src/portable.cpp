@@ -4,6 +4,28 @@
 #include <limits>
 
 namespace stillflow {
+namespace {
+struct AreaSpan {
+    int first, end;
+    size_t offset;
+};
+struct AreaAxis {
+    std::vector<AreaSpan> spans;
+    std::vector<double> weights;
+    AreaAxis(int source, int target) {
+        const double scale = double(source) / target;
+        spans.reserve(target);
+        weights.reserve(static_cast<size_t>(source) + target);
+        for (int at = 0; at < target; ++at) {
+            const double lo = at * scale, hi = (at + 1) * scale;
+            const int first = int(lo), end = std::min(source, int(std::ceil(hi)));
+            spans.push_back({first, end, weights.size()});
+            for (int sample = first; sample < end; ++sample)
+                weights.push_back(std::min(hi, double(sample + 1)) - std::max(lo, double(sample)));
+        }
+    }
+};
+} // namespace
 Image gray_proxy(const Image& input, Size size) {
     if (size.width < 2 || size.height < 2)
         throw std::invalid_argument("Invalid analysis size");
@@ -40,14 +62,17 @@ Image gray_proxy(const Image& input, Size size) {
     }
     // Area sampling preserves thin features when downscaling camera luma.
     const double sx = double(view.size.width) / size.width, sy = double(view.size.height) / size.height;
+    const AreaAxis horizontal(view.size.width, size.width), vertical(view.size.height, size.height);
     for (int y = 0; y < size.height; ++y)
         for (int x = 0; x < size.width; ++x) {
-            const double left = x * sx, right = (x + 1) * sx, top = y * sy, bottom = (y + 1) * sy;
+            const auto& xs = horizontal.spans[x];
+            const auto& ys = vertical.spans[y];
             double sum = 0;
-            for (int iy = int(top); iy < std::min(view.size.height, int(std::ceil(bottom))); ++iy)
-                for (int ix = int(left); ix < std::min(view.size.width, int(std::ceil(right))); ++ix)
-                    sum += sample(ix, iy) * (std::min(right, double(ix + 1)) - std::max(left, double(ix))) *
-                           (std::min(bottom, double(iy + 1)) - std::max(top, double(iy)));
+            // Keep the original accumulation order and rounding while reusing axis weights.
+            for (int iy = ys.first; iy < ys.end; ++iy)
+                for (int ix = xs.first; ix < xs.end; ++ix)
+                    sum += sample(ix, iy) * horizontal.weights[xs.offset + ix - xs.first] *
+                           vertical.weights[ys.offset + iy - ys.first];
             pixels[static_cast<size_t>(y) * size.width + x] =
                 static_cast<uint8_t>(std::clamp(std::lround(sum / (sx * sy)), 0L, 255L));
         }

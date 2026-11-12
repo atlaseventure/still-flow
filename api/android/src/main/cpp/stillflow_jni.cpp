@@ -121,6 +121,19 @@ void render(JNIEnv* env, const Session& owner, const sf_frame_plan* plan, jint w
         std::memcpy(data + static_cast<size_t>(row) * row_bytes,
                     output.planes[0].data + static_cast<size_t>(row) * output.planes[0].row_stride, row_bytes);
 }
+jfloatArray frame_map(JNIEnv* env, const Session& owner, const sf_frame_plan* plan) {
+    sf_error error{};
+    sf_map map{};
+    check(sf_frame_plan_get_map(plan, owner.width, owner.height, &map, &error), error);
+    std::vector<jfloat> values{float(map.columns), float(map.rows),   float(map.origin_x), float(map.origin_y),
+                               float(map.step_x),  float(map.step_y), float(map.grid_x),   float(map.grid_y)};
+    for (int i = 0; i < map.columns * map.rows * 2; ++i)
+        values.push_back(static_cast<float>(map.offsets[i]));
+    auto result = env->NewFloatArray(static_cast<jsize>(values.size()));
+    if (result)
+        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+    return result;
+}
 } // namespace
 
 extern "C" {
@@ -248,19 +261,27 @@ JNIEXPORT jfloatArray JNICALL Java_io_stillflow_StillFlow_nativeReadyMap(JNIEnv*
         auto& owner = session(handle);
         if (!owner.stream || !owner.ready)
             throw Failure(SF_INVALID_STATE, "No ready streaming plan");
-        sf_error error{};
-        sf_map map{};
-        check(sf_frame_plan_get_map(owner.ready.get(), owner.width, owner.height, &map, &error), error);
-        std::vector<jfloat> values{float(map.columns), float(map.rows),   float(map.origin_x), float(map.origin_y),
-                                   float(map.step_x),  float(map.step_y), float(map.grid_x),   float(map.grid_y)};
-        for (int i = 0; i < map.columns * map.rows * 2; ++i)
-            values.push_back(static_cast<float>(map.offsets[i]));
-        result = env->NewFloatArray(static_cast<jsize>(values.size()));
-        if (!result)
-            return;
-        env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
-        if (!env->ExceptionCheck())
+        result = frame_map(env, owner, owner.ready.get());
+        if (result && !env->ExceptionCheck())
             owner.ready.reset();
+    });
+    return result;
+}
+JNIEXPORT jfloatArray JNICALL Java_io_stillflow_StillFlow_nativeFrameMap(JNIEnv* env, jclass, jlong handle,
+                                                                         jint index) {
+    jfloatArray result = nullptr;
+    boundary(env, [&] {
+        auto& owner = session(handle);
+        if (!owner.plan || owner.stream)
+            throw Failure(SF_INVALID_STATE, "Finish offline analysis before extracting maps");
+        if (index < 0)
+            throw Failure(SF_INVALID_ARGUMENT, "Invalid frame index");
+        sf_error error{};
+        sf_frame_plan* raw = nullptr;
+        const auto status = sf_plan_get_frame(owner.plan.get(), static_cast<size_t>(index), &raw, &error);
+        Handle<sf_frame_plan, sf_frame_plan_destroy> plan(raw, sf_frame_plan_destroy);
+        check(status, error);
+        result = frame_map(env, owner, plan.get());
     });
     return result;
 }

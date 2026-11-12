@@ -37,7 +37,7 @@ class ExportRunner : Instrumentation() {
             require(runId.matches(Regex("[a-f0-9]{32}"))) { "Invalid run ID" }
             val directory = File(targetContext.filesDir, runId)
             val config = JSONObject(File(directory, "config.json").readText())
-            if (config.optBoolean("gpu_surface")) {
+            if (config.optBoolean("gpu_surface") && config.optBoolean("realtime")) {
                 exportGpu(directory, config)
             } else if (config.optBoolean("realtime")) exportStream(directory, config) else export(directory, config)
             report.put("status", "passed").put("run", runId)
@@ -64,6 +64,13 @@ class ExportRunner : Instrumentation() {
         .put("histogram_min_ms", TimingStatistics.HISTOGRAM_MIN_MS)
         .put("histogram_bins_per_octave", TimingStatistics.HISTOGRAM_BINS_PER_OCTAVE)
         .put("histogram_bins", TimingStatistics.HISTOGRAM_BINS)
+
+    private inline fun <T> timed(stages: MutableMap<String, TimingStatistics>, stage: String, work: () -> T): T {
+        val start = System.nanoTime()
+        try { return work() } finally {
+            stages.getOrPut(stage) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6)
+        }
+    }
 
     private fun progress(stage: String, frames: Int) {
         val event = JSONObject().put("stage", stage).put("frames", frames)
@@ -195,12 +202,15 @@ class ExportRunner : Instrumentation() {
         val timestamps = mutableListOf<Long>()
         val durationUs = Math.round(1_000_000 / fps)
         val began = System.nanoTime()
+        val stages = linkedMapOf<String, TimingStatistics>()
         StillFlow(width, height, fps, config.getBoolean("horizontalScan"), settings).use { session ->
+            val analysisStart = System.nanoTime()
             val frames = decode(input) { image, pts, _ ->
-                session.analyze(AndroidFrames.luma(image), pts, durationUs)
+                timed(stages, "analysis.analyze") { session.analyze(AndroidFrames.luma(image), pts, durationUs) }
                 timestamps.add(pts)
                 if (timestamps.size % 60 == 0) progress("analyze", timestamps.size)
             }
+            stages.getOrPut("analysis.decode_pass") { TimingStatistics() }.add((System.nanoTime() - analysisStart) / 1e6)
             var request = session.nextRecoveryFrame()
             var recoveryFrames = 0
             if (request != null) {
@@ -216,8 +226,15 @@ class ExportRunner : Instrumentation() {
                 check(request == null) { "Input ended during tracking recovery" }
             }
             report.put("recovery_frames", recoveryFrames)
-            check(frames > 0 && session.finish().frameCount == frames.toLong()) { "Analysis frame count mismatch" }
+            check(frames > 0 && timed(stages, "analysis.plan") { session.finish() }.frameCount == frames.toLong()) { "Analysis frame count mismatch" }
             report.put("analysis_seconds", (System.nanoTime() - began) / 1e9)
+            report.put("mode", "offline").put("decode_passes", if (recoveryFrames > 0) 3 else 2)
+            if (config.optBoolean("gpu_surface")) {
+                renderOfflineSurface(input, output, config, session, timestamps, stages)
+                report.put("stages", timingJson(stages)).put("profiling", profilingJson())
+                    .put("total_seconds", (System.nanoTime() - began) / 1e9)
+                return
+            }
             val fmt = MediaFormat.createVideoFormat("video/avc", width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
                 setInteger(MediaFormat.KEY_BIT_RATE, config.getInt("bitrate"))
@@ -245,9 +262,9 @@ class ExportRunner : Instrumentation() {
                     // The host validates the source matrix and range before deployment.
                     val bt709 = config.getBoolean("bt709")
                     val full = config.getBoolean("fullRange")
-                    pixels(true, image, inputPixels, width, height, bt709, full)
-                    session.render(index, frame, outputPixels)
-                    sink.submit(outputPixels, width, height, pts - timestamps[0])
+                    timed(stages, "render.yuv_to_rgba") { pixels(true, image, inputPixels, width, height, bt709, full) }
+                    timed(stages, "render.buffer") { session.render(index, frame, outputPixels) }
+                    timed(stages, "render.encode_and_convert") { sink.submit(outputPixels, width, height, pts - timestamps[0]) }
                     index++
                     if (index % 60 == 0) progress("render", index)
                 }
@@ -258,12 +275,65 @@ class ExportRunner : Instrumentation() {
                 report.put("frames", frames).put("width", width).put("height", height)
                     .put("backend", renderer.backend).put("gpu", renderer.gpu).put("device", renderer.device)
                     .put("fallback_reason", renderer.fallbackReason)
+                    .put("stages", timingJson(stages)).put("profiling", profilingJson())
                     .put("total_seconds", (System.nanoTime() - began) / 1e9)
             } finally {
                 encoder.release()
                 muxer?.release()
             }
         }
+    }
+
+    private fun renderOfflineSurface(
+        input: File, output: File, config: JSONObject, session: StillFlow,
+        timestamps: List<Long>, stages: MutableMap<String, TimingStatistics>,
+    ) {
+        val width = config.getInt("width")
+        val height = config.getInt("height")
+        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, config.getInt("bitrate"))
+            setFloat(MediaFormat.KEY_FRAME_RATE, config.getDouble("fps").toFloat())
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+            setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+            setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+        }
+        val encoder = HardwareCodecs.encoder(format)
+        try {
+            val surface = encoder.createInputSurface()
+            try {
+                val writer = MediaMuxer(output.path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                try {
+                    val sink = EncoderSink(encoder, writer)
+                    encoder.start()
+                    GpuFrames(width, height, 2, surface).use { gpu ->
+                        ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
+                            var index = 0
+                            val renderStart = System.nanoTime()
+                            val rendered = decode(input, images = images) { image, pts, _ ->
+                                check(index < timestamps.size && pts == timestamps[index]) { "Decode timestamp mismatch" }
+                                val map = timed(stages, "render.map") { session.frameMap(index) }
+                                timed(stages, "render.surface") {
+                                    sink.drain(0)
+                                    gpu.render(image, map, pts - timestamps[0], config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                                    sink.drain(0)
+                                }
+                                index++
+                                if (index % 60 == 0) progress("render", index)
+                            }
+                            timed(stages, "render.flush") { sink.finishSurface() }
+                            stages.getOrPut("render.decode_pass") { TimingStatistics() }.add((System.nanoTime() - renderStart) / 1e6)
+                            check(rendered == timestamps.size && index == rendered && sink.frames == rendered) { "GPU offline export lost frames" }
+                            report.put("frames", rendered).put("width", width).put("height", height)
+                                .put("backend", "gles").put("gpu", true).put("device", gpu.device)
+                                .put("encoder", encoder.name).put("gpu_surface", true).put("fallback_reason", "")
+                        }
+                    }
+                } finally { writer.release() }
+            } finally { surface.release() }
+        } finally { encoder.release() }
     }
 
     private fun exportStream(directory: File, config: JSONObject) {

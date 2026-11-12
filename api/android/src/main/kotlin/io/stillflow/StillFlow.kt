@@ -187,6 +187,14 @@ class StillFlow(
         return Frame(frame.width, frame.height, frame.format, frame.width * frame.format.bytesPerPixel, output)
     }
 
+    /** Independent output-resolution map for GPU Surface rendering after finish(). */
+    @Synchronized
+    fun frameMap(index: Int): FloatArray {
+        requireOpen()
+        require(index >= 0) { "Invalid frame index" }
+        return nativeFrameMap(handle, index)
+    }
+
     private fun outputBuffer(frame: Frame, destination: ByteBuffer): ByteBuffer {
         val rowBytes = frame.width.toLong() * frame.format.bytesPerPixel
         val size = rowBytes * frame.height
@@ -235,6 +243,7 @@ class StillFlow(
             handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
         ): Boolean
         @JvmStatic private external fun nativeReadyMap(handle: Long): FloatArray
+        @JvmStatic private external fun nativeFrameMap(handle: Long, index: Int): FloatArray
         @JvmStatic private external fun nativeStreamReady(handle: Long): LongArray?
         @JvmStatic private external fun nativeStreamFinish(handle: Long)
         @JvmStatic private external fun nativeAnalyze(
