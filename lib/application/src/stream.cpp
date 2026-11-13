@@ -225,6 +225,19 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
         Profile profile;
         settle_recovery(output_profile ? *output_profile : profile);
     }
+    const bool reset = base_ + next_ == 0 || current.motion.reset;
+    if (!reset && current.motion.repeated && !previous_warp_.displacement.empty()) {
+        output = {base_ + next_,
+                  analysis_.origin_us + static_cast<int64_t>(std::llround(current.seconds * 1000000)),
+                  static_cast<int64_t>(std::llround(current.duration * 1000000)),
+                  current,
+                  previous_warp_,
+                  ahead};
+        if (output_profile)
+            output_profile->count("plan.repeated_picture", 1);
+        consume_ready();
+        return true;
+    }
     // The final preview duration cannot depend on whether the producer has
     // already submitted a frame outside this fixed lookahead window.
     std::vector<FrameMotion> window(frames.begin(), frames.end());
@@ -259,41 +272,44 @@ bool StreamAnalyzer::take_ready(ReadyWarp& output, Profile* output_profile) {
     profile.count("plan.forward_steps", work.forward_steps);
     profile.count("plan.reused_steps", work.reused_steps);
     profile.count("plan.reverse_steps", work.reverse_steps);
-    const bool reset = base_ + next_ == 0 || current.motion.reset;
     const double dt = reset ? std::max(1 / fps_, current.duration) : current.seconds - previous_picture_seconds_;
     size_t end = next_ + 1;
     while (end < frames.size() && frames[end].segment == current.segment)
         ++end;
     auto warp = warps[next_];
     warp.boundary_search_steps = 0;
-    const bool repeated = !reset && current.motion.repeated && !previous_warp_.displacement.empty();
-    if (repeated) {
-        warp = previous_warp_;
-    } else if (settings_.crop_mode != CropMode::fixed) {
+    if (settings_.crop_mode != CropMode::fixed) {
         ScopeTimer timer(profile, "plan.crop");
         crop_.apply(warp, std::span<const Warp>(warps).subspan(next_, end - next_), frames.subspan(next_, end - next_),
                     analysis_.size, settings_, dt, reset);
     }
-    if (!repeated) {
-        previous_warp_ = warp;
-        previous_picture_seconds_ = current.seconds;
-    }
+    previous_warp_ = warp;
+    previous_picture_seconds_ = current.seconds;
     output = {base_ + next_,
               analysis_.origin_us + static_cast<int64_t>(std::llround(current.seconds * 1000000)),
               static_cast<int64_t>(std::llround(current.duration * 1000000)),
               current,
               std::move(warp),
               ahead};
+    consume_ready();
+    return true;
+}
+void StreamAnalyzer::consume_ready() {
     ++next_;
-    // Exact trajectory support plus crop neighborhood. Full-resolution images
-    // belong to the caller and can be released as soon as their warp is consumed.
+    // Keep the filter's support in picture updates, including duplicated input
+    // cadences. A separate frame cap bounds long holds and very sparse updates.
+    // Full-resolution images are released by the caller after consumption.
     constexpr size_t history = 180;
-    if (next_ > history) {
-        const size_t count = next_ - history;
+    size_t count = next_, pictures = 0;
+    while (count > 0 && next_ - count < 4 * history && pictures < history) {
+        --count;
+        if (!analysis_.frames[count].motion.repeated)
+            ++pictures;
+    }
+    if (count > 0) {
         analysis_.frames.erase(analysis_.frames.begin(), analysis_.frames.begin() + count);
         base_ += count;
         next_ -= count;
     }
-    return true;
 }
 } // namespace stillflow

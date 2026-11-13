@@ -326,7 +326,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
         ReadyWarp ready;
         for (;;) {
             const double plan_start = now_ms();
-            if (!analyzer.take_ready(ready))
+            if (!analyzer.take_ready(ready, &profile))
                 break;
             profile.add("stream.plan", now_ms() - plan_start);
             if (delayed.empty() || ready.index != planned || ready.pts_us != delayed.front().frame.pts_us)
@@ -386,7 +386,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
         }
         if (!writer)
             throw std::runtime_error("Input contains no decoded video frames");
-        analyzer.finish();
+        analyzer.finish(&profile);
         drain();
         render_queue.close();
     } catch (...) {

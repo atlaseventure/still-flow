@@ -65,5 +65,6 @@ class StreamAnalyzer {
     size_t recovery_apply_at_ = 0, recovery_begin_ = 0;
     void settle_recovery(Profile& profile);
     void recover_pending(Profile& profile, bool flush);
+    void consume_ready();
 };
 } // namespace stillflow
