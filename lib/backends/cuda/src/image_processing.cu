@@ -143,6 +143,7 @@ class CudaImageProcessing final : public ImageProcessing {
             label_size_ = combined;
         }
         auto frame = pool_->acquire(combined);
+        frame->require_bgr();
         const dim3 block(16, 16), grid((combined.width + 15) / 16, (combined.height + 15) / 16);
         compose_kernel<<<grid, block, 0, stream_->value>>>(cuda::yuv_source(input), cuda::yuv_source(stabilized),
                                                            size.width, size.height, labels_.data(), frame->bgr);

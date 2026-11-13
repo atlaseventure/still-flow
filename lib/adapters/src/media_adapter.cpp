@@ -64,8 +64,10 @@ class FfmpegReader final : public VideoReader {
         if (!reader.next(decoded, luma_only))
             return false;
         const Size size(reader.info().width, reader.info().height);
-        auto pixels = decoded.device ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size, luma_only)
-                                     : image(std::move(decoded.pixels));
+        Image pixels = decoded.planar ? std::move(decoded.planar)
+                       : decoded.device
+                           ? std::make_shared<DecodedDeviceImage>(std::move(decoded.device), size, luma_only)
+                           : image(std::move(decoded.pixels));
         frame = {std::move(pixels), decoded.pts_us, decoded.duration_us,
                  decoded.luma.empty() ? Image{} : image(std::move(decoded.luma))};
         return true;
@@ -95,6 +97,10 @@ class FfmpegWriter final : public VideoWriter {
                 writer_.video(device, std::move(native->lifetime), pts, duration);
                 return;
             }
+        }
+        if (input->format() == PixelFormat::i420) {
+            writer_.video(map_host_image(input), pts, duration);
+            return;
         }
         auto view = read_pixels(input);
         if (view.mapping.format != PixelFormat::bgr8)

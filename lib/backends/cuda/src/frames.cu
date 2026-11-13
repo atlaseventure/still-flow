@@ -31,9 +31,18 @@ __global__ void nv12_kernel(const unsigned char* bgr, unsigned char* luma, unsig
     uv[1] = to_byte(128 + 224 * (r - yy) / (2 * (1 - kr)) / 255);
 }
 
+__global__ void bgr_kernel(DeviceSource source, unsigned char* output, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height)
+        return;
+    const auto value = sample<true>(source, x, y, width, height);
+    auto* pixel = output + (static_cast<size_t>(y) * width + x) * 3;
+    pixel[0] = to_byte(value.x), pixel[1] = to_byte(value.y), pixel[2] = to_byte(value.z);
+}
+
 class PublishedImage final : public ImageData {
   public:
-    explicit PublishedImage(std::shared_ptr<const OutputFrame> frame) : frame_(std::move(frame)) {}
+    PublishedImage(std::shared_ptr<const OutputFrame> frame, bool native) : frame_(std::move(frame)), native_(native) {}
     Size size() const override { return frame_->size; }
     PixelFormat format() const override { return PixelFormat::bgr8; }
     HostImageView map_read() const override {
@@ -41,7 +50,17 @@ class PublishedImage final : public ImageData {
             const size_t bytes = static_cast<size_t>(frame_->size.width) * frame_->size.height * 3;
             std::vector<uint8_t> pixels(bytes);
             check(cudaSetDevice(0), "Select CUDA device");
-            check(cudaMemcpy(pixels.data(), frame_->bgr, bytes, cudaMemcpyDeviceToHost), "Download CUDA frame");
+            Buffer<unsigned char> converted;
+            const unsigned char* bgr = frame_->bgr;
+            if (native_) {
+                converted.reserve(bytes);
+                const dim3 block(16, 16), grid((frame_->size.width + 15) / 16, (frame_->size.height + 15) / 16);
+                bgr_kernel<<<grid, block>>>(yuv_source(frame_->descriptor), converted.data(), frame_->size.width,
+                                            frame_->size.height);
+                check(cudaGetLastError(), "Convert CUDA host mapping");
+                bgr = converted.data();
+            }
+            check(cudaMemcpy(pixels.data(), bgr, bytes, cudaMemcpyDeviceToHost), "Download CUDA frame");
             host_ = make_host_image(frame_->size, PixelFormat::bgr8, std::move(pixels));
         });
         return host_->map_read();
@@ -54,6 +73,7 @@ class PublishedImage final : public ImageData {
 
   private:
     std::shared_ptr<const OutputFrame> frame_;
+    bool native_;
     mutable std::once_flag downloaded_;
     mutable Image host_;
 };
@@ -61,13 +81,9 @@ class PublishedImage final : public ImageData {
 
 OutputFrame::OutputFrame(Size value) : size(value) {
     const auto width = static_cast<size_t>(size.width), height = static_cast<size_t>(size.height);
-    check(cudaMalloc(reinterpret_cast<void**>(&bgr), width * height * 3), "Allocate CUDA frame");
     const cudaError_t allocated =
         cudaMallocPitch(reinterpret_cast<void**>(&nv12), &pitch, width, height + (height + 1) / 2);
-    if (allocated != cudaSuccess) {
-        cudaFree(bgr);
-        check(allocated, "Allocate CUDA NV12 frame");
-    }
+    check(allocated, "Allocate CUDA NV12 frame");
     descriptor.coded = size;
     descriptor.luma = nv12;
     descriptor.chroma = nv12 + pitch * height;
@@ -75,6 +91,11 @@ OutputFrame::OutputFrame(Size value) : size(value) {
     descriptor.color.kr = 0.2126f, descriptor.color.kb = 0.0722f;
     descriptor.color.full_range = false;
     descriptor.color.chroma_x = 0, descriptor.color.chroma_y = 0.5f;
+}
+void OutputFrame::require_bgr() {
+    if (!bgr)
+        check(cudaMalloc(reinterpret_cast<void**>(&bgr), static_cast<size_t>(size.width) * size.height * 3),
+              "Allocate CUDA BGR frame");
 }
 OutputFrame::~OutputFrame() {
     cudaFree(nv12);
@@ -101,13 +122,14 @@ void FramePool::release(OutputFrame* frame) {
     free_.emplace_back(frame);
 }
 
-Image publish(std::shared_ptr<OutputFrame> frame, cudaStream_t stream) {
+Image publish(std::shared_ptr<OutputFrame> frame, cudaStream_t stream, bool nv12_ready) {
     const auto [width, height] = frame->size;
     const dim3 block(16, 16), grid((width + 31) / 32, (height + 31) / 32);
-    nv12_kernel<<<grid, block, 0, stream>>>(frame->bgr, frame->nv12, frame->nv12 + frame->pitch * height, frame->pitch,
-                                            width, height);
+    if (!nv12_ready)
+        nv12_kernel<<<grid, block, 0, stream>>>(frame->bgr, frame->nv12, frame->nv12 + frame->pitch * height,
+                                                frame->pitch, width, height);
     check(cudaGetLastError(), "Launch CUDA NV12 conversion");
     check(cudaStreamSynchronize(stream), "Complete CUDA frame");
-    return std::make_shared<PublishedImage>(std::move(frame));
+    return std::make_shared<PublishedImage>(std::move(frame), nv12_ready);
 }
 } // namespace stillflow::cuda

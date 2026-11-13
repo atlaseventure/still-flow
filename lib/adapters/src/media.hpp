@@ -61,6 +61,7 @@ class DeviceFrame {
 };
 
 struct DecodedFrame {
+    Image planar;
     cv::Mat luma;
     cv::Mat pixels;                            // Host BGR or source luma.
     std::shared_ptr<const DeviceFrame> device; // NVDEC frames left on the GPU.
@@ -93,6 +94,7 @@ class Writer {
     Writer(const Writer&) = delete;
     Writer& operator=(const Writer&) = delete;
     void video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us);
+    void video(const HostImageView& yuv, int64_t pts_us, int64_t duration_us);
     // Whether video(image, ...) can encode this device image without a copy.
     [[nodiscard]] bool accepts(const CudaImage& image) const;
     // Encodes device memory in place; lifetime is held until NVENC has read it.

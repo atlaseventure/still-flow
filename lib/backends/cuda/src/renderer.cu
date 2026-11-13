@@ -22,30 +22,69 @@ __device__ float sample_mesh(const float* values, int a, int b, float fx, float 
     return (values[a] * (1 - fx) + values[a + 1] * fx) * (1 - fy) + (values[b] * (1 - fx) + values[b + 1] * fx) * fy;
 }
 
-template <bool yuv>
-__global__ void render_kernel(DeviceSource source, unsigned char* output, int width, int height, const DeviceMap* map,
-                              unsigned int* invalid_count) {
+__device__ float2 source_position(const DeviceMap& m, float x, float y) {
+    const float2 target{m.origin_x + x * m.step_x, m.origin_y + y * m.step_y};
+    float2 p = target;
+    for (int iteration = 0; iteration < mesh_inverse_iterations; ++iteration) {
+        const float gx = fminf(m.columns - 1, fmaxf(0, p.x * m.grid_x));
+        const float gy = fminf(m.rows - 1, fmaxf(0, p.y * m.grid_y));
+        const int cx = min(static_cast<int>(gx), m.columns - 2), cy = min(static_cast<int>(gy), m.rows - 2);
+        const float fx = gx - cx, fy = gy - cy;
+        const int a = cy * m.columns + cx, b = a + m.columns;
+        p = {target.x - sample_mesh(m.offset_x, a, b, fx, fy), target.y - sample_mesh(m.offset_y, a, b, fx, fy)};
+    }
+    return p;
+}
+
+// Keep matching YUV samples in their original code space, including headroom.
+// Other matrices/ranges are converted in float without an 8-bit RGB intermediate.
+__device__ float3 output_yuv(const DeviceSource& s, float2 at, int width, int height) {
+    if (s.kr == 0.2126f && s.kb == 0.0722f && !s.full_range) {
+        const auto p = cuda::coded_position(at.x, at.y, s.rotation, s.coded_width, s.coded_height);
+        const float cx = (p.x - s.chroma_x) * 0.5f, cy = (p.y - s.chroma_y) * 0.5f;
+        const int cw = (s.coded_width + 1) / 2, ch = (s.coded_height + 1) / 2;
+        return {cuda::bicubic(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y),
+                cuda::bilinear(s.chroma, s.chroma_pitch, 2, cw, ch, cx, cy),
+                cuda::bilinear(s.chroma + 1, s.chroma_pitch, 2, cw, ch, cx, cy)};
+    }
+    const auto rgb = cuda::sample<true>(s, at.x, at.y, width, height);
+    const float y = 0.2126f * rgb.z + 0.7152f * rgb.y + 0.0722f * rgb.x;
+    return {16 + y * (219.0f / 255), 128 + (rgb.x - y) * (224.0f / (255 * 1.8556f)),
+            128 + (rgb.z - y) * (224.0f / (255 * 1.5748f))};
+}
+
+__global__ void render_yuv_kernel(DeviceSource source, unsigned char* output, size_t pitch, int width, int height,
+                                  const DeviceMap* map, unsigned int* invalid_count) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    bool invalid = false;
+    if (x < width && y < height) {
+        const auto p = source_position(*map, x, y);
+        invalid = !(p.x >= 0 && p.x <= width - 1 && p.y >= 0 && p.y <= height - 1);
+        output[static_cast<size_t>(y) * pitch + x] = cuda::to_byte(output_yuv(source, p, width, height).x);
+        if (!(x & 1) && !(y & 1)) {
+            // Left-sited chroma lives between the two luma rows.
+            const auto uv = output_yuv(source, source_position(*map, x, fminf(y + 0.5f, height - 1)), width, height);
+            auto* pixel = output + pitch * height + static_cast<size_t>(y / 2) * pitch + x;
+            pixel[0] = cuda::to_byte(uv.y), pixel[1] = cuda::to_byte(uv.z);
+        }
+    }
+    const int count = __syncthreads_count(invalid);
+    if (threadIdx.x == 0 && threadIdx.y == 0 && count)
+        atomicAdd(invalid_count, static_cast<unsigned int>(count));
+}
+
+__global__ void render_bgr_kernel(DeviceSource source, unsigned char* output, int width, int height,
+                                  const DeviceMap* map, unsigned int* invalid_count) {
     const auto& m = *map;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     bool invalid = false;
     if (x < width && y < height) {
-        const float target_x = m.origin_x + x * m.step_x;
-        const float target_y = m.origin_y + y * m.step_y;
-        float px = target_x, py = target_y;
-        for (int iteration = 0; iteration < mesh_inverse_iterations; ++iteration) {
-            const float gx = fminf(m.columns - 1, fmaxf(0, px * m.grid_x));
-            const float gy = fminf(m.rows - 1, fmaxf(0, py * m.grid_y));
-            const int cx = min(static_cast<int>(gx), m.columns - 2);
-            const int cy = min(static_cast<int>(gy), m.rows - 2);
-            const float fx = gx - cx, fy = gy - cy;
-            const int a = cy * m.columns + cx, b = a + m.columns;
-            px = target_x - sample_mesh(m.offset_x, a, b, fx, fy);
-            py = target_y - sample_mesh(m.offset_y, a, b, fx, fy);
-        }
+        const auto p = source_position(m, x, y);
+        const float px = p.x, py = p.y;
         invalid = !(px >= 0 && px <= width - 1 && py >= 0 && py <= height - 1);
         if (!invalid) {
-            const float3 bgr = cuda::sample<yuv>(source, px, py, width, height);
+            const float3 bgr = cuda::sample<false>(source, px, py, width, height);
             unsigned char* out = output + (static_cast<size_t>(y) * width + x) * 3;
             out[0] = cuda::to_byte(bgr.x);
             out[1] = cuda::to_byte(bgr.y);
@@ -70,7 +109,7 @@ class CudaBackend final : public RenderBackend {
                 {{PixelFormat::bgr8}, {std::string(cuda_image_api), "host"}},
                 {{"compiler", STILLFLOW_CUDA_VERSION},
                  {"sampler", "catmull-rom luma/RGB, bilinear chroma"},
-                 {"output", "bgr8 + nv12 bt709 (device)"}}};
+                 {"output", "nv12 bt709 (device), lazy host bgr8"}}};
     }
     void upload(const Image& input) override {
         lease_.reset();
@@ -98,6 +137,8 @@ class CudaBackend final : public RenderBackend {
             yuv_ = false;
         }
         frame_ = pool_->acquire(size_);
+        if (!yuv_)
+            frame_->require_bgr();
     }
     double warp(const MapParameters& p) override {
         DeviceMap m{};
@@ -118,11 +159,11 @@ class CudaBackend final : public RenderBackend {
         check(cudaMemsetAsync(invalid_.data(), 0, sizeof(unsigned int), stream_.value), "Reset CUDA crop check");
         const dim3 block(16, 16), grid((size_.width + 15) / 16, (size_.height + 15) / 16);
         if (yuv_)
-            render_kernel<true><<<grid, block, 0, stream_.value>>>(source_, frame_->bgr, size_.width, size_.height,
-                                                                   map_.data(), invalid_.data());
+            render_yuv_kernel<<<grid, block, 0, stream_.value>>>(source_, frame_->nv12, frame_->pitch, size_.width,
+                                                                 size_.height, map_.data(), invalid_.data());
         else
-            render_kernel<false><<<grid, block, 0, stream_.value>>>(source_, frame_->bgr, size_.width, size_.height,
-                                                                    map_.data(), invalid_.data());
+            render_bgr_kernel<<<grid, block, 0, stream_.value>>>(source_, frame_->bgr, size_.width, size_.height,
+                                                                 map_.data(), invalid_.data());
         check(cudaGetLastError(), "Launch CUDA warp");
         unsigned int invalid = 0;
         check(cudaMemcpyAsync(&invalid, invalid_.data(), sizeof(invalid), cudaMemcpyDeviceToHost, stream_.value),
@@ -132,7 +173,7 @@ class CudaBackend final : public RenderBackend {
     }
     Image download() override {
         lease_.reset();
-        return cuda::publish(std::move(frame_), stream_.value);
+        return cuda::publish(std::move(frame_), stream_.value, yuv_);
     }
 
   private:

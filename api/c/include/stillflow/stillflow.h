@@ -172,8 +172,8 @@ typedef struct sf_renderer_info {
     int32_t gpu;
 } sf_renderer_info;
 SF_API sf_status sf_renderer_get_info(const sf_renderer*, sf_renderer_info*, sf_error*);
-/* Input dimensions match sf_video. Packed gray8/BGR8/RGBA8 output retains the
-   frame plan's timing; full-color YUV requires a platform conversion path. */
+/* Input dimensions match sf_video. Output retains the input format and frame
+   plan timing. CPU supports gray8/BGR8/RGBA8 and NV12/NV21/I420 planes. */
 SF_API sf_status sf_renderer_render(sf_renderer*, const sf_frame_plan*, const sf_image*, sf_frame**, sf_error*);
 SF_API void sf_renderer_destroy(sf_renderer*);
 SF_API sf_status sf_frame_get_info(const sf_frame*, sf_frame_info*, sf_error*);

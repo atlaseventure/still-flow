@@ -577,6 +577,7 @@ bool Reader::next(DecodedFrame& output, bool luma_only) {
     s.last_pts = output.pts_us;
     output.duration_us = frame->duration > 0 ? av_rescale_q(frame->duration, time_base, microseconds)
                                              : static_cast<int64_t>(std::llround(1000000 / s.info.fps));
+    output.planar.reset();
     if (frame->format == AV_PIX_FMT_CUDA && format == AV_PIX_FMT_NV12) {
         if (s.codec.request.independent_frames) {
             if (!s.delay_pool) {
@@ -606,8 +607,35 @@ bool Reader::next(DecodedFrame& output, bool luma_only) {
         output.pixels.release();
     } else {
         output.device.reset();
-        output.pixels = s.converter->convert(frame, luma_only);
-        output.luma = luma_only ? output.pixels : s.converter->convert(frame, true);
+        // Keep common SDR decoder planes reference counted through rendering.
+        // Other color models and display rotations retain the conversion path.
+        CudaImage color;
+        describe_colour(frame, color);
+        if (!luma_only && !s.codec.request.prefer_hardware && s.info.rotation == 0 &&
+            frame->format == AV_PIX_FMT_YUV420P && color.color.kr == 0.2126f && color.color.kb == 0.0722f &&
+            !color.color.full_range && color.color.chroma_x == 0 && color.color.chroma_y == 0.5f &&
+            frame->linesize[0] > 0 && frame->linesize[1] > 0 && frame->linesize[2] > 0) {
+            auto* copy = av_frame_clone(frame);
+            if (!copy)
+                throw std::bad_alloc();
+            std::shared_ptr<const AVFrame> owner(copy, [](const AVFrame* value) {
+                auto* owned = const_cast<AVFrame*>(value);
+                av_frame_free(&owned);
+            });
+            HostImageView view{{frame->width, frame->height}, PixelFormat::i420, {}, owner, color.color};
+            for (int plane = 0; plane < 3; ++plane) {
+                const size_t width = plane ? (frame->width + 1) / 2 : frame->width;
+                const size_t height = plane ? (frame->height + 1) / 2 : frame->height;
+                view.planes.push_back({static_cast<size_t>(frame->linesize[plane]),
+                                       {frame->data[plane], (height - 1) * frame->linesize[plane] + width}});
+            }
+            output.planar = borrow_host_image(std::move(view));
+            output.pixels.release();
+            output.luma.release();
+        } else {
+            output.pixels = s.converter->convert(frame, luma_only);
+            output.luma = luma_only ? output.pixels : s.converter->convert(frame, true);
+        }
     }
     av_frame_unref(s.frame);
     return true;
@@ -865,6 +893,37 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
 
 Writer::~Writer() = default;
 const CodecReport& Writer::codec() const { return impl_->codec; }
+void Writer::video(const HostImageView& yuv, int64_t pts_us, int64_t duration_us) {
+    auto& s = *impl_;
+    if (yuv.format != PixelFormat::i420 || yuv.size.width != s.frame->width || yuv.size.height != s.frame->height ||
+        yuv.planes.size() != 3 || yuv.color.kr != 0.2126f || yuv.color.kb != 0.0722f || yuv.color.full_range ||
+        yuv.color.chroma_x != 0 || yuv.color.chroma_y != 0.5f)
+        throw std::invalid_argument("Encoder requires BT.709 limited-range left-sited I420");
+    check(av_frame_make_writable(s.frame), "Make encoder frame writable");
+    for (int plane = 0; plane < 3; ++plane) {
+        const int width = plane ? (yuv.size.width + 1) / 2 : yuv.size.width;
+        const int height = plane ? (yuv.size.height + 1) / 2 : yuv.size.height;
+        for (int row = 0; row < height; ++row) {
+            const auto* input = yuv.planes[plane].bytes.data() + row * yuv.planes[plane].row_stride;
+            if (plane && s.frame->format == AV_PIX_FMT_NV12) {
+                auto* output = s.frame->data[1] + static_cast<size_t>(row) * s.frame->linesize[1] + plane - 1;
+                for (int x = 0; x < width; ++x)
+                    output[2 * static_cast<size_t>(x)] = input[x];
+            } else
+                std::memcpy(s.frame->data[plane] + static_cast<size_t>(row) * s.frame->linesize[plane], input, width);
+        }
+    }
+    if (s.encoder->pix_fmt != AV_PIX_FMT_CUDA) {
+        s.submit(s.frame, pts_us, duration_us);
+        return;
+    }
+    av_frame_unref(s.hardware);
+    check(av_hwframe_get_buffer(s.encoder->hw_frames_ctx, s.hardware, 0), "Allocate NVENC input frame");
+    check(av_hwframe_transfer_data(s.hardware, s.frame, 0), "Upload NVENC input frame");
+    s.devices->synchronize();
+    s.submit(s.hardware, pts_us, duration_us);
+    av_frame_unref(s.hardware);
+}
 void Writer::video(const cv::Mat& bgr, int64_t pts_us, int64_t duration_us) {
     auto& s = *impl_;
     check(av_frame_make_writable(s.frame), "Make encoder frame writable");

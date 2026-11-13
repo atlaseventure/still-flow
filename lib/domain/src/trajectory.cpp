@@ -517,7 +517,10 @@ Point source_point(const MapParameters& map, Point target) {
             return (values[a] * (1 - fx) + values[a + 1] * fx) * (1 - fy) +
                    (values[b] * (1 - fx) + values[b + 1] * fx) * fy;
         };
-        source = target - Point(sample(map.offset_x), sample(map.offset_y));
+        const auto next = target - Point(sample(map.offset_x), sample(map.offset_y));
+        if (next.x == source.x && next.y == source.y)
+            break; // Further fixed-point iterations produce the same coordinates.
+        source = next;
     }
     return source;
 }

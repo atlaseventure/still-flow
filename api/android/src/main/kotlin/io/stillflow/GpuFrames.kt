@@ -34,8 +34,10 @@ class GpuFrames @JvmOverloads constructor(
         var compute = false
         var pixel = false
     }
+    internal data class Texture(val y: Int, val uv: Int)
     class Frame internal constructor(
-        internal val owner: GpuFrames, internal val texture: Int,
+        internal val owner: GpuFrames, internal val texture: Texture,
+        internal val bt709: Boolean, internal val fullRange: Boolean,
         internal val analysisWidth: Int, internal val analysisHeight: Int,
         internal var transfer: Readback?,
     ) {
@@ -53,9 +55,9 @@ class GpuFrames @JvmOverloads constructor(
     private val fbo = IntArray(1)
     private val external = IntArray(1)
     private val horizontal = IntArray(1)
-    private val free = ConcurrentLinkedQueue<Int>()
+    private val free = ConcurrentLinkedQueue<Texture>()
     private val proxies = ConcurrentLinkedQueue<ByteBuffer>()
-    private val owned = mutableListOf<Int>()
+    private val owned = mutableListOf<Texture>()
     private var copyProgram = 0
     private var proxyProgram = 0
     private var horizontalProgram = 0
@@ -65,7 +67,7 @@ class GpuFrames @JvmOverloads constructor(
     private var computeCapture = false
     private var pixelCapture = false
     private var warpProgram = 0
-    private var offlineTexture = 0
+    private var externalWarpProgram = 0
     private var proxyWidth = 0
     private var proxyHeight = 0
     private val readbacks = mutableListOf<Readback>()
@@ -88,7 +90,7 @@ class GpuFrames @JvmOverloads constructor(
         private set
     var surfaceSubmitMs = 0.0
         private set
-    val retainedTextureBytes: Long get() = owned.size.toLong() * width * height * 4
+    val retainedTextureBytes: Long get() = owned.size.toLong() * (width.toLong() * height + ((width + 1L) / 2) * ((height + 1L) / 2) * 2)
     val readbackBackend: String get() = if (computeCapture) "compute_buffer" else if (pixelCapture) "pixel_buffer" else "texture_readback"
     var device: String = ""
         private set
@@ -129,7 +131,8 @@ class GpuFrames @JvmOverloads constructor(
             directCompute = compute(COMPUTE_HEADER + AREA_LUMA + COMPUTE_DIRECT)
             verticalCompute = compute(COMPUTE_HEADER.replace("sampler2D", "usampler2D") + VERTICAL_LUMA + COMPUTE_VERTICAL)
         }
-        warpProgram = program(WARP)
+        warpProgram = program(WARP_HEADER + PLANAR_SOURCE + WARP)
+        externalWarpProgram = program(YUV_HEADER.replace("out vec4 color;", "") + WARP_HEADER.substringAfter("precision highp float;") + EXTERNAL_SOURCE + WARP)
         } catch (error: Throwable) {
             close()
             throw error
@@ -156,7 +159,7 @@ class GpuFrames @JvmOverloads constructor(
         }
         val texture = free.poll() ?: run {
             check(owned.size < capacity) { "GPU frame cache is full" }
-            allocate(width, height).also { owned.add(it) }
+            Texture(allocate(width, height, GLES30.GL_R8), allocate((width + 1) / 2, (height + 1) / 2, GLES30.GL_RG8)).also { owned.add(it) }
         }
         val crop = image.cropRect
         require(crop.width() == width && crop.height() == height)
@@ -168,10 +171,14 @@ class GpuFrames @JvmOverloads constructor(
             var sourceFence = 0L
             var sourceComplete = false
             try {
-                target(texture, width, height)
+                GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+                GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
                 source(copyProgram, buffer, crop)
-                GLES30.glUniform2f(GLES30.glGetUniformLocation(copyProgram, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
-                GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "fullRange"), if (fullRange) 1 else 0)
+                target(texture.y, width, height)
+                GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "chroma"), 0)
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+                target(texture.uv, (width + 1) / 2, (height + 1) / 2)
+                GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "chroma"), 1)
                 GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
                 sourceFence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
                 check(sourceFence != 0L)
@@ -205,12 +212,12 @@ class GpuFrames @JvmOverloads constructor(
                 if (separable) {
                     if (horizontal[0] == 0) horizontal[0] = allocate(packedWidth, height, GLES30.GL_RGBA16UI)
                     target(horizontal[0], packedWidth, height)
-                    proxySource(horizontalProgram, texture, analysisWidth, analysisHeight)
+                    proxySource(horizontalProgram, texture.y, analysisWidth, analysisHeight)
                     GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
                 }
                 if (computeCapture) {
                     proxySource(if (separable) verticalCompute else directCompute,
-                        if (separable) horizontal[0] else texture, analysisWidth, analysisHeight)
+                        if (separable) horizontal[0] else texture.y, analysisWidth, analysisHeight)
                     GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, transfer.id)
                     GLES31.glDispatchCompute((packedWidth + 7) / 8, (analysisHeight + 7) / 8, 1)
                     GLES31.glMemoryBarrier(GLES31.GL_BUFFER_UPDATE_BARRIER_BIT)
@@ -222,7 +229,7 @@ class GpuFrames @JvmOverloads constructor(
                     GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
                 } else {
                     target(transfer.texture, packedWidth, analysisHeight)
-                    proxySource(proxyProgram, texture, analysisWidth, analysisHeight)
+                    proxySource(proxyProgram, texture.y, analysisWidth, analysisHeight)
                     GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
                 }
                 if (pixelCapture) {
@@ -239,7 +246,7 @@ class GpuFrames @JvmOverloads constructor(
                 sourceComplete = true
                 sourceReleaseWaitMs = (System.nanoTime() - submitted) / 1e6
                 checkGl()
-                return Frame(this, texture, analysisWidth, analysisHeight, transfer)
+                return Frame(this, texture, bt709, fullRange, analysisWidth, analysisHeight, transfer)
             } finally {
                 GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
                 if (!sourceComplete) GLES30.glFinish()
@@ -328,7 +335,7 @@ class GpuFrames @JvmOverloads constructor(
         checkThread()
         require(frame.owner === this && !frame.rendered) { "Frame is foreign or already consumed" }
         readLuma(frame, true)
-        renderTexture(frame.texture, map, ptsUs)
+        renderTexture(frame.texture, map, ptsUs, frame.bt709, frame.fullRange)
         frame.rendered = true
         free.add(frame.texture)
         proxies.add(checkNotNull(frame.buffer))
@@ -345,13 +352,10 @@ class GpuFrames @JvmOverloads constructor(
             GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, external[0])
             val imported = nativeImport(buffer)
             try {
-                if (offlineTexture == 0) offlineTexture = allocate(width, height)
-                target(offlineTexture, width, height)
-                source(copyProgram, buffer, crop)
-                GLES30.glUniform2f(GLES30.glGetUniformLocation(copyProgram, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
-                GLES30.glUniform1i(GLES30.glGetUniformLocation(copyProgram, "fullRange"), if (fullRange) 1 else 0)
-                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
-                renderTexture(offlineTexture, map, ptsUs)
+                GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+                GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+                source(externalWarpProgram, buffer, crop)
+                renderTexture(null, map, ptsUs, bt709, fullRange)
             } finally {
                 // Complete source reads before the decoder recycles this Image, including on failure.
                 GLES30.glFinish()
@@ -369,22 +373,31 @@ class GpuFrames @JvmOverloads constructor(
         GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "crop"), crop.left.toFloat(), crop.top.toFloat(), width.toFloat(), height.toFloat())
     }
 
-    private fun renderTexture(texture: Int, map: FloatArray, ptsUs: Long) {
+    private fun renderTexture(texture: Texture?, map: FloatArray, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
         val began = System.nanoTime()
         require(map.size >= 8 && ptsUs >= 0 && map.all { it.isFinite() })
         val vertices = map[0].toInt() * map[1].toInt()
         require(map[0].toInt() in 2..32 && map[1].toInt() in 2..32 && vertices <= 288 && map.size == 8 + 2 * vertices)
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, width, height)
-        GLES30.glUseProgram(warpProgram)
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
-        GLES30.glUniform1i(GLES30.glGetUniformLocation(warpProgram, "source"), 0)
-        GLES30.glUniform2f(GLES30.glGetUniformLocation(warpProgram, "dimensions"), width.toFloat(), height.toFloat())
-        GLES30.glUniform2i(GLES30.glGetUniformLocation(warpProgram, "meshSize"), map[0].toInt(), map[1].toInt())
-        GLES30.glUniform4fv(GLES30.glGetUniformLocation(warpProgram, "viewport"), 1, map, 2)
-        GLES30.glUniform2fv(GLES30.glGetUniformLocation(warpProgram, "gridScale"), 1, map, 6)
-        GLES30.glUniform2fv(GLES30.glGetUniformLocation(warpProgram, "offsets"), (map.size - 8) / 2, map, 8)
+        val program = if (texture == null) externalWarpProgram else warpProgram
+        GLES30.glUseProgram(program)
+        if (texture != null) {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture.y)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "source"), 0)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture.uv)
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "chromaSource"), 1)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        }
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "fullRange"), if (fullRange) 1 else 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "dimensions"), width.toFloat(), height.toFloat())
+        GLES30.glUniform2i(GLES30.glGetUniformLocation(program, "meshSize"), map[0].toInt(), map[1].toInt())
+        GLES30.glUniform4fv(GLES30.glGetUniformLocation(program, "viewport"), 1, map, 2)
+        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "gridScale"), 1, map, 6)
+        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "offsets"), (map.size - 8) / 2, map, 8)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
         checkGl()
         check(EGLExt.eglPresentationTimeANDROID(display, window, Math.multiplyExact(ptsUs, 1000)))
@@ -417,8 +430,9 @@ class GpuFrames @JvmOverloads constructor(
         GLES30.glDeleteProgram(directCompute)
         GLES30.glDeleteProgram(verticalCompute)
         GLES30.glDeleteProgram(warpProgram)
-        GLES30.glDeleteTextures(owned.size, owned.toIntArray(), 0)
-        GLES30.glDeleteTextures(1, intArrayOf(offlineTexture), 0)
+        GLES30.glDeleteProgram(externalWarpProgram)
+        val textures = owned.flatMap { listOf(it.y, it.uv) }.toIntArray()
+        GLES30.glDeleteTextures(textures.size, textures, 0)
         GLES30.glDeleteTextures(1, external, 0)
         GLES30.glDeleteTextures(readbacks.size, readbacks.map { it.texture }.toIntArray(), 0)
         GLES30.glDeleteTextures(1, horizontal, 0)
@@ -442,7 +456,7 @@ class GpuFrames @JvmOverloads constructor(
             GLES30.glGenTextures(1, id, 0)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, id[0])
             GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, format, width, height)
-            val filter = if (format == GLES30.GL_RGBA8) GLES30.GL_LINEAR else GLES30.GL_NEAREST
+            val filter = if (format == GLES30.GL_RGBA16UI) GLES30.GL_NEAREST else GLES30.GL_LINEAR
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, filter)
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, filter)
             GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
@@ -499,14 +513,11 @@ class GpuFrames @JvmOverloads constructor(
             vec3 sampleYuv(vec2 p) { return texture(source,(crop.xy+p)/codedSize).xyz; }
         """.trimIndent() + "\n"
         private val COPY = """
-            uniform vec2 coefficients;
-            uniform int fullRange;
+            uniform int chroma;
             void main() {
-                vec3 yuv=sampleYuv(gl_FragCoord.xy);
-                float y=fullRange!=0 ? yuv.x : (yuv.x-16.0/255.0)*255.0/219.0;
-                vec2 uv=(yuv.yz-vec2(128.0/255.0))*(fullRange!=0 ? 1.0 : 255.0/224.0);
-                float kr=coefficients.x,kb=coefficients.y,kg=1.0-kr-kb;
-                color=vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,yuv.x);
+                vec2 p=chroma!=0 ? floor(gl_FragCoord.xy)*2.0+vec2(0.5,1.0) : gl_FragCoord.xy;
+                vec3 yuv=sampleYuv(p);
+                color=chroma!=0 ? vec4(yuv.yz,0.0,1.0) : vec4(yuv.x,0.0,0.0,1.0);
             }
         """.trimIndent()
         private val PROXY_HEADER = """#version 300 es
@@ -527,7 +538,7 @@ class GpuFrames @JvmOverloads constructor(
                     for(int x=int(floor(lo.x));x<int(ceil(hi.x));++x) {
                         vec2 p=vec2(x,y);
                         vec2 weight=max(vec2(0),min(hi,p+1.0)-max(lo,p));
-                        sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).a*255.0*weight.x*weight.y;
+                        sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).r*255.0*weight.x*weight.y;
                     }
                 return floor(sum/(scale.x*scale.y)+0.5)/255.0;
             }
@@ -542,7 +553,7 @@ class GpuFrames @JvmOverloads constructor(
                 float scale=sourceSize.x/analysisSize.x;
                 float lo=float(at)*scale,hi=float(at+1)*scale,sum=0.0;
                 for(int x=int(floor(lo));x<int(ceil(hi));++x)
-                    sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).a*255.0*max(0.0,min(hi,float(x+1))-max(lo,float(x)));
+                    sum+=texelFetch(source,min(ivec2(x,y),ivec2(sourceSize)-1),0).r*255.0*max(0.0,min(hi,float(x+1))-max(lo,float(x)));
                 return uint(floor(sum*256.0/scale+0.5));
             }
             void main() {
@@ -593,20 +604,36 @@ class GpuFrames @JvmOverloads constructor(
                 storeLuma(at,verticalLuma(at));
             }
         """.trimIndent()
-        private val WARP = """#version 300 es
+        private val WARP_HEADER = """#version 300 es
             precision highp float;
-            uniform sampler2D source;
             uniform vec2 dimensions;
             uniform ivec2 meshSize;
             uniform vec2 gridScale;
             uniform vec4 viewport;
             uniform vec2 offsets[288];
             out vec4 color;
+            uniform vec2 coefficients;
+            uniform int fullRange;
+        """.trimIndent() + "\n"
+        private val PLANAR_SOURCE = """
+            uniform sampler2D source;
+            uniform sampler2D chromaSource;
+            float sourceLuma(vec2 p) { return texture(source,(p+0.5)/dimensions).r; }
+            vec2 sourceChroma(vec2 p) {
+                vec2 size=ceil(dimensions*0.5);
+                return texture(chromaSource,((p-vec2(0.0,0.5))*0.5+0.5)/size).rg;
+            }
+        """.trimIndent() + "\n"
+        private val EXTERNAL_SOURCE = """
+            float sourceLuma(vec2 p) { return sampleYuv(clamp(p,vec2(0),dimensions-1.0)+0.5).x; }
+            vec2 sourceChroma(vec2 p) { return sampleYuv(clamp(p,vec2(0),dimensions-1.0)+0.5).yz; }
+        """.trimIndent() + "\n"
+        private val WARP = """
             vec4 weights(float t) {
                 float t2=t*t,t3=t2*t;
                 return vec4(-0.5*t+t2-0.5*t3,1.0-2.5*t2+1.5*t3,0.5*t+2.0*t2-1.5*t3,-0.5*t2+0.5*t3);
             }
-            vec4 reconstruct(vec2 p) {
+            float reconstruct(vec2 p) {
                 p=clamp(p,vec2(0),dimensions-1.0);
                 vec2 lo=floor(p),f=p-lo;
                 vec4 wx=weights(f.x),wy=weights(f.y);
@@ -615,10 +642,10 @@ class GpuFrames @JvmOverloads constructor(
                 vec3 x=vec3(lo.x-1.0,lo.x+wx.z/(wx.y+wx.z),lo.x+2.0);
                 vec3 y=vec3(lo.y-1.0,lo.y+wy.z/(wy.y+wy.z),lo.y+2.0);
                 vec3 ax=vec3(wx.x,wx.y+wx.z,wx.w),ay=vec3(wy.x,wy.y+wy.z,wy.w);
-                vec4 value=vec4(0);
+                float value=0.0;
                 for(int j=0;j<3;++j)
                     for(int i=0;i<3;++i)
-                        value+=texture(source,(vec2(x[i],y[j])+0.5)/dimensions)*ax[i]*ay[j];
+                        value+=sourceLuma(vec2(x[i],y[j]))*ax[i]*ay[j];
                 return clamp(value,0.0,1.0);
             }
             void main() {
@@ -632,7 +659,11 @@ class GpuFrames @JvmOverloads constructor(
                     int a=cell.y*meshSize.x+cell.x,b=a+meshSize.x;
                     p=target-mix(mix(offsets[a],offsets[a+1],f.x),mix(offsets[b],offsets[b+1],f.x),f.y);
                 }
-                color=vec4(reconstruct(p).rgb,1.0);
+                float y=reconstruct(p);
+                y=fullRange!=0 ? y : (y-16.0/255.0)*255.0/219.0;
+                vec2 uv=(sourceChroma(p)-vec2(128.0/255.0))*(fullRange!=0 ? 1.0 : 255.0/224.0);
+                float kr=coefficients.x,kb=coefficients.y,kg=1.0-kr-kb;
+                color=vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,1.0);
             }
         """.trimIndent()
     }

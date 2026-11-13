@@ -6,11 +6,12 @@
 #include <vector>
 
 namespace stillflow::cuda {
-// A device frame: packed BGR written by kernels, plus the NV12 copy encoders
-// read in place (BT.709 limited range, left-sited chroma).
+// NV12 output (BT.709 limited range, left-sited chroma). Packed RGB callers
+// allocate BGR on demand; native YUV rendering only allocates NV12.
 struct OutputFrame {
     explicit OutputFrame(Size value);
     ~OutputFrame();
+    void require_bgr();
     OutputFrame(const OutputFrame&) = delete;
     OutputFrame& operator=(const OutputFrame&) = delete;
     Size size;
@@ -31,8 +32,7 @@ class FramePool : public std::enable_shared_from_this<FramePool> {
     std::vector<std::unique_ptr<OutputFrame>> free_;
 };
 
-// Fills the NV12 planes from BGR on stream, waits for completion (consumers use
-// other streams and engines) and returns an image exposing both: native reads
-// see NV12 in place, host mappings download BGR once.
-Image publish(std::shared_ptr<OutputFrame> frame, cudaStream_t stream);
+// Convert packed output unless NV12 is already rendered, then wait for readers
+// on other streams/engines. Host BGR mappings are materialized on first access.
+Image publish(std::shared_ptr<OutputFrame> frame, cudaStream_t stream, bool nv12_ready = false);
 } // namespace stillflow::cuda
