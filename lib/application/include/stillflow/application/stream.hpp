@@ -48,6 +48,8 @@ class StreamAnalyzer {
     bool finished_ = false;
     StreamCrop crop_;
     TrajectoryCache planning_;
+    Warp previous_warp_;
+    double previous_picture_seconds_ = 0;
     std::unique_ptr<MotionAnalyzer> motion_, recovery_;
     Image previous_;
     std::deque<std::pair<size_t, Image>> proxies_;

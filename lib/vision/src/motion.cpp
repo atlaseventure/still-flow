@@ -611,7 +611,9 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
                 break;
             }
         }
-        const double trust = std::clamp((result.rs_confidence - 0.25) / 0.45, 0.0, 1.0);
+        // Spatial regularization already shrinks weak row modes. Keep the
+        // low-coverage gate, reaching full gain at joint confidence 0.5.
+        const double trust = std::clamp((result.rs_confidence - 0.25) / 0.25, 0.0, 1.0);
         for (int j = 0; j < bands; ++j)
             result.row_delta[j] = Point(parameters(4 + 2 * j), parameters(5 + 2 * j)) * trust;
     }
@@ -635,6 +637,28 @@ Motion MotionEstimator::estimate(const cv::Mat& previous, const cv::Mat& current
         for (size_t i = 0; i < q.size(); ++i)
             if (residuals[i] <= 3 * pixel_scale)
                 tracked_.push_back(q[i]);
+    // Compression can change pixel values in held pictures. Require both
+    // photometric agreement and broadly stationary, reliable feature tracks.
+    std::vector<double> displacement;
+    displacement.reserve(p.size());
+    Point mean_displacement;
+    for (size_t i = 0; i < p.size(); ++i) {
+        displacement.push_back(cv::norm(q[i] - p[i]));
+        mean_displacement = mean_displacement + Point{q[i].x - p[i].x, q[i].y - p[i].y};
+    }
+    const auto percentile = displacement.begin() + static_cast<ptrdiff_t>(displacement.size() * 9 / 10);
+    std::nth_element(displacement.begin(), percentile, displacement.end());
+    if (score.confidence > 0.95 && *percentile < 0.15 * pixel_scale &&
+        stillflow::norm(mean_displacement) / p.size() < 0.05 * pixel_scale) {
+        cv::Mat difference;
+        cv::absdiff(previous, current, difference);
+        if (cv::mean(difference)[0] < 0.5) {
+            result.repeated = true;
+            result.step = Matrix3::eye();
+            std::fill(result.row_delta.begin(), result.row_delta.end(), Point{});
+            profile.count("analysis.repeated_picture", 1);
+        }
+    }
     return result;
 }
 

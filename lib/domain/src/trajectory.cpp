@@ -353,6 +353,38 @@ std::vector<Warp> plan_warps(std::span<const FrameMotion> frames, Size size, con
     output_last = std::min(output_last, frames.size());
     if (output_first > output_last)
         throw std::invalid_argument("Invalid planning range");
+    // Plan on picture updates, retaining their original times. Re-encoded
+    // duplicate frames must neither change the filter's sampling density nor
+    // acquire an independently evolving scanline warp.
+    if (std::any_of(frames.begin(), frames.end(), [](const auto& f) { return f.motion.repeated; })) {
+        std::vector<FrameMotion> pictures;
+        std::vector<size_t> indices;
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const auto& frame = frames[i];
+            if (!std::isfinite(frame.seconds) || !std::isfinite(frame.duration) || frame.duration < 0 ||
+                (i > 0 && !frame.motion.reset && frame.segment == frames[i - 1].segment &&
+                 frame.seconds <= frames[i - 1].seconds))
+                throw std::invalid_argument("Trajectory timestamps must increase within a shot");
+            if (pictures.empty() || !frame.motion.repeated || frame.motion.reset ||
+                frame.segment != pictures.back().segment) {
+                if (!pictures.empty() && !frame.motion.reset && frame.segment == pictures.back().segment)
+                    pictures.back().duration = frame.seconds - pictures.back().seconds;
+                pictures.push_back(frame);
+                pictures.back().motion.repeated = false;
+            } else {
+                pictures.back().duration = frame.seconds + frame.duration - pictures.back().seconds;
+            }
+            indices.push_back(pictures.size() - 1);
+        }
+        const size_t begin = output_first < frames.size() ? indices[output_first] : pictures.size();
+        const size_t end = output_last > output_first ? indices[output_last - 1] + 1 : begin;
+        const auto planned =
+            plan_warps(pictures, size, options, horizontal, first_shot_start, cache, begin, end, plan_viewports);
+        std::vector<Warp> expanded(frames.size());
+        for (size_t i = output_first; i < output_last; ++i)
+            expanded[i] = planned[indices[i]];
+        return expanded;
+    }
     if (cache)
         cache->impl->cursor = 0;
     std::vector<Warp> output(frames.size());

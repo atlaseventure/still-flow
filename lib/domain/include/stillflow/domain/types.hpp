@@ -35,6 +35,8 @@ struct Motion {
     // Only cuts and timestamp gaps start a new trajectory. Missing observations
     // remain in the current shot so recovery can preserve temporal continuity.
     bool reset = false;
+    // The decoded picture repeats the preceding observation, including its row shape.
+    bool repeated = false;
     MotionState state = MotionState::tracked;
     std::string failure;
     double fit_confidence = 0;
