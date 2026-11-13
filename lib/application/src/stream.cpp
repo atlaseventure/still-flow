@@ -17,6 +17,8 @@ StreamAnalyzer::StreamAnalyzer(StabilizationSettings settings, StreamSettings st
     // Share validation with the offline analyzer.
     Analyzer validate(settings, size, fps, horizontal, nullptr, execution);
     validate_stream_settings(stream);
+    if (motion_)
+        motion_->adaptive_tracking(stream.adaptive_tracking);
 }
 StreamAnalyzer::~StreamAnalyzer() {
     stop_recovery_.store(true);
@@ -41,12 +43,6 @@ void StreamAnalyzer::settle_recovery(Profile& profile) {
         if (frame.segment == result.segment)
             frame.motion = std::move(result.frames[i].motion);
     }
-}
-void StreamAnalyzer::adaptive_tracking(bool enabled) {
-    if (!analysis_.frames.empty() || finished_)
-        throw std::logic_error("Configure tracking before input");
-    if (motion_)
-        motion_->adaptive_tracking(enabled);
 }
 bool StreamAnalyzer::push(const Image& image, int64_t pts, int64_t duration, Profile& profile) {
     execution_.check();

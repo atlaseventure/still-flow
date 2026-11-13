@@ -171,9 +171,7 @@ class ExportRunner : Instrumentation() {
         val options = config.getJSONObject("settings")
         StillFlow.configureThreads(options.optInt("visionThreads", 4))
         val settings = StillFlow.Settings().apply {
-            backend = StillFlow.Backend.GLES
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
-            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
             analysisWidth = options.optInt("analysisWidth", analysisWidth)
             features = options.optInt("features", features)
             bands = options.optInt("bands", bands)
@@ -185,9 +183,8 @@ class ExportRunner : Instrumentation() {
             rsStrength = options.optDouble("rsStrength", rsStrength)
         }
         report.put("settings", JSONObject().apply {
-            put("backend", settings.backend.name)
+            put("backend", StillFlow.Backend.GLES.name)
             put("motionEstimator", settings.motionEstimator.name)
-            put("adaptiveTracking", settings.adaptiveTracking)
             put("analysisWidth", settings.analysisWidth)
             put("features", settings.features)
             put("bands", settings.bands)
@@ -202,10 +199,10 @@ class ExportRunner : Instrumentation() {
         val durationUs = Math.round(1_000_000 / fps)
         val began = System.nanoTime()
         val stages = linkedMapOf<String, TimingStatistics>()
-        StillFlow(width, height, fps, config.getBoolean("horizontalScan"), settings).use { session ->
+        StillFlow.Analyzer(StillFlow.Video(width, height, fps, config.getBoolean("horizontalScan")), settings).use { session ->
             val analysisStart = System.nanoTime()
             val frames = decode(input) { image, pts, _ ->
-                timed(stages, "analysis.analyze") { session.analyze(AndroidFrames.luma(image), pts, durationUs) }
+                timed(stages, "analysis.analyze") { session.push(AndroidFrames.luma(image), pts, durationUs) }
                 timestamps.add(pts)
                 if (timestamps.size % 60 == 0) progress("analyze", timestamps.size)
             }
@@ -225,17 +222,20 @@ class ExportRunner : Instrumentation() {
                 check(request == null) { "Input ended during tracking recovery" }
             }
             report.put("recovery_frames", recoveryFrames)
-            check(frames > 0 && timed(stages, "analysis.plan") { session.finish() }.frameCount == frames.toLong()) { "Analysis frame count mismatch" }
-            report.put("analysis_seconds", (System.nanoTime() - began) / 1e9)
-            report.put("mode", "offline").put("decode_passes", if (recoveryFrames > 0) 3 else 2)
-            renderOfflineSurface(input, output, config, session, timestamps, stages)
+            timed(stages, "analysis.plan") { session.finish() }.use { plan ->
+                session.close()
+                check(frames > 0 && plan.info.frameCount == frames.toLong()) { "Analysis frame count mismatch" }
+                report.put("analysis_seconds", (System.nanoTime() - began) / 1e9)
+                report.put("mode", "offline").put("decode_passes", if (recoveryFrames > 0) 3 else 2)
+                renderOfflineSurface(input, output, config, plan, timestamps, stages)
+            }
             report.put("stages", timingJson(stages)).put("profiling", profilingJson())
                 .put("total_seconds", (System.nanoTime() - began) / 1e9)
         }
     }
 
     private fun renderOfflineSurface(
-        input: File, output: File, config: JSONObject, session: StillFlow,
+        input: File, output: File, config: JSONObject, plan: StillFlow.Plan,
         timestamps: List<Long>, stages: MutableMap<String, TimingStatistics>,
     ) {
         val width = config.getInt("width")
@@ -264,7 +264,7 @@ class ExportRunner : Instrumentation() {
                             val renderStart = System.nanoTime()
                             val rendered = decode(input, images = images) { image, pts, _ ->
                                 check(index < timestamps.size && pts == timestamps[index]) { "Decode timestamp mismatch" }
-                                val map = timed(stages, "render.map") { session.frameMap(index) }
+                                val map = timed(stages, "render.map") { plan.frame(index.toLong()).use { it.map(width, height) } }
                                 timed(stages, "render.surface") {
                                     sink.drain(0)
                                     gpu.render(image, map, pts - timestamps[0], config.getBoolean("bt709"), config.getBoolean("fullRange"))
@@ -296,10 +296,7 @@ class ExportRunner : Instrumentation() {
         val options = config.getJSONObject("settings")
         StillFlow.configureThreads(options.optInt("visionThreads", 4))
         val settings = StillFlow.Settings().apply {
-            lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
-            backend = StillFlow.Backend.GLES
             motionEstimator = StillFlow.MotionEstimator.valueOf(options.optString("motionEstimator", motionEstimator.name))
-            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
             analysisWidth = options.optInt("analysisWidth", analysisWidth)
             features = options.optInt("features", features)
             bands = options.optInt("bands", bands)
@@ -311,9 +308,8 @@ class ExportRunner : Instrumentation() {
             rsStrength = options.optDouble("rsStrength", rsStrength)
         }
         report.put("settings", JSONObject().apply {
-            put("backend", settings.backend.name)
+            put("backend", StillFlow.Backend.GLES.name)
             put("motionEstimator", settings.motionEstimator.name)
-            put("adaptiveTracking", settings.adaptiveTracking)
             put("analysisWidth", settings.analysisWidth)
             put("features", settings.features)
             put("bands", settings.bands)
@@ -324,7 +320,11 @@ class ExportRunner : Instrumentation() {
             put("crop", settings.crop)
             put("rsStrength", settings.rsStrength)
         })
-        settings.realtime = true
+        val streaming = StillFlow.StreamSettings().apply {
+            lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
+            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
+        }
+        report.getJSONObject("settings").put("adaptiveTracking", streaming.adaptiveTracking)
         val scale = minOf(1.0, settings.analysisWidth.toDouble() / width)
         val aw = maxOf(32, Math.round(width * scale).toInt())
         val ah = maxOf(32, Math.round(height * scale).toInt())
@@ -351,9 +351,9 @@ class ExportRunner : Instrumentation() {
                         encoded.put(JSONObject().put("pts_us", pts).put("output_ns", ns - began))
                     }
                     encoder.start()
-                    GpuFrames(width, height, settings.maxBufferedFrames, surface, config.optBoolean("computeReadback", true)).use { gpu ->
+                    GpuFrames(width, height, streaming.maxBufferedFrames, surface, config.optBoolean("computeReadback", true)).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
-                            StreamPlanner(width, height, fps, config.getBoolean("horizontalScan"), settings).use { planner ->
+                            StreamPlanner(StillFlow.Video(width, height, fps, config.getBoolean("horizontalScan")), settings, streaming).use { planner ->
                                 data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
                                 val pending = java.util.ArrayDeque<Pending>()
                                 val awaitingAnalysis = java.util.ArrayDeque<Pending>()
@@ -455,7 +455,7 @@ class ExportRunner : Instrumentation() {
                                     .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
                                     .put("mode", "realtime").put("gpu_surface", true)
                                     .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events).put("encoded_events", encoded)
-                                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", settings.lookaheadSeconds)
+                                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", streaming.lookaheadSeconds)
                                         .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
                                         .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
                             }

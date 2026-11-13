@@ -32,20 +32,27 @@ dependencies {
 import io.stillflow.StillFlow
 import java.nio.ByteBuffer
 
-StillFlow(width, height, fps).use { session ->
+val video = StillFlow.Video(width, height, fps)
+val plan = StillFlow.Analyzer(video).use { analyzer ->
     frames.forEachIndexed { index, frame ->
-        session.analyze(frame, timestampsUs[index], durationsUs[index])
+        analyzer.push(frame, timestampsUs[index], durationsUs[index])
     }
-    var request = session.nextRecoveryFrame()
+    var request = analyzer.nextRecoveryFrame()
     while (request != null) {
         val index = request.index.toInt()
-        session.recover(frames[index], timestampsUs[index])
-        request = session.nextRecoveryFrame()
+        analyzer.recover(frames[index], timestampsUs[index])
+        request = analyzer.nextRecoveryFrame()
     }
-    session.finish()
-    val output = ByteBuffer.allocateDirect(width * height * 4)
-    frames.forEachIndexed { index, frame ->
-        consume(session.render(index, frame, output))
+    analyzer.finish()
+}
+plan.use {
+    StillFlow.Renderer().use { renderer ->
+        val output = ByteBuffer.allocateDirect(width * height * 4)
+        frames.forEachIndexed { index, frame ->
+            plan.frame(index.toLong()).use { framePlan ->
+                consume(renderer.render(framePlan, frame, output))
+            }
+        }
     }
 }
 ```
@@ -54,6 +61,8 @@ StillFlow(width, height, fps).use { session ->
 
 ## 流式处理
 
-创建会话时设置 `settings.realtime = true`，默认前视 1.35 秒。通过 `tryPush()` 推帧，按索引保留全分辨率帧，并取出 `takeReady()` 返回的就绪结果。每次使用对应帧调用 `renderReady()` 后，再取下一项。推帧被拒绝时，先处理就绪结果再重试，或丢弃新到达的直播帧。结束时调用 `finishStream()`，再处理剩余结果。
+使用独立的 `StreamSettings` 创建 `StillFlow.Stream(video, settings, streaming)`，默认前视 1.35 秒。通过 `tryPush()` 推帧，按索引保留全分辨率帧，再调用 `poll()`。`Ready` 持有独立的 `FramePlan`，渲染或提取不可变 `WarpMap` 后关闭；`Pending` 表示需要更多输入。结束时调用 `finish()`，持续取出结果直到 `End`。被拒绝的输入未被消费，可先处理就绪结果再重试，或丢弃新到达的直播帧。
+
+计划和单帧计划在父对象关闭后仍有效。`FramePlan.map(width, height)` 用于 `GpuFrames` Surface 渲染。`StreamPlanner` 提供有界工作线程，返回带不可变映射的计划。使用 `configureThreads()` 时，在启动工作线程前设置进程级 OpenCV 线程数。
 
 硬件视频输入输出用法见[视频运行器示例](../../tools/android/src/main/kotlin/io/stillflow/runner/ExportRunner.kt)。

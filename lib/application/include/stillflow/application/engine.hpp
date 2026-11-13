@@ -40,10 +40,6 @@ class Analyzer {
     void push_observation(Motion motion, int64_t pts_us, int64_t duration_us);
     AnalysisResult finish_analysis();
     Plan finish();
-    bool take_ready(Warp&) {
-        execution_.check();
-        return false;
-    }
 
   private:
     StabilizationSettings settings_;

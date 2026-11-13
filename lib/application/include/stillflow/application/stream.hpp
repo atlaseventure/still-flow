@@ -9,6 +9,7 @@ struct StreamSettings {
     double lookahead_seconds = 1.35;
     size_t max_buffered_frames = 120;
     bool background_recovery = false;
+    bool adaptive_tracking = false;
 };
 void validate_stream_settings(const StreamSettings& settings);
 struct ReadyWarp {
@@ -29,7 +30,6 @@ class StreamAnalyzer {
     ~StreamAnalyzer();
     // Only reduced gray proxies are retained (at most 24); callers own the
     // delayed full-resolution frames until take_ready returns their index.
-    void adaptive_tracking(bool enabled);
     bool push(const Image& image, int64_t pts_us, int64_t duration_us, Profile& profile);
     bool push_observation(Motion motion, int64_t pts_us, int64_t duration_us);
     bool take_ready(ReadyWarp& output, Profile* profile = nullptr);

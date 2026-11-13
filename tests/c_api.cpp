@@ -62,9 +62,9 @@ TEST_CASE("C API validates arguments and contains exceptions", "[c-api]") {
 TEST_CASE("C ABI retains input leases and renders independently owned output", "[c-api]") {
     int leases = 0;
     Api api;
-    api.image.kr = 0.299f;
-    api.image.kb = 0.114f;
-    api.image.full_range = 1;
+    api.image.color.kr = 0.299f;
+    api.image.color.kb = 0.114f;
+    api.image.color.full_range = 1;
     api.image.user_data = &leases;
     api.image.retain = [](void* p) { ++*static_cast<int*>(p); };
     api.image.release = [](void* p) { --*static_cast<int*>(p); };
@@ -85,9 +85,9 @@ TEST_CASE("C ABI retains input leases and renders independently owned output", "
     REQUIRE(sf_renderer_render(api.renderer, api.frame_plan, &api.image, &api.frame, &api.error) == SF_OK);
     sf_image output{};
     REQUIRE(sf_frame_get_image(api.frame, &output, &api.error) == SF_OK);
-    REQUIRE(output.kr == api.image.kr);
-    REQUIRE(output.kb == api.image.kb);
-    REQUIRE(output.full_range == 1);
+    REQUIRE(output.color.kr == api.image.color.kr);
+    REQUIRE(output.color.kb == api.image.color.kb);
+    REQUIRE(output.color.full_range == 1);
     auto value = output.planes[0].data[0];
     sf_renderer_destroy(api.renderer);
     api.renderer = nullptr;

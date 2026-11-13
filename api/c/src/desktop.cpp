@@ -124,7 +124,9 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_file_callback
         options.audio = static_cast<stillflow::AudioMode>(value->audio);
         options.overwrite = value->overwrite != 0;
         options.realtime = value->mode == SF_FILE_STREAM;
-        options.stream = {value->stream.lookahead_seconds, value->stream.max_buffered_frames};
+        stillflow::c_api::boolean(value->stream.adaptive_tracking);
+        options.stream = {value->stream.lookahead_seconds, value->stream.max_buffered_frames, false,
+                          value->stream.adaptive_tracking != 0};
         const auto* runtime_callbacks = callbacks ? &callbacks->runtime : nullptr;
         stillflow::c_api::Runtime runtime(runtime_callbacks);
         auto executor = stillflow::make_thread_executor(options.threads);

@@ -32,20 +32,27 @@ This offline example uses `frames`, a list of full-resolution RGBA8 `StillFlow.F
 import io.stillflow.StillFlow
 import java.nio.ByteBuffer
 
-StillFlow(width, height, fps).use { session ->
+val video = StillFlow.Video(width, height, fps)
+val plan = StillFlow.Analyzer(video).use { analyzer ->
     frames.forEachIndexed { index, frame ->
-        session.analyze(frame, timestampsUs[index], durationsUs[index])
+        analyzer.push(frame, timestampsUs[index], durationsUs[index])
     }
-    var request = session.nextRecoveryFrame()
+    var request = analyzer.nextRecoveryFrame()
     while (request != null) {
         val index = request.index.toInt()
-        session.recover(frames[index], timestampsUs[index])
-        request = session.nextRecoveryFrame()
+        analyzer.recover(frames[index], timestampsUs[index])
+        request = analyzer.nextRecoveryFrame()
     }
-    session.finish()
-    val output = ByteBuffer.allocateDirect(width * height * 4)
-    frames.forEachIndexed { index, frame ->
-        consume(session.render(index, frame, output))
+    analyzer.finish()
+}
+plan.use {
+    StillFlow.Renderer().use { renderer ->
+        val output = ByteBuffer.allocateDirect(width * height * 4)
+        frames.forEachIndexed { index, frame ->
+            plan.frame(index.toLong()).use { framePlan ->
+                consume(renderer.render(framePlan, frame, output))
+            }
+        }
     }
 }
 ```
@@ -54,6 +61,8 @@ Replay all requested recovery frames with their original pixels and timestamps b
 
 ## Streaming
 
-Set `settings.realtime = true` when creating the session; lookahead defaults to 1.35 seconds. Push with `tryPush()`, retain full frames by index, and drain `takeReady()`. Call `renderReady()` with the corresponding frame before taking the next result. If a push is rejected, drain and retry, or drop the incoming live frame. End with `finishStream()` and drain the remaining results.
+Create `StillFlow.Stream(video, settings, streaming)` with separate `StreamSettings`; lookahead defaults to 1.35 seconds. Push with `tryPush()`, retain full frames by index, and call `poll()`. A `Ready` result owns a `FramePlan`; close it after rendering or extracting an immutable `WarpMap`. `Pending` means more input is needed. End with `finish()` and drain until `End`. Rejected pushes consume nothing: drain and retry, or drop the incoming live frame.
+
+Plans and frame plans remain valid after their parent closes. Use `FramePlan.map(width, height)` for `GpuFrames` surface rendering. `StreamPlanner` supplies a bounded worker and returns plans with immutable maps. Configure process-wide OpenCV thread count with `configureThreads()` before starting workers.
 
 For hardware video input and output, see the [video runner example](../../tools/android/src/main/kotlin/io/stillflow/runner/ExportRunner.kt).

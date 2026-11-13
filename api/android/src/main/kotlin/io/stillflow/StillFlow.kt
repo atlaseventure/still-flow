@@ -2,14 +2,19 @@ package io.stillflow
 
 import java.nio.ByteBuffer
 
-/** Frame stabilization. Calls are synchronous; use a worker thread and close the session. */
-class StillFlow(
-    width: Int,
-    height: Int,
-    fps: Double,
-    horizontalScan: Boolean,
-    settings: Settings,
-) : AutoCloseable {
+/** Frame stabilization. Processing calls are synchronous; use a worker thread. */
+object StillFlow {
+    init { System.loadLibrary("stillflow_jni") }
+
+    class Video @JvmOverloads constructor(
+        @JvmField val width: Int,
+        @JvmField val height: Int,
+        @JvmField val fps: Double,
+        @JvmField val horizontalScan: Boolean = false,
+    ) {
+        init { require(width > 0 && height > 0 && fps.isFinite() && fps > 0) }
+    }
+
     enum class PixelFormat(internal val nativeValue: Int, @JvmField val bytesPerPixel: Int) {
         GRAY8(0, 1), BGR8(1, 3), RGBA8(2, 4)
     }
@@ -17,13 +22,8 @@ class StillFlow(
     enum class Backend { AUTO, CPU, GLES }
     enum class MotionEstimator { TRANSLATION, OPENCV }
 
-    /** Settings are copied when the session is created. Public fields also support Java callers. */
+    /** Settings are copied when an analyzer or stream is created. Public fields also support Java callers. */
     class Settings {
-        @JvmField var adaptiveTracking = true
-        @JvmField var realtime = false
-        @JvmField var lookaheadSeconds = 1.35
-        @JvmField var maxBufferedFrames = 120
-        @JvmField var backend = Backend.AUTO
         @JvmField var motionEstimator = MotionEstimator.OPENCV
         @JvmField var analysisWidth: Int
         @JvmField var features: Int
@@ -80,71 +80,50 @@ class StillFlow(
     }
 
     class RendererInfo internal constructor(values: Array<String>) {
-        @JvmField val backend = values[0]
+        @JvmField val backend = Backend.valueOf(values[0].uppercase(java.util.Locale.ROOT))
         @JvmField val device = values[1]
         @JvmField val fallbackReason = values[2]
         @JvmField val gpu = values[3].toBoolean()
     }
 
-    private var handle = nativeCreate(
-        width, height, fps, horizontalScan, settings.backend.ordinal, settings.motionEstimator.ordinal,
-        settings.analysisWidth, settings.features, settings.bands, settings.cropMode.ordinal,
-        settings.rollingShutter, settings.smoothSeconds, settings.rsSeconds, settings.crop, settings.rsStrength,
-        settings.realtime, settings.lookaheadSeconds, settings.maxBufferedFrames, settings.realtime && settings.adaptiveTracking,
-    )
 
-    constructor(width: Int, height: Int, fps: Double) : this(width, height, fps, false, Settings())
-
-    /** Timestamps and durations use microseconds. Timestamps must increase. */
-    @Synchronized
-    fun analyze(frame: Frame, ptsUs: Long, durationUs: Long) {
-        requireOpen()
-        nativeAnalyze(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
+    class StreamSettings {
+        private val defaults = nativeStreamDefaults()
+        @JvmField var lookaheadSeconds = defaults[0]
+        @JvmField var maxBufferedFrames = defaults[1].toInt()
+        @JvmField var adaptiveTracking = defaults[2] != 0.0
     }
 
-    class ReadyFrame internal constructor(values: LongArray) {
+    /** Immutable output-pixel mapping, independent of native plan lifetime. */
+    class WarpMap private constructor(
+        @JvmField val width: Int,
+        @JvmField val height: Int,
+        @get:JvmSynthetic internal val packed: FloatArray,
+    ) {
+        companion object {
+            @JvmSynthetic internal fun own(width: Int, height: Int, packed: FloatArray): WarpMap = WarpMap(width, height, packed)
+        }
+        @JvmField val columns = packed[0].toInt()
+        @JvmField val rows = packed[1].toInt()
+        @JvmField val originX = packed[2]
+        @JvmField val originY = packed[3]
+        @JvmField val stepX = packed[4]
+        @JvmField val stepY = packed[5]
+        @JvmField val gridX = packed[6]
+        @JvmField val gridY = packed[7]
+        fun offsetX(column: Int, row: Int): Float = packed[offset(column, row)]
+        fun offsetY(column: Int, row: Int): Float = packed[offset(column, row) + 1]
+        private fun offset(column: Int, row: Int): Int {
+            require(column in 0 until columns && row in 0 until rows)
+            return 8 + 2 * (row * columns + column)
+        }
+    }
+
+    class FrameInfo internal constructor(values: LongArray) {
         @JvmField val index = values[0]
         @JvmField val ptsUs = values[1]
         @JvmField val durationUs = values[2]
-    }
-
-    /** Copies the proxy during this call. Keep full frames until their ready index is returned.
-     * False means the bounded queue is full; drain or drop the incoming live frame. */
-    @Synchronized
-    fun tryPush(frame: Frame, ptsUs: Long, durationUs: Long): Boolean {
-        requireOpen()
-        return nativeStreamPush(handle, frame.width, frame.height, frame.format.nativeValue,
-            frame.rowStride, frame.pixels, ptsUs, durationUs)
-    }
-
-    /** Render each returned frame before requesting the next one. */
-    @Synchronized
-    fun takeReady(): ReadyFrame? {
-        requireOpen()
-        return nativeStreamReady(handle)?.let { ReadyFrame(it) }
-    }
-
-    /** Transfers the ready plan into an independent GPU map and releases its native storage. */
-    @Synchronized
-    fun takeReadyMap(): FloatArray {
-        requireOpen()
-        return nativeReadyMap(handle)
-    }
-
-    /** Seals streaming input. Drain takeReady() until null after this call. */
-    @Synchronized
-    fun finishStream() {
-        requireOpen()
-        nativeStreamFinish(handle)
-    }
-
-    /** Render the last ready index using the corresponding retained full frame. */
-    @Synchronized
-    fun renderReady(frame: Frame, destination: ByteBuffer): Frame {
-        requireOpen()
-        val output = outputBuffer(frame, destination)
-        nativeRenderReady(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
-        return Frame(frame.width, frame.height, frame.format, frame.width * frame.format.bytesPerPixel, output)
+        @JvmField val lookaheadSeconds = Double.fromBits(values[3])
     }
 
     class RecoveryFrame internal constructor(values: LongArray) {
@@ -152,117 +131,156 @@ class StillFlow(
         @JvmField val ptsUs = values[1]
     }
 
-    /** Seals analysis; replay requested frames in order until this returns null. */
-    @Synchronized
-    fun nextRecoveryFrame(): RecoveryFrame? {
-        requireOpen()
-        return nativeNextRecoveryFrame(handle)?.let { RecoveryFrame(it) }
-    }
-
-    @Synchronized
-    fun recover(frame: Frame, ptsUs: Long) {
-        requireOpen()
-        nativeRecover(handle, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs)
-    }
-
-    /** Requires all requested recovery frames to have been replayed. */
-    @Synchronized
-    fun finish(): PlanInfo {
-        requireOpen()
-        return PlanInfo(nativeFinish(handle))
-    }
-
-    @Synchronized
-    fun rendererInfo(): RendererInfo {
-        requireOpen()
-        return RendererInfo(nativeRendererInfo(handle))
-    }
-
-    /** Writes packed output into caller-owned storage without changing its position or limit. */
-    @Synchronized
-    fun render(index: Int, frame: Frame, destination: ByteBuffer): Frame {
-        requireOpen()
-        require(index >= 0) { "Invalid frame index" }
-        val output = outputBuffer(frame, destination)
-        nativeRender(handle, index, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
-        return Frame(frame.width, frame.height, frame.format, frame.width * frame.format.bytesPerPixel, output)
-    }
-
-    /** Independent output-resolution map for GPU Surface rendering after finish(). */
-    @Synchronized
-    fun frameMap(index: Int): FloatArray {
-        requireOpen()
-        require(index >= 0) { "Invalid frame index" }
-        return nativeFrameMap(handle, index)
-    }
-
-    private fun outputBuffer(frame: Frame, destination: ByteBuffer): ByteBuffer {
-        val rowBytes = frame.width.toLong() * frame.format.bytesPerPixel
-        val size = rowBytes * frame.height
-        require(destination.isDirect && !destination.isReadOnly && rowBytes <= Int.MAX_VALUE && size <= destination.remaining()) {
-            "Invalid writable direct destination extent"
+    private class Resource(private var handle: Long, private val kind: Int) : AutoCloseable {
+        @Synchronized fun <T> access(work: (Long) -> T): T {
+            check(handle != 0L) { "StillFlow resource is closed" }
+            return work(handle)
         }
-        val output = destination.slice()
-        output.limit(size.toInt())
-        return output
-    }
-
-    @Synchronized
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0
+        @Synchronized override fun close() {
+            if (handle != 0L) {
+                nativeDestroy(handle, kind)
+                handle = 0
+            }
         }
     }
 
-    /** Native streaming stage aggregates as JSON objects with count, total_ms, min_ms and max_ms. */
-    @Synchronized
-    fun profile(): String {
-        requireOpen()
-        return nativeProfile(handle)
+    class Analyzer @JvmOverloads constructor(video: Video, settings: Settings = Settings()) : AutoCloseable {
+        private val resource = Resource(create(video, settings, null), 0)
+        /** Timestamps and durations use microseconds. Timestamps must increase. */
+        fun push(frame: Frame, ptsUs: Long, durationUs: Long) = resource.access {
+            nativeAnalyze(it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
+        }
+        /** Seals analysis; replay requested frames in order until null. */
+        fun nextRecoveryFrame(): RecoveryFrame? = resource.access { nativeNextRecoveryFrame(it)?.let(::RecoveryFrame) }
+        fun recover(frame: Frame, ptsUs: Long) = resource.access {
+            nativeRecover(it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs)
+        }
+        /** Transfers an independent plan after all recovery requests have been satisfied. */
+        fun finish(): Plan = resource.access { Plan.own(nativeFinish(it)) }
+        override fun close() = resource.close()
     }
 
-    private fun requireOpen() = check(handle != 0L) { "StillFlow session is closed" }
-
-    companion object {
-        init { System.loadLibrary("stillflow_jni"); nativeThreads(4) }
-
-        /** Configure once before starting analysis workers. */
-        @JvmStatic fun configureThreads(threads: Int) = nativeThreads(threads)
-        @JvmStatic private external fun nativeThreads(threads: Int)
-        @JvmStatic fun mobileSettings(): Settings = Settings().apply { analysisWidth = 640; features = 600 }
-        @JvmStatic fun buildDescription(): String = nativeBuildDescription()
-        @JvmStatic private external fun nativeProfile(handle: Long): String
-        @JvmStatic private external fun nativeDefaults(): DoubleArray
-        @JvmStatic private external fun nativeCreate(
-            width: Int, height: Int, fps: Double, horizontalScan: Boolean, backend: Int, motionEstimator: Int,
-            analysisWidth: Int, features: Int, bands: Int, cropMode: Int, rollingShutter: Boolean,
-            smoothSeconds: Double, rsSeconds: Double, crop: Double, rsStrength: Double,
-            realtime: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int, adaptiveTracking: Boolean,
-        ): Long
-        @JvmStatic private external fun nativeStreamPush(
-            handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
-        ): Boolean
-        @JvmStatic private external fun nativeReadyMap(handle: Long): FloatArray
-        @JvmStatic private external fun nativeFrameMap(handle: Long, index: Int): FloatArray
-        @JvmStatic private external fun nativeStreamReady(handle: Long): LongArray?
-        @JvmStatic private external fun nativeStreamFinish(handle: Long)
-        @JvmStatic private external fun nativeAnalyze(
-            handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
-        )
-        @JvmStatic private external fun nativeNextRecoveryFrame(handle: Long): LongArray?
-        @JvmStatic private external fun nativeRecover(
-            handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long,
-        )
-        @JvmStatic private external fun nativeFinish(handle: Long): LongArray
-        @JvmStatic private external fun nativeRendererInfo(handle: Long): Array<String>
-        @JvmStatic private external fun nativeRender(
-            handle: Long, index: Int, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, destination: ByteBuffer,
-        )
-        @JvmStatic private external fun nativeRenderReady(
-            handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, destination: ByteBuffer,
-        )
-        @JvmStatic private external fun nativeDestroy(handle: Long)
-        @JvmStatic private external fun nativeBuildDescription(): String
+    class Plan private constructor(handle: Long) : AutoCloseable {
+        companion object {
+            @JvmSynthetic internal fun own(handle: Long): Plan = Plan(handle)
+        }
+        private val resource = Resource(handle, 1)
+        val info: PlanInfo get() = resource.access { PlanInfo(nativePlanInfo(it)) }
+        /** The returned frame plan owns its resources; close it after use. */
+        fun frame(index: Long): FramePlan = resource.access {
+            require(index >= 0) { "Invalid frame index" }
+            FramePlan.own(nativePlanFrame(it, index))
+        }
+        override fun close() = resource.close()
     }
+
+    class FramePlan private constructor(handle: Long) : AutoCloseable {
+        companion object {
+            @JvmSynthetic internal fun own(handle: Long): FramePlan = FramePlan(handle)
+        }
+        private val resource = Resource(handle, 2)
+        val info: FrameInfo get() = resource.access { FrameInfo(nativeFrameInfo(it)) }
+        fun map(width: Int, height: Int): WarpMap = resource.access {
+            require(width > 0 && height > 0)
+            WarpMap.own(width, height, nativeFrameMap(it, width, height))
+        }
+        @JvmSynthetic internal fun <T> access(work: (Long) -> T): T = resource.access(work)
+        override fun close() = resource.close()
+    }
+
+    sealed class StreamResult {
+        class Ready internal constructor(@JvmField val plan: FramePlan) : StreamResult()
+        object Pending : StreamResult()
+        object End : StreamResult()
+    }
+
+    class Stream @JvmOverloads constructor(
+        video: Video, settings: Settings = Settings(), streaming: StreamSettings = StreamSettings(),
+    ) : AutoCloseable {
+        private val resource = Resource(create(video, settings, streaming), 3)
+        /** False applies backpressure and consumes nothing. Drain and retry or drop this input. */
+        fun tryPush(frame: Frame, ptsUs: Long, durationUs: Long): Boolean = resource.access {
+            nativeStreamPush(it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
+        }
+        /** Ready plans are independently owned. Retain full input frames by their plan index. */
+        fun poll(): StreamResult = resource.access {
+            val values = nativeStreamReady(it)
+            when (values[0]) {
+                0L -> StreamResult.Ready(FramePlan.own(values[1]))
+                1L -> StreamResult.Pending
+                2L -> StreamResult.End
+                else -> error("Unexpected native stream status")
+            }
+        }
+        /** Seals input. Continue polling until End; repeated finish calls are harmless. */
+        fun finish() = resource.access { nativeStreamFinish(it) }
+        /** Bounded native stage aggregates in JSON. */
+        fun profile(): String = resource.access { nativeProfile(it) }
+        override fun close() = resource.close()
+    }
+
+    class Renderer @JvmOverloads constructor(backend: Backend = Backend.AUTO) : AutoCloseable {
+        private val resource = Resource(nativeRendererCreate(backend.ordinal), 4)
+        val info: RendererInfo get() = resource.access { RendererInfo(nativeRendererInfo(it)) }
+        /** Writes packed output into caller-owned storage, preserving its position and limit. */
+        fun render(plan: FramePlan, frame: Frame, destination: ByteBuffer): Frame = resource.access { renderer ->
+            val rowBytes = frame.width.toLong() * frame.format.bytesPerPixel
+            val size = rowBytes * frame.height
+            require(destination.isDirect && !destination.isReadOnly && rowBytes <= Int.MAX_VALUE && size <= destination.remaining()) {
+                "Invalid writable direct destination extent"
+            }
+            val output = destination.slice().apply { limit(size.toInt()) }
+            plan.access {
+                nativeRender(renderer, it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
+            }
+            Frame(frame.width, frame.height, frame.format, rowBytes.toInt(), output)
+        }
+        override fun close() = resource.close()
+    }
+
+    private fun create(video: Video, settings: Settings, stream: StreamSettings?): Long = nativeCreate(
+        video.width, video.height, video.fps, video.horizontalScan, settings.motionEstimator.ordinal,
+        settings.analysisWidth, settings.features, settings.bands, settings.cropMode.ordinal,
+        settings.rollingShutter, settings.smoothSeconds, settings.rsSeconds, settings.crop, settings.rsStrength,
+        stream != null, stream?.lookaheadSeconds ?: 0.0, stream?.maxBufferedFrames ?: 0, stream?.adaptiveTracking ?: false,
+    )
+
+    /** Configure process-wide OpenCV threads before starting analysis workers. */
+    @JvmStatic fun configureThreads(threads: Int) = nativeThreads(threads)
+    @JvmStatic fun mobileSettings(): Settings = Settings().apply { analysisWidth = 640; features = 600 }
+    @JvmStatic fun buildDescription(): String = nativeBuildDescription()
+    @JvmStatic private external fun nativeThreads(threads: Int)
+    @JvmStatic private external fun nativeProfile(handle: Long): String
+    @JvmStatic private external fun nativeDefaults(): DoubleArray
+    @JvmStatic private external fun nativeStreamDefaults(): DoubleArray
+    @JvmStatic private external fun nativeCreate(
+        width: Int, height: Int, fps: Double, horizontalScan: Boolean, motionEstimator: Int,
+        analysisWidth: Int, features: Int, bands: Int, cropMode: Int, rollingShutter: Boolean,
+        smoothSeconds: Double, rsSeconds: Double, crop: Double, rsStrength: Double,
+        realtime: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int, adaptiveTracking: Boolean,
+    ): Long
+    @JvmStatic private external fun nativeStreamPush(
+        handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
+    ): Boolean
+    @JvmStatic private external fun nativeStreamReady(handle: Long): LongArray
+    @JvmStatic private external fun nativeStreamFinish(handle: Long)
+    @JvmStatic private external fun nativeAnalyze(
+        handle: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, ptsUs: Long, durationUs: Long,
+    )
+    @JvmStatic private external fun nativeNextRecoveryFrame(handle: Long): LongArray?
+    @JvmStatic private external fun nativeRecover(
+        handle: Long, width: Int, height: Int, format: Int, stride: Int, pixels: ByteBuffer, ptsUs: Long,
+    )
+    @JvmStatic private external fun nativeFinish(handle: Long): Long
+    @JvmStatic private external fun nativePlanInfo(handle: Long): LongArray
+    @JvmStatic private external fun nativePlanFrame(handle: Long, index: Long): Long
+    @JvmStatic private external fun nativeFrameInfo(handle: Long): LongArray
+    @JvmStatic private external fun nativeFrameMap(handle: Long, width: Int, height: Int): FloatArray
+    @JvmStatic private external fun nativeRendererCreate(backend: Int): Long
+    @JvmStatic private external fun nativeRendererInfo(handle: Long): Array<String>
+    @JvmStatic private external fun nativeRender(
+        handle: Long, plan: Long, width: Int, height: Int, format: Int, rowStride: Int, pixels: ByteBuffer, destination: ByteBuffer,
+    )
+    @JvmStatic private external fun nativeDestroy(handle: Long, kind: Int)
+    @JvmStatic private external fun nativeBuildDescription(): String
 }

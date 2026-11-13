@@ -71,13 +71,17 @@ typedef struct sf_plane {
     const uint8_t* data;
     size_t size_bytes, row_stride;
 } sf_plane;
+/* YUV matrix coefficients, chroma sample position in luma pixels, and range. */
+typedef struct sf_color_info {
+    float kr, kb, chroma_x, chroma_y;
+    int32_t full_range;
+} sf_color_info;
 typedef struct sf_image {
     int32_t width, height;
     sf_pixel_format format;
     int32_t plane_count;
     sf_plane planes[3];
-    float kr, kb, chroma_x, chroma_y;
-    int32_t full_range;
+    sf_color_info color;
     /* Both callbacks retain read-only storage until release; with neither,
        input is copied as needed. Input pixels remain unchanged during the call
        and, for retained storage, until release. Descriptor storage is borrowed
@@ -134,12 +138,11 @@ SF_API void sf_frame_plan_destroy(sf_frame_plan*);
 typedef struct sf_stream_settings {
     double lookahead_seconds;
     size_t max_buffered_frames;
+    int32_t adaptive_tracking;
 } sf_stream_settings;
 SF_API sf_stream_settings sf_stream_settings_default(void);
 SF_API sf_status sf_stream_create(const sf_settings*, const sf_stream_settings*, const sf_video*, const sf_runtime*,
                                   sf_stream**, sf_error*);
-/* Configure adaptive feature quotas before the first input. */
-SF_API sf_status sf_stream_adaptive_tracking(sf_stream*, int32_t enabled, sf_error*);
 /* OK accepts one frame; AGAIN means full and consumes nothing. Drain after
    pushes, then retry the same frame or drop it. The host retains full-sized
    frames until their frame plan arrives. Capacity/shot boundaries can shorten

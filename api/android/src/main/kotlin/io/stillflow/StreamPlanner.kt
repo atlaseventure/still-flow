@@ -7,7 +7,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /** Bounded analysis worker. Retain input storage until its planned frame is consumed. */
-class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolean, settings: StillFlow.Settings) : AutoCloseable {
+class StreamPlanner @JvmOverloads constructor(
+    video: StillFlow.Video, settings: StillFlow.Settings = StillFlow.Settings(),
+    streaming: StillFlow.StreamSettings = StillFlow.StreamSettings(),
+) : AutoCloseable {
     class CpuProfile internal constructor(@JvmField val analysisMs: Double, @JvmField val planningMs: Double)
     private var analysisCpuNs = 0L
     private var planningCpuNs = 0L
@@ -15,13 +18,11 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
         @JvmField val index: Long,
         @JvmField val ptsUs: Long,
         @JvmField val durationUs: Long,
-        internal val map: FloatArray,
+        @JvmField val map: StillFlow.WarpMap,
         @JvmField val analysisStartedNs: Long,
         @JvmField val analysisCompletedNs: Long,
         @JvmField val planCompletedNs: Long,
-    ) {
-        fun copyMap(): FloatArray = map.copyOf()
-    }
+    )
     private class Input(val frame: StillFlow.Frame?, val pts: Long = 0, val duration: Long = 0)
     private val inputs = ArrayBlockingQueue<Input>(2)
     private val outputs = ArrayBlockingQueue<PlannedFrame>(3)
@@ -33,9 +34,8 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
     private val worker: Thread
 
     init {
-        require(settings.realtime) { "StreamPlanner requires realtime settings" }
         // Create synchronously to snapshot caller-owned settings before starting the worker.
-        val session = StillFlow(width, height, fps, horizontalScan, settings)
+        val session = StillFlow.Stream(video, settings, streaming)
         worker = Thread({
             try {
                 session.use {
@@ -43,12 +43,15 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
                     fun drain() {
                         while (true) {
                             val cpuStart = Debug.threadCpuTimeNanos()
-                            val ready = session.takeReady()
+                            val result = session.poll()
                             planningCpuNs += Debug.threadCpuTimeNanos() - cpuStart
-                            if (ready == null) break
-                            val map = session.takeReadyMap()
-                            val times = analysisTimes.removeFirst()
-                            outputs.put(PlannedFrame(ready.index, ready.ptsUs, ready.durationUs, map, times.first, times.second, System.nanoTime()))
+                            if (result !is StillFlow.StreamResult.Ready) break
+                            result.plan.use { plan ->
+                                val ready = plan.info
+                                val map = plan.map(video.width, video.height)
+                                val times = analysisTimes.removeFirst()
+                                outputs.put(PlannedFrame(ready.index, ready.ptsUs, ready.durationUs, map, times.first, times.second, System.nanoTime()))
+                            }
                         }
                     }
                     while (true) {
@@ -61,7 +64,7 @@ class StreamPlanner(width: Int, height: Int, fps: Double, horizontalScan: Boolea
                         analysisTimes.addLast(Pair(start, System.nanoTime()))
                         drain()
                     }
-                    session.finishStream()
+                    session.finish()
                     drain()
                     profile.set(session.profile())
                 }

@@ -330,8 +330,8 @@ class GpuFrames @JvmOverloads constructor(
 
     fun render(frame: Frame, plan: StreamPlanner.PlannedFrame, originUs: Long) = render(frame, plan.map, plan.ptsUs - originUs)
 
-    /** The map is an independent immutable snapshot obtained from takeReadyMap(). */
-    fun render(frame: Frame, map: FloatArray, ptsUs: Long) {
+    /** The map must match this renderer’s output dimensions. */
+    fun render(frame: Frame, map: StillFlow.WarpMap, ptsUs: Long) {
         checkThread()
         require(frame.owner === this && !frame.rendered) { "Frame is foreign or already consumed" }
         readLuma(frame, true)
@@ -342,7 +342,7 @@ class GpuFrames @JvmOverloads constructor(
     }
 
     /** Render one decoded Image with an offline map; the caller may close the Image on return. */
-    fun render(image: Image, map: FloatArray, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
+    fun render(image: Image, map: StillFlow.WarpMap, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
         checkThread()
         val crop = image.cropRect
         require(crop.width() == width && crop.height() == height)
@@ -373,11 +373,10 @@ class GpuFrames @JvmOverloads constructor(
         GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "crop"), crop.left.toFloat(), crop.top.toFloat(), width.toFloat(), height.toFloat())
     }
 
-    private fun renderTexture(texture: Texture?, map: FloatArray, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
+    private fun renderTexture(texture: Texture?, warp: StillFlow.WarpMap, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
         val began = System.nanoTime()
-        require(map.size >= 8 && ptsUs >= 0 && map.all { it.isFinite() })
-        val vertices = map[0].toInt() * map[1].toInt()
-        require(map[0].toInt() in 2..32 && map[1].toInt() in 2..32 && vertices <= 288 && map.size == 8 + 2 * vertices)
+        require(warp.width == width && warp.height == height && ptsUs >= 0) { "Map dimensions or output timestamp are invalid" }
+        val map = warp.packed
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, width, height)
         val program = if (texture == null) externalWarpProgram else warpProgram

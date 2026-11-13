@@ -21,12 +21,13 @@ Image import_image(const sf_image* value) {
     if (value->plane_count < 1 || value->plane_count > 3 || value->format < SF_GRAY8 || value->format > SF_I420 ||
         bool(value->retain) != bool(value->release))
         throw std::invalid_argument("Invalid image descriptor");
-    c_api::boolean(value->full_range);
-    HostImageView view{{value->width, value->height},
-                       static_cast<PixelFormat>(value->format),
-                       {},
-                       {},
-                       {value->kr, value->kb, value->full_range != 0, value->chroma_x, value->chroma_y}};
+    c_api::boolean(value->color.full_range);
+    HostImageView view{
+        {value->width, value->height},
+        static_cast<PixelFormat>(value->format),
+        {},
+        {},
+        {value->color.kr, value->color.kb, value->color.full_range != 0, value->color.chroma_x, value->color.chroma_y}};
     for (int i = 0; i < value->plane_count; ++i) {
         if (!value->planes[i].data || !value->planes[i].size_bytes)
             throw std::invalid_argument("Missing plane data");
@@ -146,9 +147,9 @@ sf_settings sf_settings_default(void) {
 }
 sf_image sf_image_default(void) {
     sf_image image{};
-    image.kr = 0.2126f;
-    image.kb = 0.0722f;
-    image.chroma_y = 0.5f;
+    image.color.kr = 0.2126f;
+    image.color.kb = 0.0722f;
+    image.color.chroma_y = 0.5f;
     return image;
 }
 const char* sf_build_description(void) { return "stillflow " STILLFLOW_VERSION " (pre-release C API, MIT core)"; }
@@ -294,7 +295,15 @@ sf_status sf_frame_plan_get_map(const sf_frame_plan* plan, int32_t width, int32_
 }
 void sf_frame_plan_destroy(sf_frame_plan* plan) { delete plan; }
 void sf_plan_destroy(sf_plan* plan) { delete plan; }
-sf_stream_settings sf_stream_settings_default(void) { return {1.35, 120}; }
+sf_stream_settings sf_stream_settings_default(void) {
+    return {1.35, 120,
+#ifdef __ANDROID__
+            1
+#else
+            0
+#endif
+    };
+}
 sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* stream, const sf_video* video,
                            const sf_runtime* callbacks, sf_stream** out, sf_error* error) {
     if (out)
@@ -303,6 +312,7 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
         if (!out)
             throw std::invalid_argument("Missing stream output");
         c_api::require(stream);
+        c_api::boolean(stream->adaptive_tracking);
         auto settings = c_api::settings(value);
         const auto size = analysis_size(video, settings);
         std::unique_ptr<MotionAnalyzer> motion;
@@ -323,24 +333,17 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
             settings,
             StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames,
 #ifdef __ANDROID__
-                           true
+                           true,
 #else
-                                     false
+                           false,
 #endif
-            },
+                           stream->adaptive_tracking != 0},
             size, video->fps, result->horizontal, std::move(motion), result->runtime.settings(),
 #ifdef STILLFLOW_C_OPENCV
             value->motion_estimator == SF_MOTION_OPENCV ? make_opencv_analyzer(settings, result->horizontal) :
 #endif
                                                         make_translation_analyzer(settings));
         *out = result.release();
-    });
-}
-sf_status sf_stream_adaptive_tracking(sf_stream* stream, int32_t enabled, sf_error* error) {
-    return c_api::boundary(error, [&] {
-        c_api::require(stream);
-        c_api::boolean(enabled);
-        stream->analyzer->adaptive_tracking(enabled != 0);
     });
 }
 sf_status sf_stream_push(sf_stream* stream, const sf_image* image, int64_t pts, int64_t duration, sf_error* error) {
@@ -488,11 +491,11 @@ sf_status sf_frame_get_image(const sf_frame* frame, sf_image* image, sf_error* e
         image->height = view.size.height;
         image->format = static_cast<int32_t>(view.format);
         image->plane_count = static_cast<int32_t>(view.planes.size());
-        image->kr = view.color.kr;
-        image->kb = view.color.kb;
-        image->full_range = view.color.full_range;
-        image->chroma_x = view.color.chroma_x;
-        image->chroma_y = view.color.chroma_y;
+        image->color.kr = view.color.kr;
+        image->color.kb = view.color.kb;
+        image->color.full_range = view.color.full_range;
+        image->color.chroma_x = view.color.chroma_x;
+        image->color.chroma_y = view.color.chroma_y;
         for (size_t i = 0; i < view.planes.size(); ++i)
             image->planes[i] = {view.planes[i].bytes.data(), view.planes[i].bytes.size(), view.planes[i].row_stride};
     });
