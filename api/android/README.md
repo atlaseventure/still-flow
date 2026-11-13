@@ -1,6 +1,18 @@
 # Android SDK
 
-Kotlin implementation with Java-callable bindings for frame stabilization, GPU rendering and Android hardware codecs. Build from the repository root with `./api/android/gradlew -p api/android assembleRelease`, then add the generated AAR to your app:
+English | [简体中文](README.zh-CN.md)
+
+Video stabilization for Kotlin and Java apps on Android arm64, API 26 or later.
+
+## Build and integrate
+
+Install a JDK, Android SDK/NDK and CMake, and set `ANDROID_HOME` to the SDK directory. Run from the repository root:
+
+```sh
+./api/android/gradlew -p api/android assembleRelease
+```
+
+Copy the generated AAR into your app's `libs` directory and add:
 
 ```kotlin
 dependencies {
@@ -8,9 +20,13 @@ dependencies {
 }
 ```
 
-The consuming app needs the Kotlin standard library, supplied by Kotlin-enabled Android projects.
+The app needs the Kotlin standard library, included by Kotlin-enabled Android projects.
 
-Run processing on a worker thread. In offline mode, analyze decoded frames in presentation order, replay requested recovery frames, finish the plan, then decode the original frames again and render by index. Timestamps and durations use microseconds.
+## Stabilize frames
+
+Run processing on a worker thread. The app supplies decoded frames and handles output encoding and audio. Rendering defaults to GPU with CPU fallback.
+
+This offline example uses `frames`, a list of full-resolution RGBA8 `StillFlow.Frame` objects backed by direct buffers with an explicit row stride. Supply increasing presentation timestamps and frame durations in microseconds. `consume` must finish reading each output before the buffer is reused.
 
 ```kotlin
 import io.stillflow.StillFlow
@@ -28,31 +44,16 @@ StillFlow(width, height, fps).use { session ->
     }
     session.finish()
     val output = ByteBuffer.allocateDirect(width * height * 4)
-    frames.forEachIndexed { index, rgbaFrame ->
-        val stabilized = session.render(index, rgbaFrame, output)
-        consume(stabilized) // Consume before reusing output.
+    frames.forEachIndexed { index, frame ->
+        consume(session.render(index, frame, output))
     }
 }
 ```
 
-For offline recovery, decode again only when requested and feed the requested indices in order. `finish()` requires recovery to be complete. Use the same source luma and timestamps for analysis and replay.
+Replay all requested recovery frames with their original pixels and timestamps before calling `finish()`. For video files, decode frames again as needed instead of keeping the entire video in memory.
 
-For offline GPU Surface output on Android 10+, finish analysis, then decode again into an `ImageReader` Surface. Pass each decoded `Image`, `session.frameMap(index)` and its relative PTS to `GpuFrames.render(image, map, ptsUs, bt709, fullRange)`. Use the validated source color matrix/range and an encoder input Surface; drain the encoder around rendering. The call completes source reads before returning, so close the Image immediately afterward. This path requires `GL_EXT_YUV_target` and keeps full-resolution pixels on the GPU.
+## Streaming
 
-`Frame` accepts direct buffers containing gray8, BGR8 or RGBA8, with an explicit row stride. It captures the buffer's remaining range. Analysis copies input as needed; rendering writes to caller-owned storage. Keep input unchanged during each call and close sessions with Kotlin `use` or Java try-with-resources.
+Set `settings.realtime = true` when creating the session; lookahead defaults to 1.35 seconds. Push with `tryPush()`, retain full frames by index, and drain `takeReady()`. Call `renderReady()` with the corresponding frame before taking the next result. If a push is rejected, drain and retry, or drop the incoming live frame. End with `finishStream()` and drain the remaining results.
 
-`Settings.backend` defaults to `AUTO`, preferring OpenGL ES 3.1 compute and falling back to CPU on backend failures. `GLES` requires GPU execution; `CPU` selects software rendering. `rendererInfo()` reports the active device and fallback reason. GPU rendering includes upload and readback for the buffer API.
-
-Motion estimation defaults to `OPENCV`, using feature tracking for translation, rotation, scale and rolling-shutter motion. Analysis and trajectory planning run on CPU. `Settings.motionEstimator = TRANSLATION` selects the lightweight translation-only estimator for constrained workloads. The AAR includes OpenCV and its license notices.
-
-`HardwareCodecs.decoder(format, surface)` and `HardwareCodecs.encoder(format)` return configured hardware `MediaCodec` instances. The host starts, feeds, drains and releases them. Pass a null decoder surface for `Image` output and use `AndroidFrames.luma(image)` for analysis before releasing the decoded buffer. For encoding, configure Surface input or flexible YUV input and supply the corresponding pixels. Packed render frames require conversion to the encoder's input format. On API 26–28, codec selection uses vendor names because the hardware capability flag is unavailable.
-
-Set `settings.realtime = true` for streaming. Call `tryPush()` and drain `takeReady()`; retain full frames by index and call `renderReady()` before taking another result. Finish with `finishStream()` and drain again. A rejected push means the queue is full: drain and retry or drop the incoming frame. Copy MediaCodec output into host-owned buffers before releasing it. Delay audio by the same lookahead while preserving original PTS.
-
-Use `StillFlow.mobileSettings()` for 640-pixel analysis with 600 features. OpenCV defaults to four threads; call `StillFlow.configureThreads()` before starting analysis workers to override this process-wide setting. Streaming adapts feature quotas within `settings.features`; set `settings.adaptiveTracking = false` for a fixed budget.
-
-For GPU-resident streaming on Android 10+ with `GL_EXT_YUV_target`, decode into an `ImageReader` Surface and call `GpuFrames.captureAsync()` before closing each Image. Poll `readLuma()` on the GPU thread while consuming ready plans; drain pending luma before submitting more than three captures. Pass `wait = true` when flushing, or use `capture()` for a synchronous capture. Retain each frame by index, then use `takeReadyMap()` and `GpuFrames.render()` with the encoder input Surface. The GPU cache owns the delayed frames; only the reduced source-Y analysis image is read back. Keep all `GpuFrames` calls on its creating thread and drain the encoder while processing.
-
-`StreamPlanner` runs analysis and planning on a worker with bounded input/output queues. Retry rejected submissions while consuming `takeReady()` results, then call `tryFinish()` and drain until `finished`. Plans own independent maps and can be consumed by the GPU thread while analysis continues. Close the planner to cancel pending work and join its worker.
-
-`profile()` returns cumulative per-stage wall-time aggregates and P50/P95/P99 estimates with bounded native storage. `StreamPlanner.cpuProfile()` reports analysis and planning CPU time on its worker after finishing; OpenCV helper threads are excluded.
+For hardware video input and output, see the [video runner example](../../tools/android/src/main/kotlin/io/stillflow/runner/ExportRunner.kt).

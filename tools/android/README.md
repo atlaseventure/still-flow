@@ -1,22 +1,30 @@
 # Android video runner
 
-Headless Kotlin app consuming the packaged AAR, with hardware H.264 decoding/encoding and GPU Surface rendering. Requires Linux or WSL, the Android SDK, an authorized Android 10+ arm64 device, `adb`, FFmpeg and `uv`.
+English | [简体中文](README.zh-CN.md)
 
-From the repository root:
+Process videos on an Android device using the Still Flow AAR and compare results with a reference video.
+
+## Requirements
+
+Requires Linux or WSL, a JDK, Android SDK/NDK, CMake, `adb`, FFmpeg and `uv`. Set `ANDROID_HOME` to the SDK directory and connect an authorized Android 10+ arm64 device with `GL_EXT_YUV_target` support.
+
+Inputs must be progressive 8-bit H.264 with even dimensions, square pixels and SDR BT.601/BT.709 color metadata. Apply rotation to the pixels before processing. Output contains video only and preserves frame timestamps.
+
+## Usage
+
+Run from the repository root:
 
 ```sh
 uv run --locked --group video python scripts/android.py input.mp4
 uv run --locked --group video python scripts/android.py input.mp4 --realtime --mobile
 uv run --locked --group video python scripts/android.py input.mp4 --serial DEVICE --reference host.mp4 --max-displacement 0.5
-uv run --locked --group video python scripts/compare_video.py host.mp4 android.mp4 --output .local/comparison
+uv run --locked --group video python scripts/android.py --help
 ```
 
-Inputs must be progressive 8-bit H.264 with even dimensions, square pixels, SDR BT.601/BT.709 color metadata and rotation baked into the pixels. Output contains video only and preserves presentation timing. Unsupported media fails before deployment.
+Processing defaults to offline. `--realtime` enables fixed-lookahead streaming; `--mobile` selects lighter analysis settings. Encoding bitrate defaults to 12 Mbps. Use `--serial` when multiple devices are connected, or `--aar` to supply an existing AAR.
 
-The runner builds and installs a minified, debuggable consumer of the release AAR. `--aar` selects an existing AAR. Stabilization parameters use SDK defaults unless overridden. Build parallelism defaults to 12 and encoding bitrate to 12 Mbps. `--help` lists overrides.
+Each run saves its video and reports under `.local/android-runs/`. Use `--output` to select a new directory. The runner builds and installs the app; after processing, it removes temporary device files and leaves the app installed.
 
-Processing defaults to offline. Both modes keep decoded render pixels on the GPU and render to the hardware encoder Surface, requiring `GL_EXT_YUV_target`. Offline processing analyzes the full video before a second decode/render pass. Add `--realtime` for fixed-lookahead streaming. Reports include stage timings.
+## Compare results
 
-Each run writes videos, logs, effective settings, device details and checksums under a new `.local/android-runs/` directory. `--output` selects a new directory. Binary transfers are verified, including when WSL uses Windows adb. The application remains installed; only the run's device files are removed.
-
-Comparison aligns presentation timestamps and measures feature displacement at native resolution. The preview shows reference on the left and candidate on the right. `--max-displacement` requires every frame to have sufficient tracks and a 95th-percentile displacement within the selected pixel limit. Without it, the tool reports measurements without asserting geometric equivalence. These comparisons assess consistency; use a known-motion reference when assessing stabilization quality.
+`--reference` compares frame timing and image geometry. The preview shows the reference on the left and device output on the right. `--max-displacement` requires every frame to have enough tracked features and a 95th-percentile displacement within the specified pixel limit; failure returns a nonzero exit status. Omit the threshold to report measurements only.
