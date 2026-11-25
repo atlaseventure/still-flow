@@ -1,6 +1,7 @@
 #include "stillflow/desktop.h"
 #include "internal.hpp"
 #include "stillflow/adapters/backends.hpp"
+#include "stillflow/adapters/gyro.hpp"
 #include "stillflow/application/stabilize.hpp"
 #include "stillflow/backends/cpu.hpp"
 #ifdef STILLFLOW_C_CUDA
@@ -61,6 +62,50 @@ class Progress final : public stillflow::Progress {
 std::filesystem::path path(const char* text) {
     return text ? std::filesystem::path(reinterpret_cast<const char8_t*>(text)) : std::filesystem::path{};
 }
+stillflow::GyroInput gyro_options(const sf_file_options& options) {
+    if (options.backend == SF_BACKEND_CPU || options.backend == SF_BACKEND_GLES)
+        throw stillflow::NotImplementedError("Gyro stabilization is only implemented on the CUDA backend");
+    if (options.mode == SF_FILE_STREAM)
+        throw stillflow::NotImplementedError("Realtime streaming mode is not implemented for gyro stabilization");
+#ifndef STILLFLOW_C_CUDA
+    throw stillflow::NotImplementedError("Gyro stabilization requires CUDA support");
+#else
+    const auto& value = options.gyro;
+    auto gyro = stillflow::load_gyro_input(path(value.config), path(value.imu));
+    auto& settings = gyro.settings;
+    for (double number : {value.smoothness, value.max_zoom, value.zoom_window, value.fov, value.lens_correction,
+                          value.readout_ms, value.time_offset_ms})
+        if (!std::isfinite(number))
+            throw std::invalid_argument("Gyro options must be finite");
+    if (value.output_width || value.output_height)
+        settings.output_size = {value.output_width, value.output_height};
+    if (value.smoothness >= 0)
+        settings.smoothness = value.smoothness;
+    if (value.max_zoom > 0)
+        settings.max_zoom = value.max_zoom > 10 ? value.max_zoom / 100 : value.max_zoom;
+    if (value.zoom_window >= 0) {
+        settings.adaptive_zoom_window_s = value.zoom_window;
+        settings.adaptive_zoom = value.zoom_window > 0;
+    }
+    if (value.fov > 0)
+        settings.fov = value.fov;
+    if (value.lens_correction >= 0) {
+        if (value.lens_correction > 1)
+            throw std::invalid_argument("Lens correction must be in [0,1]");
+        gyro.lens.lens_correction_amount = value.lens_correction;
+    }
+    if (value.readout_ms >= 0)
+        settings.readout_ms = value.readout_ms;
+    settings.time_offset_s += value.time_offset_ms / 1000;
+    if (value.integration == SF_IMU_GYRO)
+        settings.integration_method = stillflow::ImuIntegrationMethod::gyro_only;
+    else if (value.integration == SF_IMU_COMPLEMENTARY)
+        settings.integration_method = stillflow::ImuIntegrationMethod::complementary;
+    else if (value.integration != SF_IMU_AUTO)
+        throw std::invalid_argument("Invalid IMU integration method");
+    return gyro;
+#endif
+}
 } // namespace
 extern "C" {
 sf_file_options sf_file_options_default(void) {
@@ -71,6 +116,10 @@ sf_file_options sf_file_options_default(void) {
     value.preset = "fast";
     value.threads = 12;
     value.crf = 18;
+    value.gyro.smoothness = -1;
+    value.gyro.zoom_window = -1;
+    value.gyro.lens_correction = -1;
+    value.gyro.readout_ms = -1;
     return value;
 }
 const char* sf_desktop_build_description(void) {
@@ -111,6 +160,8 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_file_callback
         options.scan_axis = scans[value->scan_axis];
         options.preset = value->preset;
         options.backend = stillflow::c_api::backend_name(value->backend);
+        if (value->gyro.config)
+            options.gyro = gyro_options(*value);
         if (value->backend == SF_BACKEND_GLES)
             throw stillflow::BackendError("GLES is unavailable in the desktop file adapter");
 #ifndef STILLFLOW_C_CUDA

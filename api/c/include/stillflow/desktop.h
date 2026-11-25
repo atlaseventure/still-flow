@@ -21,6 +21,21 @@ typedef int32_t sf_decoder;
 enum { SF_DECODER_AUTO = 0, SF_DECODER_CPU = 1, SF_DECODER_NVDEC = 2 };
 typedef int32_t sf_encoder;
 enum { SF_ENCODER_AUTO = 0, SF_ENCODER_OPENH264 = 1, SF_ENCODER_NVENC = 2 };
+typedef int32_t sf_imu_integration;
+enum { SF_IMU_AUTO = 0, SF_IMU_GYRO = 1, SF_IMU_COMPLEMENTARY = 2 };
+typedef struct sf_gyro_options {
+    const char* config;                  /* stabilization.json or .gyroflow. Null selects visual stabilization. */
+    const char* imu;                     /* Optional camera-frame IMU CSV override. */
+    int32_t output_width, output_height; /* Both zero to use the configured dimensions. */
+    double smoothness;                   /* 0..1, negative uses configuration. */
+    double max_zoom;                     /* Ratio or percentage (>10), nonpositive uses configuration. */
+    double zoom_window;                  /* Seconds, zero for static zoom, negative uses configuration. */
+    double fov;                          /* Positive multiplier, nonpositive uses configuration. */
+    double lens_correction;              /* 0..1, negative uses configuration. */
+    double readout_ms;                   /* Negative uses configuration. */
+    double time_offset_ms;               /* Added to camera-frame sample times. */
+    sf_imu_integration integration;
+} sf_gyro_options;
 /* UTF-8 strings are borrowed until sf_stabilize_file returns. Optional paths
    may be null. Use the default function, then set input and output. */
 typedef struct sf_file_options {
@@ -35,6 +50,7 @@ typedef struct sf_file_options {
     sf_audio_mode audio;
     int32_t threads, crf, overwrite;
     const char* preset; /* NVENC speed name; ignored by OpenH264. */
+    sf_gyro_options gyro;
 } sf_file_options;
 typedef struct sf_run_summary {
     size_t frames;

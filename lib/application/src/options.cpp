@@ -1,10 +1,20 @@
 #include "stillflow/application/options.hpp"
+#include "stillflow/application/rendering.hpp"
 #include <cmath>
 #include <stdexcept>
 
 namespace stillflow {
 namespace {
 void validate_options(const Options& o) {
+    if (o.gyro) {
+        if (o.realtime)
+            throw NotImplementedError("Realtime streaming mode is not implemented for gyro stabilization");
+        if (o.backend != "auto" && o.backend != "cuda")
+            throw NotImplementedError("Gyro stabilization is only implemented on the CUDA backend");
+        validate_gyro_settings(o.gyro->settings);
+        if (o.gyro->imu.empty())
+            throw std::invalid_argument("Gyro stabilization requires IMU samples");
+    }
     validate_settings(o);
     if (o.input.empty() || o.output.empty())
         throw std::invalid_argument("input and output paths are required");

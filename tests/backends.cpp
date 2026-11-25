@@ -1,4 +1,8 @@
+#include "stillflow/adapters/gyro.hpp"
 #include "stillflow/backends/cpu.hpp"
+#include "temp_directory.hpp"
+#include <fstream>
+#include <nlohmann/json.hpp>
 #ifdef STILLFLOW_TEST_CUDA
 #include "stillflow/backends/cuda.hpp"
 #endif
@@ -334,3 +338,72 @@ TEST_CASE("Gyro renderer selects CUDA, falls back on unsupported gyro and honors
 }
 #endif
 } // namespace
+
+TEST_CASE("Gyro adapters resolve projects and camera-frame IMU samples", "[gyro][adapter]") {
+    using namespace stillflow;
+    using Json = nlohmann::json;
+    test::TempDirectory temp;
+    const auto csv = temp.path / "camera.imu_camera.csv";
+    std::ofstream(csv, std::ios::binary)
+        << "t_video_s,wx,wy,wz,ax,ay,az\r\n0,1,2,3,4,5,6\r\n0.12,7,8,9,10,11,12\r\n\r\n";
+    Json intrinsics = {{"camera_matrix", {{20, 0, 15}, {0, 21, 7}, {0, 0, 1}}},
+                       {"distortion_coeffs", {0.2, 0.1, 0, 0}}};
+    Json lens = intrinsics;
+    lens["calib_dimension"] = {{"w", 32}, {"h", 16}};
+    lens["model"] = "opencv_fisheye (k1..k4)";
+    const Json size = {{"w", 24}, {"h", 12}};
+    Json defaults = {{"output_dimension", size},
+                     {"max_zoom", 129},
+                     {"adaptive_zoom_window_s", 0},
+                     {"smoothing_params", {{"smoothness", 0.3}, {"smoothness_yaw", 0.7}, {"per_axis", 1}}}};
+    const auto config = temp.path / "stabilization.json";
+    std::ofstream(config) << Json{{"lens", lens},
+                                  {"imu", {{"file", csv.filename().string()}}},
+                                  {"rolling_shutter", {{"readout_ms", 8}, {"direction", "BottomToTop"}}},
+                                  {"gyroflow_reference", defaults}};
+    const auto project = temp.path / "camera.gyroflow";
+    std::ofstream(project) << Json{{"calibration_data",
+                                    {{"calib_dimension", lens["calib_dimension"]},
+                                     {"output_dimension", size},
+                                     {"frame_readout_time", 8},
+                                     {"fisheye_params", intrinsics}}},
+                                   {"stabilization",
+                                    {{"frame_readout_direction", "BottomToTop"},
+                                     {"max_zoom", 129},
+                                     {"adaptive_zoom_window", 0},
+                                     {"smoothing_params",
+                                      {{{"name", "smoothness"}, {"value", 0.3}},
+                                       {{"name", "smoothness_yaw"}, {"value", 0.7}},
+                                       {{"name", "per_axis"}, {"value", 1}}}}}}};
+    for (const auto& path : {config, project}) {
+        auto input = load_gyro_input(path);
+        REQUIRE(input.config_path == path);
+        REQUIRE(input.imu_path == csv);
+        REQUIRE(input.lens.model == LensModel::opencv_fisheye);
+        REQUIRE(input.lens.fy == 21);
+        REQUIRE(input.lens.k[1] == 0.1);
+        REQUIRE(input.settings.smoothness == 0.3);
+        REQUIRE(input.settings.per_axis);
+        REQUIRE(input.settings.smoothness_yaw == 0.7);
+        REQUIRE(input.settings.readout_ms == 8);
+        REQUIRE(!input.settings.readout_top_to_bottom);
+        REQUIRE(input.settings.max_zoom == Catch::Approx(1.29));
+        REQUIRE(!input.settings.adaptive_zoom);
+        REQUIRE(input.settings.output_size.width == 24);
+        REQUIRE(input.imu.size() == 2);
+        REQUIRE(input.imu.back().has_accel);
+        REQUIRE(input.imu.back().az == 12);
+        REQUIRE(input.imu.back().time_s == 0.12);
+        const auto override = temp.path / "rates.csv";
+        std::ofstream(override) << "t_video_s,wx,wy,wz\n0,4,5,6\n";
+        auto rates = load_gyro_input(path, override);
+        REQUIRE(rates.imu.size() == 1);
+        REQUIRE(!rates.imu.front().has_accel);
+        REQUIRE(rates.imu.front().wy == 5);
+    }
+    for (const auto* row : {"0,1,nan,3", "0,1,2", "0,1,2,3x", "-1,1,2,3"}) {
+        std::ofstream(csv) << "t_video_s,wx,wy,wz\n0,1,2,3\n" << row << '\n';
+        REQUIRE_THROWS_AS(load_gyro_input(project), std::runtime_error);
+    }
+    REQUIRE_THROWS_AS(load_gyro_input(project, temp.path / "missing.csv"), std::runtime_error);
+}

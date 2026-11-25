@@ -29,6 +29,17 @@ Usage: stillflow INPUT OUTPUT [options]
   --crop FRACTION         Maximum equivalent per-edge crop, 0..0.25 (default 0.08)
   --crop-mode MODE        auto (shot-fixed), fixed or adaptive (default auto)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
+  --gyro-config PATH      Offline CUDA stabilization using stabilization.json or .gyroflow
+  --imu PATH              Override the camera-frame IMU CSV
+  --output-size WxH       Gyro output dimensions
+  --gyro-smooth N         Gyro smoothness, 0..1
+  --max-zoom N            Maximum zoom ratio, or percentage above 10
+  --zoom-window SECONDS   Adaptive zoom window, 0 for static zoom
+  --fov N                 Positive field-of-view multiplier
+  --lens-correction N     Lens correction amount, 0..1
+  --readout-ms N          Rolling shutter readout in milliseconds
+  --gyro-offset MS        Additional IMU time offset
+  --imu-integration MODE  auto, gyro or complementary
   --backend auto|NAME     Rendering backend (default auto)
   --decoder NAME          Video decoder: auto, cpu or nvdec (default auto)
   --encoder NAME          H.264 encoder: auto, openh264 or nvenc (default auto)
@@ -43,7 +54,7 @@ Usage: stillflow INPUT OUTPUT [options]
 Accepts progressive 8-bit SDR video with square pixels and even dimensions.
 Writes H.264 MP4/MKV; keeps VFR presentation times and compatible audio.
 auto assumes sensor rows and adjusts for display-rotation metadata.
-Crop limits reduce correction strength. No IMU, training or network required.
+Visual stabilization runs without IMU data. Crop limits reduce visual correction strength.
 Codec auto uses NVDEC/NVENC when rendering on CUDA and falls back to CPU
 OpenH264; nvdec/nvenc require the NVIDIA driver and fail instead.
 )";
@@ -68,6 +79,57 @@ int integer(const std::string& text, const std::string& option) {
         throw std::runtime_error(option + " requires an integer");
     return static_cast<int>(value);
 }
+bool gyro_option(sf_gyro_options& gyro, const std::string& option, const char* argument) {
+    const std::string value = argument;
+    auto bounded = [&](double low, double high) {
+        const double result = number(value, option);
+        if (result < low || result > high)
+            throw std::runtime_error(option + " is out of range");
+        return result;
+    };
+    if (option == "--gyro-config")
+        gyro.config = argument;
+    else if (option == "--imu")
+        gyro.imu = argument;
+    else if (option == "--output-size") {
+        const auto sep = value.find('x');
+        if (sep == value.npos || value.find_first_not_of("0123456789x") != value.npos)
+            throw std::runtime_error("--output-size requires WIDTHxHEIGHT");
+        gyro.output_width = integer(value.substr(0, sep), option);
+        gyro.output_height = integer(value.substr(sep + 1), option);
+        if (gyro.output_width <= 0 || gyro.output_height <= 0)
+            throw std::runtime_error("--output-size requires positive dimensions");
+    } else if (option == "--gyro-smooth")
+        gyro.smoothness = bounded(0, 1);
+    else if (option == "--max-zoom") {
+        gyro.max_zoom = number(value, option);
+        if (gyro.max_zoom < 1 || (gyro.max_zoom > 10 && gyro.max_zoom < 100))
+            throw std::runtime_error("--max-zoom must be at least 1x or 100 percent");
+    } else if (option == "--zoom-window")
+        gyro.zoom_window = bounded(0, std::numeric_limits<double>::max());
+    else if (option == "--fov") {
+        gyro.fov = number(value, option);
+        if (gyro.fov <= 0)
+            throw std::runtime_error("--fov must be positive");
+    } else if (option == "--lens-correction")
+        gyro.lens_correction = bounded(0, 1);
+    else if (option == "--readout-ms")
+        gyro.readout_ms = bounded(0, std::numeric_limits<double>::max());
+    else if (option == "--gyro-offset")
+        gyro.time_offset_ms = number(value, option);
+    else if (option == "--imu-integration") {
+        if (value == "auto")
+            gyro.integration = SF_IMU_AUTO;
+        else if (value == "gyro")
+            gyro.integration = SF_IMU_GYRO;
+        else if (value == "complementary")
+            gyro.integration = SF_IMU_COMPLEMENTARY;
+        else
+            throw std::runtime_error("--imu-integration must be auto, gyro or complementary");
+    } else
+        return false;
+    return true;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -85,6 +147,7 @@ int main(int argc, char** argv) {
         auto o = sf_file_options_default();
         o.input = argv[1];
         o.output = argv[2];
+        bool gyro_selected = false;
         bool backend_selected = false;
         for (int i = 3; i < argc; ++i) {
             const std::string option = argv[i];
@@ -103,6 +166,10 @@ int main(int argc, char** argv) {
             if (i + 1 >= argc)
                 throw std::runtime_error("Missing value for " + option);
             const std::string value = argv[++i];
+            if (gyro_option(o.gyro, option, argv[i])) {
+                gyro_selected = true;
+                continue;
+            }
             if (option == "--mode") {
                 if (value != "offline" && value != "realtime")
                     throw std::runtime_error("--mode must be offline or realtime");
@@ -169,11 +236,12 @@ int main(int argc, char** argv) {
                             : value == "openh264" ? SF_ENCODER_OPENH264
                                                   : SF_ENCODER_NVENC;
             } else if (option == "--backend") {
-                if (value != "auto" && value != "cpu" && value != "cuda")
-                    throw std::runtime_error("--backend must be auto, cpu or cuda");
-                const sf_backend backend = value == "auto"  ? SF_BACKEND_AUTO
-                                           : value == "cpu" ? SF_BACKEND_CPU
-                                                            : SF_BACKEND_CUDA;
+                if (value != "auto" && value != "cpu" && value != "cuda" && value != "gles")
+                    throw std::runtime_error("Unknown rendering backend: " + value);
+                const sf_backend backend = value == "auto"   ? SF_BACKEND_AUTO
+                                           : value == "cpu"  ? SF_BACKEND_CPU
+                                           : value == "gles" ? SF_BACKEND_GLES
+                                                             : SF_BACKEND_CUDA;
                 if (backend_selected && backend != o.backend)
                     throw std::runtime_error("Conflicting rendering backend selections");
                 o.backend = backend;
@@ -189,6 +257,8 @@ int main(int argc, char** argv) {
             } else
                 throw std::runtime_error("Unknown option: " + option);
         }
+        if (gyro_selected && !o.gyro.config)
+            throw std::runtime_error("Gyro options require --gyro-config");
         sf_run_summary result{};
         sf_error error{};
         struct Display {

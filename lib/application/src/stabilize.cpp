@@ -426,45 +426,15 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     report_file->publish();
     return summary;
 }
-} // namespace
-
-RunSummary stabilize(const Options& request, Services services) {
-    const auto options = resolve_options(request);
-    options.execution.check();
-    const auto start = Clock::now();
-    const auto frames_path = frames_report_path(options);
-    const std::array outputs{options.output, options.compare, options.report, frames_path};
-    services.outputs.validate(options.input, outputs, options.overwrite);
-    services.media.validate_output(options.output);
-    if (!options.compare.empty())
-        services.media.validate_output(options.compare);
-    services.runtime.configure(options.threads);
-    if (options.realtime)
-        return stabilize_stream(options, services, start);
-    Profile profile(now_ms);
-    PendingRenderer pending(services.renderers, options.backend, services.progress);
-    auto analysis = analyze(options, services, pending, profile);
+RunSummary render_offline(const Options& options, Services& services, Clock::time_point start, Profile& profile,
+                          const Analysis& analysis, Size size, Renderer& renderer, const std::vector<Warp>& warps,
+                          const std::function<Image(size_t, const Image&)>& render,
+                          std::span<const GyroFrameMap> maps = {}, std::span<const double> invalid = {}) {
     const auto& info = analysis.info;
     const auto& frames = analysis.frames;
-    const auto analysis_size = analysis.size;
-    const bool horizontal = analysis.horizontal;
     const auto origin = analysis.origin;
-    if (frames.empty())
-        throw std::runtime_error("Input contains no decoded video frames");
-    // Actual PTS differences, rather than nominal FPS, define frame durations for VFR files.
-    for (size_t i = 0; i + 1 < frames.size(); ++i)
-        analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
-    Plan plan;
-    progress(services.progress, ProgressStage::plan);
-    {
-        ScopeTimer timer(profile, "plan.optimize");
-        plan = Planner::plan({analysis_size, horizontal, origin, frames}, options, options.execution);
-    }
-    progress(services.progress, ProgressStage::plan, 0, 0, 0, 0, true);
-    auto& warps = plan.warps;
+    const auto frames_path = frames_report_path(options);
     const auto analysis_ms = milliseconds(start);
-    auto& renderer = pending.get(profile);
-    RenderSession session(plan, renderer, options.execution);
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())
@@ -478,9 +448,8 @@ RunSummary stabilize(const Options& request, Services services) {
         codecs.emplace_back("recovery_decoder", *analysis.recovery_decoder);
     {
         const auto backends = renderer.report().backends;
-        const bool gpu = !backends.empty() && backends.back().gpu;
+        const bool gpu = options.gyro.has_value() || (!backends.empty() && backends.back().gpu);
         auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
-        const Size size(info.width, info.height);
         const CodecRequest encoder{options.encoder, gpu};
         const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
         auto writer = services.media.writer(output->temporary(), size, info.fps, *reader, origin, encoding, encoder);
@@ -530,7 +499,7 @@ RunSummary stabilize(const Options& request, Services services) {
                     if (rendered >= frames.size() ||
                         std::abs((pts - origin) / 1000000.0 - frames[rendered].seconds) > 0.000001)
                         throw std::runtime_error("Input changed between analysis and render passes");
-                    out.stabilized = session.render(rendered, out.input, profile);
+                    out.stabilized = render(rendered, out.input);
                     out.duration_us = static_cast<int64_t>(std::llround(frames[rendered].duration * 1000000));
                     ++rendered;
                     progress(services.progress, ProgressStage::render, rendered, frames.size(),
@@ -572,8 +541,8 @@ RunSummary stabilize(const Options& request, Services services) {
                                   {options,
                                    frames_path,
                                    info,
-                                   analysis_size,
-                                   horizontal,
+                                   analysis.size,
+                                   analysis.horizontal,
                                    frames,
                                    warps,
                                    profile,
@@ -581,7 +550,9 @@ RunSummary stabilize(const Options& request, Services services) {
                                    std::move(codecs),
                                    summary,
                                    analysis_ms,
-                                   {}});
+                                   {},
+                                   maps,
+                                   invalid});
     options.execution.check();
     output->publish();
     if (comparison)
@@ -590,5 +561,116 @@ RunSummary stabilize(const Options& request, Services services) {
     report_file->publish();
     progress(services.progress, ProgressStage::complete, rendered, frames.size(), duration_us, duration_us, true);
     return summary;
+}
+
+RunSummary stabilize_gyro(const Options& options, const GyroInput& gyro, Services& services, Clock::time_point start) {
+    Profile profile(now_ms);
+    std::unique_ptr<Renderer> renderer;
+    try {
+        renderer = services.renderers.create(options.backend);
+    } catch (const std::invalid_argument& error) {
+        // An explicit CUDA request can reach a factory with no registered CUDA provider.
+        throw NotImplementedError(std::string("Gyro stabilization requires CUDA: ") + error.what());
+    } catch (const BackendError& error) {
+        throw NotImplementedError(std::string("Gyro stabilization requires CUDA: ") + error.what());
+    }
+    const auto backend = renderer->report();
+    if (backend.backend != "cuda")
+        throw NotImplementedError("Gyro stabilization requires the CUDA rendering backend");
+    services.progress.backend(backend);
+    Analysis analysis;
+    std::vector<double> times;
+    {
+        ScopeTimer timer(profile, "analysis.timestamps");
+        auto reader = services.media.reader(options.input, options.threads, {options.decoder, true});
+        analysis.info = reader->info();
+        const auto& info = analysis.info;
+        analysis.size = {info.width, info.height};
+        progress(services.progress, ProgressStage::analyze, 0, info.estimated_frames, 0, info.duration_us);
+        VideoFrame frame;
+        while (reader->next_luma(frame)) {
+            options.execution.check();
+            if (times.empty())
+                analysis.origin = frame.pts_us;
+            const double time = (frame.pts_us - analysis.origin) / 1e6;
+            if (!times.empty())
+                analysis.frames.back().duration = time - times.back();
+            times.push_back(time);
+            auto& motion = analysis.frames.emplace_back();
+            motion.seconds = time;
+            motion.duration = frame.duration_us / 1e6;
+            progress(services.progress, ProgressStage::analyze, times.size(), info.estimated_frames,
+                     frame.pts_us - analysis.origin + frame.duration_us, info.duration_us);
+        }
+        if (times.empty())
+            throw std::runtime_error("Input contains no decoded video frames");
+        analysis.decoder = reader->codec();
+    }
+    services.progress.codec("analysis_decoder", analysis.decoder);
+    services.progress.analyzed(times.size(), true);
+    progress(services.progress, ProgressStage::analyze, times.size(), times.size(), 0, 0, true);
+    progress(services.progress, ProgressStage::plan);
+    std::vector<GyroFrameMap> maps;
+    {
+        ScopeTimer timer(profile, "plan.gyro");
+        const auto track = integrate_imu(gyro.imu, gyro.settings);
+        maps = plan_gyro_frames(times, track, gyro.lens, analysis.size, gyro.settings);
+    }
+    progress(services.progress, ProgressStage::plan, 0, 0, 0, 0, true);
+    const Size size = maps.front().output_size;
+    if (!options.compare.empty() && (size.width != analysis.size.width || size.height != analysis.size.height))
+        throw std::invalid_argument("Comparison video requires matching input and output dimensions");
+    std::vector<Warp> warps(maps.size());
+    std::vector<double> invalid(maps.size());
+    return render_offline(
+        options, services, start, profile, analysis, size, *renderer, warps,
+        [&](size_t index, const Image& input) {
+            const auto& map = maps[index];
+            auto output = renderer->render_gyro(input, map, invalid[index], profile);
+            warps[index].invalid_fraction = invalid[index];
+            warps[index].strength = map.smooth_factor;
+            warps[index].window.scale = map.fov_scale;
+            return output;
+        },
+        maps, invalid);
+}
+} // namespace
+
+RunSummary stabilize(const Options& request, Services services) {
+    const auto options = resolve_options(request);
+    options.execution.check();
+    const auto start = Clock::now();
+    const auto frames_path = frames_report_path(options);
+    const std::array outputs{options.output, options.compare, options.report, frames_path};
+    services.outputs.validate(options.input, outputs, options.overwrite);
+    services.media.validate_output(options.output);
+    if (!options.compare.empty())
+        services.media.validate_output(options.compare);
+    services.runtime.configure(options.threads);
+    if (options.gyro)
+        return stabilize_gyro(options, *options.gyro, services, start);
+    if (options.realtime)
+        return stabilize_stream(options, services, start);
+    Profile profile(now_ms);
+    PendingRenderer pending(services.renderers, options.backend, services.progress);
+    auto analysis = analyze(options, services, pending, profile);
+    const auto& frames = analysis.frames;
+    if (frames.empty())
+        throw std::runtime_error("Input contains no decoded video frames");
+    // Actual PTS differences, rather than nominal FPS, define frame durations for VFR files.
+    for (size_t i = 0; i + 1 < frames.size(); ++i)
+        analysis.frames[i].duration = frames[i + 1].seconds - frames[i].seconds;
+    Plan plan;
+    progress(services.progress, ProgressStage::plan);
+    {
+        ScopeTimer timer(profile, "plan.optimize");
+        plan = Planner::plan({analysis.size, analysis.horizontal, analysis.origin, frames}, options, options.execution);
+    }
+    progress(services.progress, ProgressStage::plan, 0, 0, 0, 0, true);
+    auto& renderer = pending.get(profile);
+    RenderSession session(plan, renderer, options.execution);
+    return render_offline(options, services, start, profile, analysis, {analysis.info.width, analysis.info.height},
+                          renderer, plan.warps,
+                          [&](size_t index, const Image& input) { return session.render(index, input, profile); });
 }
 } // namespace stillflow

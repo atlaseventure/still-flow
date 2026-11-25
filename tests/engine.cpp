@@ -1,3 +1,10 @@
+#ifdef STILLFLOW_TEST_DESKTOP
+#include "stillflow/adapters/backends.hpp"
+#include "stillflow/application/stabilize.hpp"
+#include "temp_directory.hpp"
+#include <fstream>
+#include <nlohmann/json.hpp>
+#endif
 #include "stillflow/application/engine.hpp"
 #include "stillflow/application/stream.hpp"
 #include "stillflow/backends/cpu.hpp"
@@ -153,3 +160,146 @@ TEST_CASE("Streaming anticipates a growing shake envelope without leaking high-f
         REQUIRE(2 * std::abs(speed - previous) / (dt + previous_dt) <= 0.08001);
     }
 }
+
+#ifdef STILLFLOW_TEST_DESKTOP
+namespace {
+using namespace stillflow;
+class TimestampReader final : public VideoReader {
+  public:
+    bool next(VideoFrame& frame) override {
+        constexpr std::array timestamps{120001, 150004, 190010};
+        if (index_ == timestamps.size())
+            return false;
+        frame = {image_, timestamps[index_++], 33001, {}};
+        return true;
+    }
+    const VideoInfo& info() const override { return info_; }
+    void set_audio_callback(std::function<void(const AudioPacket&)>) override {}
+    CodecReport codec() const override { return {}; }
+
+  private:
+    size_t index_ = 0;
+    VideoInfo info_{64, 48, 0, 30, "test"};
+    Image image_ = make_host_image({64, 48}, PixelFormat::gray8, std::vector<uint8_t>(size_t{64} * 48));
+};
+class TimestampWriter final : public VideoWriter {
+  public:
+    explicit TimestampWriter(const std::filesystem::path& path) : file_(path) {}
+    void video(const Image& image, int64_t pts, int64_t duration) override {
+        file_ << image->size().width << ' ' << image->size().height << ' ' << pts << ' ' << duration << '\n';
+    }
+    void audio(const AudioPacket&) override {}
+    void finish() override { file_.close(); }
+    CodecReport codec() const override { return {}; }
+
+  private:
+    std::ofstream file_;
+};
+class TimestampMedia final : public MediaFactory {
+  public:
+    void validate_output(const std::filesystem::path&) const override {}
+    std::unique_ptr<VideoReader> reader(const std::filesystem::path&, int, const CodecRequest& request) override {
+        REQUIRE(request.prefer_hardware);
+        return std::make_unique<TimestampReader>();
+    }
+    std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double, VideoReader&,
+                                        int64_t origin, const EncodingSettings&, const CodecRequest& request) override {
+        REQUIRE(request.prefer_hardware);
+        REQUIRE(size.width == 48);
+        REQUIRE(size.height == 32);
+        REQUIRE(origin == 120001);
+        return std::make_unique<TimestampWriter>(path);
+    }
+};
+class GyroRenderer final : public Renderer {
+  public:
+    Image render(const Image&, Warp&, Size, double, bool, Profile&) override {
+        throw std::logic_error("Unexpected visual render");
+    }
+    Image render_gyro(const Image&, const GyroFrameMap& map, double& invalid, Profile&) override {
+        invalid = count_++ == 1 ? 0.25 : 0;
+        return make_host_image(
+            map.output_size, PixelFormat::gray8,
+            std::vector<uint8_t>(static_cast<size_t>(map.output_size.width) * map.output_size.height));
+    }
+    RenderingReport report() const override { return {"auto", "cuda", {}, {}}; }
+
+  private:
+    size_t count_ = 0;
+};
+struct GyroFactory final : RendererFactory {
+    std::unique_ptr<Renderer> create(const std::string&) const override { return std::make_unique<GyroRenderer>(); }
+};
+struct GyroProgress final : Progress {
+    std::vector<ProgressStage> stages;
+    void event(const ProgressEvent& event) override {
+        if (stages.empty() || event.stage != stages.back())
+            stages.push_back(event.stage);
+    }
+    void backend(const RenderingReport&) override {}
+    void analyzing(const VideoInfo&, Size, bool) override {}
+    void analyzed(size_t, bool) override {}
+    void rendered(size_t, size_t, bool) override {}
+};
+TEST_CASE("Offline gyro processing publishes cropped frames with original VFR timing", "[engine][gyro]") {
+    test::TempDirectory temp;
+    Options options;
+    options.input = temp.path / "input";
+    std::ofstream(options.input).put('x');
+    options.output = temp.path / "output";
+    options.report = temp.path / "report.json";
+    auto& gyro = options.gyro.emplace();
+    gyro.lens = {LensModel::none, {64, 48}, 50, 50, 31.5, 23.5};
+    gyro.imu = {{0}, {1}};
+    gyro.settings.output_size = {48, 32};
+    TimestampMedia media;
+    auto cpu = make_renderer_factory({{"cpu", [] { return make_cpu_backend(); }}});
+    auto images = make_image_processing();
+    auto outputs = make_output_storage();
+    auto host = make_runtime();
+    GyroProgress progress;
+    Services cpu_services{media, *images, *cpu, *outputs, *host, progress};
+    options.realtime = true;
+    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
+    options.realtime = false;
+    options.backend = "cpu";
+    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
+    options.backend = "auto";
+    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
+    options.backend = "cuda";
+    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
+    options.backend = "auto";
+    GyroFactory factory;
+    Services services{media, *images, factory, *outputs, *host, progress};
+    options.compare = temp.path / "comparison";
+    REQUIRE_THROWS_AS(stabilize(options, services), std::invalid_argument);
+    REQUIRE(!std::filesystem::exists(options.output));
+    options.compare.clear();
+    progress.stages.clear();
+    REQUIRE(stabilize(options, services).frames == 3);
+    REQUIRE(progress.stages == std::vector{ProgressStage::analyze, ProgressStage::plan, ProgressStage::render,
+                                           ProgressStage::finalize, ProgressStage::complete});
+    std::ifstream video(options.output);
+    for (const auto* expected : {"48 32 120001 30003", "48 32 150004 40006", "48 32 190010 33001"}) {
+        std::string line;
+        REQUIRE(std::getline(video, line));
+        REQUIRE(line == expected);
+    }
+    const auto report = nlohmann::json::parse(std::ifstream(options.report));
+    REQUIRE(report["video"]["width"] == 64);
+    REQUIRE(report["video"]["output_width"] == 48);
+    REQUIRE(report["video"]["output_height"] == 32);
+    REQUIRE(report["gyro"]["invalid_frames"] == 1);
+    REQUIRE(report["trajectory"]["method"] == "gyro_quaternion_slerp");
+    std::ifstream csv(frames_report_path(options));
+    std::string line;
+    REQUIRE(std::getline(csv, line));
+    REQUIRE(line.ends_with(",invalid_fraction"));
+    REQUIRE(std::getline(csv, line));
+    REQUIRE(line.starts_with("0,0,0.030003,"));
+    REQUIRE(std::getline(csv, line));
+    REQUIRE(line.starts_with("1,0.030003,0.040006,"));
+    REQUIRE(line.ends_with(",0.25"));
+}
+} // namespace
+#endif

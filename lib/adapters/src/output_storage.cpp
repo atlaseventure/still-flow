@@ -82,6 +82,52 @@ void write_csv(const fs::path& path, const std::vector<FrameMotion>& frames, con
     }
 }
 
+void write_gyro_diagnostics(nlohmann::json& report, const fs::path& csv_path, const RunReport& data,
+                            const GyroInput& gyro) {
+    const auto& s = gyro.settings;
+    const auto maps = data.gyro_maps;
+    const auto output = maps.front().output_size;
+    report["video"]["output_width"] = output.width;
+    report["video"]["output_height"] = output.height;
+    report["trajectory"] = {{"method", "gyro_quaternion_slerp"}};
+    std::ofstream csv(csv_path);
+    csv.exceptions(std::ios::badbit | std::ios::failbit);
+    csv << "frame,time_s,duration_s,fov_scale,zoom_ratio,smooth_factor,invalid_fraction\n" << std::setprecision(12);
+    double total_zoom = 0;
+    for (size_t i = 0; i < maps.size(); ++i) {
+        const auto& map = maps[i];
+        total_zoom += map.zoom_ratio;
+        csv << i << ',' << data.frames[i].seconds << ',' << data.frames[i].duration << ',' << map.fov_scale << ','
+            << map.zoom_ratio << ',' << map.smooth_factor << ',' << data.gyro_invalid_fractions[i] << '\n';
+    }
+    const auto [lo, hi] = std::ranges::minmax_element(maps, {}, &GyroFrameMap::zoom_ratio);
+    report["gyro"] = {
+        {"config_path", gyro.config_path.string()},
+        {"imu_path", gyro.imu_path.string()},
+        {"lens_model", gyro.lens.model == LensModel::none ? "none" : "opencv_fisheye"},
+        {"readout_ms", s.readout_ms},
+        {"readout_direction", s.readout_top_to_bottom ? "TopToBottom" : "BottomToTop"},
+        {"smoothness", s.smoothness},
+        {"fov", s.fov},
+        {"max_zoom", s.max_zoom},
+        {"adaptive_zoom_window_s", s.adaptive_zoom_window_s},
+        {"lens_correction_amount", gyro.lens.lens_correction_amount},
+        {"time_offset_ms", s.time_offset_s * 1000},
+        {"integration_method", s.integration_method == ImuIntegrationMethod::gyro_only ? "gyro_only" : "complementary"},
+        {"zoom_ratio", {{"min", lo->zoom_ratio}, {"mean", total_zoom / maps.size()}, {"max", hi->zoom_ratio}}},
+        {"invalid_frames",
+         std::ranges::count_if(data.gyro_invalid_fractions, [](double fraction) { return fraction > 0; })}};
+    if (gyro.reference_zoom_method)
+        report["gyro"]["gyroflow_adaptive_zoom_method"] = *gyro.reference_zoom_method;
+    auto& settings = report["settings"];
+    for (const auto* field : {"bands", "features", "smooth_seconds", "rs_seconds", "rs_strength", "crop_mode",
+                              "crop_budget_per_edge", "minimum_retained_area_ratio"})
+        settings.erase(field);
+    settings["rolling_shutter"] = s.readout_ms > 0;
+    settings["scan_axis"] = "y";
+    report.erase("diagnostics");
+    report.erase("cropping");
+}
 nlohmann::json profile_json(const Profile& profile) {
     auto result = nlohmann::json::object();
     for (const auto& [name, stats] : profile.stages()) {
@@ -273,7 +319,10 @@ class LocalOutputStorage final : public OutputStorage {
                                    {"frame_budget_overruns", data.streaming.frame_budget_overruns},
                                    {"crop_mode", options.crop_mode == CropMode::fixed ? "fixed" : "adaptive"}};
         }
-        write_csv(csv_path, frames, warps);
+        if (options.gyro)
+            write_gyro_diagnostics(report, csv_path, data, *options.gyro);
+        else
+            write_csv(csv_path, frames, warps);
         std::ofstream file(json_path);
         file.exceptions(std::ios::badbit | std::ios::failbit);
         file << report.dump(2) << '\n';

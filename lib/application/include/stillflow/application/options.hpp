@@ -2,11 +2,20 @@
 #include "stillflow/application/media.hpp"
 #include "stillflow/application/runtime.hpp"
 #include "stillflow/application/stream.hpp"
+#include "stillflow/domain/gyro.hpp"
 #include "stillflow/domain/settings.hpp"
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace stillflow {
+struct GyroInput {
+    LensProfile lens;
+    GyroSettings settings;
+    std::vector<ImuSample> imu;
+    std::filesystem::path config_path, imu_path;
+    std::optional<int> reference_zoom_method{}; // Gyroflow project metadata for comparison.
+};
 struct Options : StabilizationSettings {
     std::filesystem::path input, output, compare, report;
     ExecutionSettings execution;
@@ -21,6 +30,7 @@ struct Options : StabilizationSettings {
     StreamSettings stream;
     AudioMode audio = AudioMode::automatic;
     bool overwrite = false;
+    std::optional<GyroInput> gyro;
 };
 // Resolve derived paths and validate the use-case request before invoking services.
 Options resolve_options(Options options);

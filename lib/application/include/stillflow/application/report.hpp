@@ -33,5 +33,7 @@ struct RunReport {
     RunSummary summary;
     double analysis_ms;
     StreamStatistics streaming;
+    std::span<const GyroFrameMap> gyro_maps{};
+    std::span<const double> gyro_invalid_fractions{};
 };
 } // namespace stillflow
