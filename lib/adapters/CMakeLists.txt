@@ -73,7 +73,7 @@ endif()
 
 add_library(stillflow_media STATIC src/media.cpp src/media_adapter.cpp src/audio.cpp)
 add_library(stillflow_images STATIC src/image_processing.cpp)
-add_library(stillflow_host STATIC src/gyro_io.cpp src/output_storage.cpp src/runtime.cpp)
+add_library(stillflow_host STATIC src/gpmf_clock.cpp src/gyro_io.cpp src/output_storage.cpp src/runtime.cpp)
 add_library(StillFlow::media ALIAS stillflow_media)
 add_library(StillFlow::images ALIAS stillflow_images)
 add_library(StillFlow::host ALIAS stillflow_host)

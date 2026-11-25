@@ -104,6 +104,7 @@ void write_gyro_diagnostics(nlohmann::json& report, const fs::path& csv_path, co
     report["gyro"] = {
         {"config_path", gyro.config_path.string()},
         {"imu_path", gyro.imu_path.string()},
+        {"imu_clock", gyro.camera_clock ? "gpmf_tick_with_project_sync" : "csv"},
         {"lens_model", gyro.lens.model == LensModel::none ? "none" : "opencv_fisheye"},
         {"readout_ms", s.readout_ms},
         {"readout_direction", s.readout_top_to_bottom ? "TopToBottom" : "BottomToTop"},

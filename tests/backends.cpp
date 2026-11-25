@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cmath>
 #include <limits>
+#include <numbers>
 
 TEST_CASE("CPU identity preserves pixels and downloaded images own their storage", "[backend]") {
     std::vector<uint8_t> pixels(size_t{96} * 64 * 3);
@@ -214,8 +215,13 @@ TEST_CASE("CUDA rolling fisheye crop agrees with the double precision projection
     REQUIRE(output.size.width == 160);
     REQUIRE(output.size.height == 90);
 
-    // Three phase-shifted triangular ramps give each axis a linear four-tap neighborhood
-    // with slope +/-85 codes/pixel. Byte rounding resolves position to 0.5/85 px per axis.
+    const std::array<uint8_t, 3> color{7, 128, 249};
+    const auto solid = [&](int, int, int c) { return color[c]; };
+    const auto flat = render(solid);
+    const auto expected_flat = map_host_image(signal_image(map.output_size, solid));
+    REQUIRE(std::ranges::equal(flat.planes[0].bytes, expected_flat.planes[0].bytes));
+
+    // Evaluate the eight-tap reconstruction of phase-shifted ramps independently in double precision.
     const auto ramp = [](int coordinate, int c) {
         const int phase = (coordinate + c) % 6;
         return 85 * std::min(phase, 6 - phase);
@@ -225,7 +231,18 @@ TEST_CASE("CUDA rolling fisheye crop agrees with the double precision projection
     const auto axis_error = [&](double position, const uint8_t* codes) {
         const int base = static_cast<int>(position);
         const int channel = (4 - base % 3) % 3;
-        const double expected = std::lerp(ramp(base, channel), ramp(base + 1, channel), position - base);
+        const double t = position - base;
+        const auto sinc = [](double x) {
+            const double a = std::numbers::pi * x;
+            return a == 0 ? 1.0 : std::sin(a) / a;
+        };
+        double sum = 0, weights = 0;
+        for (int k = -3; k <= 4; ++k) {
+            const double w = sinc(t - k) * sinc((t - k) / 4);
+            sum += w * ramp(base + k, channel);
+            weights += w;
+        }
+        const double expected = sum / weights;
         return (codes[channel] - expected) / 85;
     };
     double squared_error = 0, max_position_error = 0;
@@ -240,7 +257,7 @@ TEST_CASE("CUDA rolling fisheye crop agrees with the double precision projection
                 std::max(max_position_error, std::hypot(axis_error(src.x, horizontal.planes[0].bytes.data() + i),
                                                         axis_error(src.y, vertical.planes[0].bytes.data() + i)));
         }
-    REQUIRE(std::sqrt(squared_error / (output.size.width * output.size.height * 3)) < 2.0);
+    REQUIRE(std::sqrt(squared_error / (output.size.width * output.size.height * 3)) < 0.41);
     REQUIRE(max_position_error < 0.01);
 }
 
@@ -286,7 +303,7 @@ TEST_CASE("CUDA gyro resamples native NV12 with independently projected chroma",
     map.output_size = {127, 90};
     map.out_cy -= 30.75;
     const double fraction = cuda->warp_gyro(map);
-    REQUIRE(fraction == Catch::Approx(1.0 / 90));
+    REQUIRE(fraction == Catch::Approx((127.0 + 64) / (127 * 90)));
     const auto output = map_host_image(cuda->download());
     REQUIRE(output.size.width == 127);
     REQUIRE(output.size.height == 90);
@@ -406,4 +423,47 @@ TEST_CASE("Gyro adapters resolve projects and camera-frame IMU samples", "[gyro]
         REQUIRE_THROWS_AS(load_gyro_input(project), std::runtime_error);
     }
     REQUIRE_THROWS_AS(load_gyro_input(project, temp.path / "missing.csv"), std::runtime_error);
+}
+
+TEST_CASE("Packet-timed IMU uses continuous camera ticks and project sync when they agree", "[adapter][gyro]") {
+    using namespace stillflow;
+    test::TempDirectory temp;
+    const auto csv = temp.path / "imu.csv";
+    std::ofstream(csv) << "t_video_s,wx,wy,wz\n0.0275,1,2,3\n0.033,1,2,3\n0.0385,1,2,3\n"
+                          "0.0435,1,2,3\n0.0485,1,2,3\n0.054,1,2,3\n";
+    const auto config = temp.path / "stabilization.json";
+    std::ofstream(config) << R"({
+        "imu":{"file":"imu.csv","time_offset_s":-0.0275},
+        "lens":{"model":"none","calib_dimension":{"w":32,"h":16},
+                "camera_matrix":[[16,0,16],[0,16,8],[0,0,1]],"distortion_coeffs":[0,0,0,0]},
+        "other_files":{"raw_gpmf":"gyro.bin"},
+        "gyroflow_reference":{"integration_method":2,"sync_offsets_ms":{"0s":50,"1s":51}}
+    })";
+    const auto record = [](const std::string& key, char type, char stride, const std::string& data) {
+        const auto count = data.size() / stride;
+        return key + type + stride + static_cast<char>(count >> 8) + static_cast<char>(count) + data +
+               std::string((4 - data.size() % 4) % 4, '\0');
+    };
+    const auto scalar = [&](const std::string& key, int value) {
+        return record(key, 'L', 4, {0, 0, static_cast<char>(value >> 8), static_cast<char>(value)});
+    };
+    const auto bin = temp.path / "gyro.bin";
+    std::ofstream packets(bin, std::ios::binary);
+    for (int i = 0; i < 3; ++i) {
+        const auto stream =
+            scalar("TICK", 1000 + 10 * i) + scalar("TSMP", 2 * (i + 1)) + record("GYRO", 's', 6, std::string(12, '\0'));
+        packets << record("DEVC", 0, 1, record("STRM", 0, 1, stream));
+    }
+    packets.close();
+    const auto corrected = load_gyro_input(config);
+    REQUIRE(corrected.camera_clock);
+    REQUIRE(corrected.imu.front().time_s == Catch::Approx(0.0475));
+    REQUIRE(corrected.imu.back().time_s == Catch::Approx(0.072525));
+    const auto explicit_csv = load_gyro_input(config, csv);
+    REQUIRE(!explicit_csv.camera_clock);
+    REQUIRE(explicit_csv.imu.front().time_s == 0.0275);
+    std::filesystem::resize_file(bin, std::filesystem::file_size(bin) - 1);
+    const auto incomplete = load_gyro_input(config);
+    REQUIRE(!incomplete.camera_clock);
+    REQUIRE(incomplete.imu.back().time_s == 0.054);
 }

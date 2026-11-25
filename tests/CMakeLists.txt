@@ -32,7 +32,7 @@ if(STILLFLOW_BUILD_CLI)
     set_tests_properties(prepare_video PROPERTIES FIXTURES_SETUP video TIMEOUT 180 WORKING_DIRECTORY
                                                   "${PROJECT_SOURCE_DIR}")
     add_executable(stillflow_video_tests video.cpp)
-    target_link_libraries(stillflow_video_tests PRIVATE Catch2::Catch2WithMain)
+    target_link_libraries(stillflow_video_tests PRIVATE StillFlow::adapters Catch2::Catch2WithMain)
     target_compile_definitions(
         stillflow_video_tests PRIVATE STILLFLOW_VIDEO_METRICS="${CMAKE_CURRENT_BINARY_DIR}/video/metrics.txt"
                                       STILLFLOW_RS_VIDEO_METRICS="${CMAKE_CURRENT_BINARY_DIR}/rolling-shutter")

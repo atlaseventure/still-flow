@@ -201,6 +201,16 @@ TEST_CASE("Bidirectional smoothing attenuates jitter without shifting its peak",
     REQUIRE_THROWS_AS(smooth_orientations(raw, s, local), std::invalid_argument);
 }
 
+TEST_CASE("Two-pass smoothing preserves the interior angular velocity of a steady pan", "[domain][gyro]") {
+    using namespace stillflow;
+    OrientationTrack raw;
+    for (int i = 0; i <= 1200; ++i)
+        raw.samples.push_back({i * 0.01, exp_so3(0, 0.12 * i * 0.01, 0)});
+    const auto smooth = smooth_orientations(raw, {});
+    const auto rotation = multiply(conjugate(smooth.sample(5)), smooth.sample(7));
+    REQUIRE(log_so3(rotation)[1] == Catch::Approx(0.24).margin(0.002));
+}
+
 TEST_CASE("Per-axis smoothing uses each camera axis and the actual interval in both passes", "[domain][gyro]") {
     using namespace stillflow;
     GyroSettings s;
@@ -208,20 +218,23 @@ TEST_CASE("Per-axis smoothing uses each camera axis and the actual interval in b
     s.smoothness_pitch = 0.2;
     s.smoothness_yaw = 0.5;
     s.smoothness_roll = 0.8;
-    s.alpha_0_1s = 1;
-    const std::array constants{s.smoothness_pitch, s.smoothness_yaw, s.smoothness_roll};
-    for (size_t axis = 0; axis < 3; ++axis) {
-        std::array<double, 3> pulse{};
-        pulse[axis] = 0.25;
-        const OrientationTrack raw{{{0, {}}, {0.1, exp_so3(pulse[0], pulse[1], pulse[2])}, {0.4, {}}}};
+    std::array<double, 3> peaks{};
+    for (size_t axis = 0; axis < peaks.size(); ++axis) {
+        OrientationTrack raw;
+        for (int i = 0; i <= 400; ++i) {
+            std::array<double, 3> pulse{};
+            pulse[axis] = i == 200 ? 0.2 : 0;
+            raw.samples.push_back({i * 0.01 + (i % 2) * 0.002, exp_so3(pulse[0], pulse[1], pulse[2])});
+        }
         const auto smooth = smooth_orientations(raw, s);
-        const double decay1 = std::exp(-0.1 / constants[axis]), decay2 = std::exp(-0.3 / constants[axis]);
-        const double forward1 = 0.25 * (1 - decay1), last = forward1 * decay2;
-        const double middle = last * decay2 + forward1 * (1 - decay2);
-        REQUIRE(log_so3(smooth.sample(0))[axis] == Catch::Approx(middle * decay1));
-        REQUIRE(log_so3(smooth.sample(0.1))[axis] == Catch::Approx(middle));
-        REQUIRE(log_so3(smooth.sample(0.4))[axis] == Catch::Approx(last));
+        const auto angles = log_so3(smooth.sample(2.0));
+        peaks[axis] = angles[axis];
+        REQUIRE(angles[(axis + 1) % 3] == Catch::Approx(0));
+        REQUIRE(angles[(axis + 2) % 3] == Catch::Approx(0));
     }
+    REQUIRE(peaks[0] > peaks[1]);
+    REQUIRE(peaks[1] > peaks[2]);
+    REQUIRE(peaks[2] > 0);
 }
 
 TEST_CASE("Fisheye planning preserves sensor pixel aspect and inverts the output ray", "[domain][gyro]") {
@@ -237,13 +250,14 @@ TEST_CASE("Fisheye planning preserves sensor pixel aspect and inverts the output
     const auto maps = plan_gyro_frames(std::array{1.0}, {}, lens, input, s);
     const auto& m = maps.at(0);
     REQUIRE(m.row_rotations.size() == 1);
-    REQUIRE(m.fov_scale == 1);
-    REQUIRE(m.out_fx == lens.fx);
-    REQUIRE(m.out_fy == lens.fy);
+    REQUIRE(m.fov_scale > 1);
+    REQUIRE(m.zoom_ratio == Catch::Approx(1));
+    REQUIRE(m.out_fx == Catch::Approx(lens.fx / m.fov_scale));
+    REQUIRE(m.out_fy == Catch::Approx(lens.fy / m.fov_scale));
     REQUIRE(m.out_cy == 759.5);
     Point src;
     REQUIRE(project_output_to_input(m, {m.out_cx + 1000, m.out_cy}, src));
-    REQUIRE(src.x == Catch::Approx(lens.cx + lens.fx * std::atan(1000 / lens.fx)));
+    REQUIRE(src.x == Catch::Approx(lens.cx + lens.fx * std::atan(1000 / m.out_fx)));
     REQUIRE(src.y == Catch::Approx(lens.cy));
     require_containment(m);
     auto behind = m;
@@ -273,6 +287,14 @@ TEST_CASE("Rolling shutter samples the cropped sensor rows in either readout dir
             REQUIRE(project_output_to_input(map, {map.out_cx, double(y)}, src));
             const double row_offset = (src.y / (input.height - 1) - 0.5) * 0.02 * (down ? 1 : -1);
             REQUIRE(src.x == Catch::Approx(lens.cx + lens.fx * std::tan(-2 * row_offset)).margin(1e-7));
+        }
+        // Off-center rays reach different sensor rows at the same output y.
+        for (double x : {25.0, 375.0}) {
+            Point src;
+            REQUIRE(project_output_to_input(map, {x, 10}, src));
+            const double dt = (src.y / (input.height - 1) - 0.5) * (down ? 0.02 : -0.02);
+            const double bearing = std::atan((x - map.out_cx) / map.out_fx);
+            REQUIRE(src.x == Catch::Approx(lens.cx + lens.fx * std::tan(bearing - 2 * dt)).margin(0.001));
         }
         require_containment(map);
     }

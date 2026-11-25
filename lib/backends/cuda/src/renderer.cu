@@ -23,7 +23,7 @@ struct DeviceMap {
 
 struct DeviceGyroMap {
     int input_width, input_height, output_width, output_height;
-    int lens_model, row_count;
+    int lens_model, row_count, sensor_rows;
     float in_fx, in_fy, in_cx, in_cy;
     float k0, k1, k2, k3, lens_correction_amount;
     float out_fx, out_fy, out_cx, out_cy;
@@ -48,6 +48,7 @@ DeviceGyroMap pack_gyro_map(const GyroFrameMap& map, Size uploaded) {
             map.output_size.height,
             static_cast<int>(lens.model),
             static_cast<int>(map.row_rotations.size()),
+            map.sensor_rows,
             static_cast<float>(lens.fx),
             static_cast<float>(lens.fy),
             static_cast<float>(lens.cx),
@@ -63,9 +64,10 @@ DeviceGyroMap pack_gyro_map(const GyroFrameMap& map, Size uploaded) {
             static_cast<float>(map.out_cy)};
 }
 
-__device__ bool gyro_source_position(const DeviceGyroMap& m, const float* row_matrices, float x, float y, float2& p) {
+__device__ bool gyro_project(const DeviceGyroMap& m, const float* row_matrices, float x, float y, float fraction,
+                             float2& p) {
     const float nx = (x - m.out_cx) / m.out_fx, ny = (y - m.out_cy) / m.out_fy;
-    const float row = fminf(fmaxf(y / (m.output_height - 1), 0), 1) * (m.row_count - 1);
+    const float row = fminf(fmaxf(fraction, 0), 1) * (m.row_count - 1);
     const int lo = min(static_cast<int>(row), m.row_count - 1), hi = min(lo + 1, m.row_count - 1);
     const float* a = row_matrices + static_cast<size_t>(lo) * 9;
     const float* b = row_matrices + static_cast<size_t>(hi) * 9;
@@ -91,8 +93,17 @@ __device__ bool gyro_source_position(const DeviceGyroMap& m, const float* row_ma
     // Preserve exact border coordinates when the ray and intrinsics are unchanged.
     p.x = px == nx && m.in_fx == m.out_fx && m.in_cx == m.out_cx ? x : px * m.in_fx + m.in_cx;
     p.y = py == ny && m.in_fy == m.out_fy && m.in_cy == m.out_cy ? y : py * m.in_fy + m.in_cy;
-    return isfinite(p.x) && isfinite(p.y) && p.x >= 0 && p.x <= m.input_width - 1 && p.y >= 0 &&
-           p.y <= m.input_height - 1;
+    return isfinite(p.x) && isfinite(p.y);
+}
+
+__device__ bool gyro_source_position(const DeviceGyroMap& m, const float* rows, float x, float y, float2& p) {
+    float fraction = y / (m.output_height - 1);
+    for (int i = 0; i < (m.sensor_rows ? 3 : 1); ++i) {
+        if (!gyro_project(m, rows, x, y, fraction, p))
+            return false;
+        fraction = p.y / (m.input_height - 1);
+    }
+    return p.x >= 0 && p.x <= m.input_width - 1 && p.y >= 0 && p.y <= m.input_height - 1;
 }
 
 __device__ float sample_mesh(const float* values, int a, int b, float fx, float fy) {
@@ -115,16 +126,21 @@ __device__ float2 source_position(const DeviceMap& m, float x, float y) {
 
 // Keep matching YUV samples in their original code space, including headroom.
 // Other matrices/ranges are converted in float without an 8-bit RGB intermediate.
-__device__ float3 output_yuv(const DeviceSource& s, float2 at, int width, int height) {
-    if (s.kr == 0.2126f && s.kb == 0.0722f && !s.full_range) {
+template <bool gyro = false> __device__ float3 output_yuv(const DeviceSource& s, float2 at, int width, int height) {
+    if (s.kr == 0.2126f && s.kb == 0.0722f && (!s.full_range || gyro)) {
         const auto p = cuda::coded_position(at.x, at.y, s.rotation, s.coded_width, s.coded_height);
         const float cx = (p.x - s.chroma_x) * 0.5f, cy = (p.y - s.chroma_y) * 0.5f;
         const int cw = (s.coded_width + 1) / 2, ch = (s.coded_height + 1) / 2;
-        return {cuda::bicubic(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y),
-                cuda::bilinear(s.chroma, s.chroma_pitch, 2, cw, ch, cx, cy),
-                cuda::bilinear(s.chroma + 1, s.chroma_pitch, 2, cw, ch, cx, cy)};
+        const float y = cuda::reconstruct<gyro>(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y);
+        const float u = cuda::bilinear(s.chroma, s.chroma_pitch, 2, cw, ch, cx, cy);
+        const float v = cuda::bilinear(s.chroma + 1, s.chroma_pitch, 2, cw, ch, cx, cy);
+        if constexpr (gyro) {
+            if (s.full_range)
+                return {16 + y * (219.0f / 255), 128 + (u - 128) * (224.0f / 255), 128 + (v - 128) * (224.0f / 255)};
+        }
+        return {y, u, v};
     }
-    const auto rgb = cuda::sample<true>(s, at.x, at.y, width, height);
+    const auto rgb = cuda::sample<true, gyro>(s, at.x, at.y, width, height);
     const float y = 0.2126f * rgb.z + 0.7152f * rgb.y + 0.0722f * rgb.x;
     return {16 + y * (219.0f / 255), 128 + (rgb.x - y) * (224.0f / (255 * 1.8556f)),
             128 + (rgb.z - y) * (224.0f / (255 * 1.5748f))};
@@ -181,7 +197,8 @@ __global__ void render_gyro_bgr_kernel(DeviceSource source, unsigned char* outpu
     if (x < m.output_width && y < m.output_height) {
         float2 p;
         invalid = !gyro_source_position(m, rows, x, y, p);
-        const float3 bgr = invalid ? float3{} : cuda::sample<false>(source, p.x, p.y, m.input_width, m.input_height);
+        const float3 bgr =
+            invalid ? float3{} : cuda::sample<false, true>(source, p.x, p.y, m.input_width, m.input_height);
         auto* pixel = output + (static_cast<size_t>(y) * m.output_width + x) * 3;
         pixel[0] = cuda::to_byte(bgr.x);
         pixel[1] = cuda::to_byte(bgr.y);
@@ -201,10 +218,11 @@ __global__ void render_gyro_yuv_kernel(DeviceSource source, unsigned char* outpu
         float2 p;
         invalid = !gyro_source_position(m, rows, x, y, p);
         output[static_cast<size_t>(y) * pitch + x] =
-            invalid ? 16 : cuda::to_byte(output_yuv(source, p, m.input_width, m.input_height).x);
+            invalid ? 16 : cuda::to_byte(output_yuv<true>(source, p, m.input_width, m.input_height).x);
         if (!(x & 1) && !(y & 1)) {
             const bool valid = gyro_source_position(m, rows, x, fminf(y + 0.5f, m.output_height - 1), p);
-            const float3 uv = valid ? output_yuv(source, p, m.input_width, m.input_height) : float3{16, 128, 128};
+            invalid |= !valid;
+            const float3 uv = valid ? output_yuv<true>(source, p, m.input_width, m.input_height) : float3{16, 128, 128};
             auto* pixel = output + pitch * m.output_height + static_cast<size_t>(y / 2) * pitch + x;
             pixel[0] = cuda::to_byte(uv.y);
             pixel[1] = cuda::to_byte(uv.z);
@@ -227,7 +245,7 @@ class CudaBackend final : public RenderBackend {
                 name_,
                 {{PixelFormat::bgr8}, {std::string(cuda_image_api), "host"}},
                 {{"compiler", STILLFLOW_CUDA_VERSION},
-                 {"sampler", "catmull-rom luma/RGB, bilinear chroma"},
+                 {"sampler", "visual Catmull-Rom, gyro Lanczos4 luma/RGB, bilinear chroma"},
                  {"output", "nv12 bt709 (device), lazy host bgr8"}}};
     }
     void upload(const Image& input) override {

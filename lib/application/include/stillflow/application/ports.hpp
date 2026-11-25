@@ -21,6 +21,14 @@ class VideoReader {
     virtual void set_audio_callback(std::function<void(const AudioPacket&)> callback) = 0;
     // Valid after the last next() call; reflects every frame decoded so far.
     virtual CodecReport codec() const = 0;
+    // Delivers the same display timeline as next(), including the last frame duration.
+    virtual void scan_timestamps(const std::function<void(FrameTimestamp)>& visit, const std::function<void()>& check) {
+        VideoFrame frame;
+        while (next_luma(frame)) {
+            check();
+            visit({frame.pts_us, frame.duration_us});
+        }
+    }
 };
 class VideoWriter {
   public:

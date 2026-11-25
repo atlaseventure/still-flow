@@ -15,6 +15,9 @@ struct VideoInfo {
     int64_t duration_us = 0; // Zero when the container does not provide a duration.
     size_t estimated_frames = 0;
 };
+struct FrameTimestamp {
+    int64_t pts_us, duration_us;
+};
 struct VideoFrame {
     Image image;
     int64_t pts_us = 0, duration_us = 0;

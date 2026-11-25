@@ -587,21 +587,21 @@ RunSummary stabilize_gyro(const Options& options, const GyroInput& gyro, Service
         const auto& info = analysis.info;
         analysis.size = {info.width, info.height};
         progress(services.progress, ProgressStage::analyze, 0, info.estimated_frames, 0, info.duration_us);
-        VideoFrame frame;
-        while (reader->next_luma(frame)) {
-            options.execution.check();
-            if (times.empty())
-                analysis.origin = frame.pts_us;
-            const double time = (frame.pts_us - analysis.origin) / 1e6;
-            if (!times.empty())
-                analysis.frames.back().duration = time - times.back();
-            times.push_back(time);
-            auto& motion = analysis.frames.emplace_back();
-            motion.seconds = time;
-            motion.duration = frame.duration_us / 1e6;
-            progress(services.progress, ProgressStage::analyze, times.size(), info.estimated_frames,
-                     frame.pts_us - analysis.origin + frame.duration_us, info.duration_us);
-        }
+        reader->scan_timestamps(
+            [&](FrameTimestamp frame) {
+                if (times.empty())
+                    analysis.origin = frame.pts_us;
+                const double time = (frame.pts_us - analysis.origin) / 1e6;
+                if (!times.empty())
+                    analysis.frames.back().duration = time - times.back();
+                times.push_back(time);
+                auto& motion = analysis.frames.emplace_back();
+                motion.seconds = time;
+                motion.duration = frame.duration_us / 1e6;
+                progress(services.progress, ProgressStage::analyze, times.size(), info.estimated_frames,
+                         frame.pts_us - analysis.origin + frame.duration_us, info.duration_us);
+            },
+            [&] { options.execution.check(); });
         if (times.empty())
             throw std::runtime_error("Input contains no decoded video frames");
         analysis.decoder = reader->codec();

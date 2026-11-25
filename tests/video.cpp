@@ -1,3 +1,4 @@
+#include "stillflow/adapters/backends.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
 #include <string>
@@ -42,4 +43,24 @@ TEST_CASE("Offline rolling shutter correction works from the first frame", "[vid
 }
 TEST_CASE("Realtime rolling shutter correction works from the first frame", "[video][rolling-shutter-realtime]") {
     check_startup_deformation("realtime");
+}
+
+TEST_CASE("Packet scan preserves every decoded presentation time and duration", "[video][global]") {
+    const auto path = std::filesystem::path(STILLFLOW_VIDEO_METRICS).parent_path() / "output.mp4";
+    auto media = stillflow::make_media_factory();
+    auto scan = media->reader(path, 2, {"cpu"});
+    std::vector<stillflow::FrameTimestamp> timeline;
+    scan->scan_timestamps([&](auto stamp) { timeline.push_back(stamp); }, [] {});
+    REQUIRE(scan->codec().frames == 0);
+    auto decoded = media->reader(path, 2, {"cpu"});
+    stillflow::VideoFrame frame;
+    size_t i = 0;
+    while (decoded->next(frame)) {
+        REQUIRE(i < timeline.size());
+        REQUIRE(timeline[i].pts_us == frame.pts_us);
+        REQUIRE(timeline[i].duration_us == frame.duration_us);
+        ++i;
+    }
+    REQUIRE(i == timeline.size());
+    REQUIRE(i == 60);
 }

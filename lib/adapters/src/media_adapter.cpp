@@ -59,6 +59,11 @@ class FfmpegReader final : public VideoReader {
     }
     bool next(VideoFrame& frame) override { return read(frame, false); }
     bool next_luma(VideoFrame& frame) override { return read(frame, true); }
+    void scan_timestamps(const std::function<void(FrameTimestamp)>& visit,
+                         const std::function<void()>& check) override {
+        if (!reader.scan_timestamps(visit, check))
+            VideoReader::scan_timestamps(visit, check);
+    }
     bool read(VideoFrame& frame, bool luma_only) {
         DecodedFrame decoded;
         if (!reader.next(decoded, luma_only))

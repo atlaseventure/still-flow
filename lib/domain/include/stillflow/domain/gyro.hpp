@@ -50,6 +50,7 @@ struct GyroSettings {
     double time_offset_s = 0.0; // Effective video time = IMU time + offset.
     ImuIntegrationMethod integration_method = ImuIntegrationMethod::gyro_only;
     Size output_size{};
+    bool zoom_envelope = false;
 };
 void validate_gyro_settings(const GyroSettings& settings);
 
@@ -71,8 +72,9 @@ struct GyroFrameMap {
     double out_fx = 0, out_fy = 0, out_cx = 0, out_cy = 0;
     double fov_scale = 1.0, zoom_ratio = 1.0, smooth_factor = 1.0;
     Quaternion raw_orientation, smooth_orientation;
-    // Uniform output rows, each mapping smooth camera rays into the raw row camera.
+    // Uniform row knots mapping smooth camera rays into the raw row camera.
     std::vector<Matrix3> row_rotations;
+    bool sensor_rows = false; // Index by projected input row for physical readout.
 };
 bool project_output_to_input(const GyroFrameMap& map, Point output_px, Point& input_px);
 // Throws std::domain_error when the zoom limit and sensor margin are incompatible.

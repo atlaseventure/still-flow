@@ -15,6 +15,7 @@ struct GyroInput {
     std::vector<ImuSample> imu;
     std::filesystem::path config_path, imu_path;
     std::optional<int> reference_zoom_method{}; // Gyroflow project metadata for comparison.
+    bool camera_clock = false;
 };
 struct Options : StabilizationSettings {
     std::filesystem::path input, output, compare, report;

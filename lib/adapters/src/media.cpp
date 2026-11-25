@@ -1,6 +1,7 @@
 #include "media.hpp"
 #include "audio.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -506,6 +507,56 @@ const VideoInfo& Reader::info() const { return impl_->info; }
 AVFormatContext* Reader::context() const { return impl_->format; }
 void Reader::set_audio_callback(std::function<void(const AVPacket*)> callback) {
     impl_->audio_callback = std::move(callback);
+}
+
+bool Reader::scan_timestamps(const std::function<void(FrameTimestamp)>& visit, const std::function<void()>& cancel) {
+    auto& s = *impl_;
+    const auto* stream = s.format->streams[s.video_stream];
+    const auto* codec = stream->codecpar;
+    // Progressive AVC/HEVC in a non-fragmented MOV sample table has one access
+    // unit per sample. Use a separate demux cursor so every rejection can decode
+    // from the original start, including edit-list preroll.
+    std::error_code error;
+    if (s.format->iformat != av_find_input_format("mov") || stream->nb_frames <= 0 ||
+        avformat_index_get_entries_count(stream) != stream->nb_frames || codec->field_order != AV_FIELD_PROGRESSIVE ||
+        (codec->codec_id != AV_CODEC_ID_H264 && codec->codec_id != AV_CODEC_ID_HEVC) ||
+        !std::filesystem::is_regular_file(s.format->url, error))
+        return false;
+    Impl scan;
+    check(avformat_open_input(&scan.format, s.format->url, nullptr, nullptr), "Open timestamp scan");
+    scan.packet = av_packet_alloc();
+    if (!scan.packet)
+        throw std::bad_alloc();
+    std::vector<FrameTimestamp> timeline;
+    const auto count = static_cast<size_t>(stream->nb_frames);
+    timeline.reserve(count);
+    for (;;) {
+        cancel();
+        const int read = av_read_frame(scan.format, scan.packet);
+        if (read == AVERROR_EOF)
+            break;
+        check(read, "Read timestamp packet");
+        const auto& p = *scan.packet;
+        if (p.stream_index == s.video_stream) {
+            if (p.pts == AV_NOPTS_VALUE || p.dts == AV_NOPTS_VALUE || p.duration <= 0 ||
+                (p.flags & (AV_PKT_FLAG_DISCARD | AV_PKT_FLAG_CORRUPT)) || timeline.size() == count)
+                return false;
+            timeline.push_back({av_rescale_q(p.pts, stream->time_base, microseconds),
+                                av_rescale_q(p.duration, stream->time_base, microseconds)});
+        }
+        av_packet_unref(scan.packet);
+    }
+    if (timeline.size() != count)
+        return false;
+    std::ranges::sort(timeline, {}, &FrameTimestamp::pts_us);
+    if (timeline.front().pts_us != s.start_us ||
+        std::ranges::adjacent_find(timeline, {}, &FrameTimestamp::pts_us) != timeline.end())
+        return false;
+    for (const auto& timing : timeline)
+        visit(timing);
+    s.codec.implementation = "mov packet timestamps";
+    s.codec.device.clear();
+    return true;
 }
 
 bool Reader::next(DecodedFrame& output, bool luma_only) {

@@ -1,7 +1,9 @@
+#include "gpmf_clock.hpp"
 #include "stillflow/adapters/gyro.hpp"
 #include <algorithm>
 #include <charconv>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 
 namespace stillflow {
@@ -80,6 +82,36 @@ void read_lens(LensProfile& lens, const Json& calibration, const Json& intrinsic
     lens.cx = matrix[0][2];
     lens.cy = matrix[1][2];
     lens.k = intrinsics.at("distortion_coeffs").get<std::array<double, 4>>();
+    if (!calibration.value("asymmetrical", true)) {
+        lens.cx = lens.calib_size.width / 2.0;
+        lens.cy = lens.calib_size.height / 2.0;
+    }
+}
+
+// A stabilization package can carry the calibrated matrix without the
+// Gyroflow profile's symmetry flag. Only inherit it from the same calibration.
+void read_packaged_lens(GyroInput& gyro, const Json& config) {
+    const auto& lens = config.at("lens");
+    read_lens(gyro.lens, lens, lens);
+    const auto source = config.value("source", Json::object());
+    if (lens.contains("asymmetrical") || !source.contains("gyroflow_project") || !lens.contains("profile"))
+        return;
+    std::ifstream project(gyro.config_path.parent_path() / source.at("gyroflow_project").get<std::string>());
+    if (!project)
+        return;
+    const auto data = Json::parse(project, nullptr, false);
+    if (!data.contains("calibration_data"))
+        return;
+    const auto& calibration = data.at("calibration_data");
+    if (!calibration.contains("fisheye_params") || !calibration.contains("calib_dimension") ||
+        calibration.value("identifier", std::string{}) != lens.at("profile").get<std::string>() ||
+        calibration.at("calib_dimension") != lens.at("calib_dimension"))
+        return;
+    const auto& intrinsics = calibration.at("fisheye_params");
+    if (intrinsics.contains("camera_matrix") && intrinsics.contains("distortion_coeffs") &&
+        intrinsics.at("camera_matrix") == lens.at("camera_matrix") &&
+        intrinsics.at("distortion_coeffs") == lens.at("distortion_coeffs"))
+        read_lens(gyro.lens, calibration, intrinsics);
 }
 
 void read_direction(GyroSettings& settings, const std::string& direction) {
@@ -115,6 +147,7 @@ void read_reference(GyroInput& gyro, const Json& ref, int integration) {
     s.adaptive_zoom_window_s =
         ref.value("adaptive_zoom_window_s", ref.value("adaptive_zoom_window", s.adaptive_zoom_window_s));
     s.adaptive_zoom = s.adaptive_zoom_window_s > 0;
+    s.zoom_envelope = ref.value("adaptive_zoom_method", 1) == 1;
     if (ref.contains("adaptive_zoom_method"))
         gyro.reference_zoom_method = ref.at("adaptive_zoom_method").get<int>();
     gyro.lens.lens_correction_amount = ref.value("lens_correction_amount", gyro.lens.lens_correction_amount);
@@ -122,6 +155,49 @@ void read_reference(GyroInput& gyro, const Json& ref, int integration) {
         s.output_size = dimensions(ref.at("output_dimension"));
     if ((integration == 1 || integration == 2) && ref.value("horizon_lock_amount", 0.0) > 0)
         s.integration_method = ImuIntegrationMethod::complementary;
+}
+void align_packet_clock(GyroInput& gyro, const Json& config) {
+    const auto files = config.value("other_files", Json::object());
+    const auto ref = config.value("gyroflow_reference", Json::object());
+    const auto& imu = config.at("imu");
+    if (!files.contains("raw_gpmf") || !ref.contains("sync_offsets_ms") || ref.value("integration_method", 0) != 2 ||
+        !imu.contains("time_offset_s") ||
+        std::abs(gyro.imu.front().time_s + imu.at("time_offset_s").get<double>()) > 1e-6)
+        return;
+    std::map<double, double> sync;
+    for (const auto& [name, offset] : ref.at("sync_offsets_ms").items()) {
+        if (!name.ends_with('s') || !offset.is_number())
+            return;
+        double seconds = 0;
+        const auto end = name.data() + name.size() - 1;
+        const auto parsed = std::from_chars(name.data(), end, seconds);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(seconds))
+            return;
+        sync.emplace(seconds, offset.get<double>() / 1000);
+    }
+    for (auto hi = sync.begin(); hi != sync.end(); ++hi) {
+        if (hi != sync.begin() && hi->first + hi->second <= std::prev(hi)->first + std::prev(hi)->second)
+            return;
+    }
+    if (sync.empty())
+        return;
+    const auto period =
+        gpmf_sample_period(gyro.config_path.parent_path() / files.at("raw_gpmf").get<std::string>(), gyro.imu);
+    if (!period)
+        return;
+    // VQF associates each integrated interval with its last rate sample.
+    // Move instantaneous measurements half a sample earlier for trapezoidal integration.
+    for (size_t i = 0; i < gyro.imu.size(); ++i) {
+        const double t = i * *period;
+        const auto hi = sync.lower_bound(t);
+        double offset = hi == sync.end() ? sync.rbegin()->second : hi->second;
+        if (hi != sync.begin() && hi != sync.end()) {
+            const auto lo = std::prev(hi);
+            offset = std::lerp(lo->second, hi->second, (t - lo->first) / (hi->first - lo->first));
+        }
+        gyro.imu[i].time_s = t + offset - *period * 0.5;
+    }
+    gyro.camera_clock = true;
 }
 } // namespace
 
@@ -155,7 +231,7 @@ GyroInput load_gyro_input(const Path& config_path, const Path& imu_override) {
                 gyro.lens.model = LensModel::opencv_fisheye;
             else if (model != "none")
                 throw std::runtime_error("Unsupported gyro lens model: " + model);
-            read_lens(gyro.lens, lens, lens);
+            read_packaged_lens(gyro, config);
             if (config.contains("rolling_shutter")) {
                 const auto& rs = config.at("rolling_shutter");
                 s.readout_ms = rs.value("readout_ms", 0.0);
@@ -168,11 +244,13 @@ GyroInput load_gyro_input(const Path& config_path, const Path& imu_override) {
             if (gyro.imu_path.empty())
                 gyro.imu_path = config_path.parent_path() / config.at("imu").at("file").get<std::string>();
         }
+        gyro.imu = load_imu_csv(gyro.imu_path);
+        if (imu_override.empty() && config.contains("imu"))
+            align_packet_clock(gyro, config);
     } catch (const Json::exception& e) {
         throw std::runtime_error("Invalid gyro configuration " + config_path.string() + ": " + e.what());
     }
     validate_gyro_settings(gyro.settings);
-    gyro.imu = load_imu_csv(gyro.imu_path);
     return gyro;
 }
 } // namespace stillflow

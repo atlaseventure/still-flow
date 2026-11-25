@@ -75,6 +75,7 @@ class Reader {
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
     bool next(DecodedFrame& frame, bool luma_only = false);
+    bool scan_timestamps(const std::function<void(FrameTimestamp)>& visit, const std::function<void()>& cancel);
     [[nodiscard]] const VideoInfo& info() const;
     [[nodiscard]] AVFormatContext* context() const;
     void set_audio_callback(std::function<void(const AVPacket*)> callback);

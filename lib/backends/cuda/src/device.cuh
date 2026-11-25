@@ -171,18 +171,72 @@ __device__ inline float bicubic(const unsigned char* plane, size_t pitch, int st
     return fminf(fmaxf(rows[0] * wy.x + rows[1] * wy.y + rows[2] * wy.z + rows[3] * wy.w, 0), 255);
 }
 
-// Catmull-Rom luma/RGB reconstruction; subsampled chroma stays bilinear.
+// sinc(d) * sinc(d/4). Across integer shifts the first sine changes only
+// sign, so its common factor cancels when the eight taps are normalized.
+__device__ inline void lanczos_weights(float t, float (&weights)[8]) {
+    float sine, cosine;
+    const bool reverse = t > 0.5f;
+    t = reverse ? 1 - t : t;
+    __sincosf(t * 0.7853981633974483f, &sine, &cosine);
+    constexpr float diagonal = 0.7071067811865475f;
+    const float phases[4] = {sine, -(sine + cosine) * diagonal, cosine, (sine - cosine) * diagonal};
+    float sum = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int shift = 3 - i;
+        const float d = t + shift;
+        const float phase = phases[(shift + 4) % 4] * (shift < 0 ? -1 : 1);
+        const int tap = reverse ? 7 - i : i;
+        weights[tap] = t < 1e-7f ? float(i == 3) : __fdividef(phase, d * d);
+        sum += weights[tap];
+    }
+    const float inv_sum = 1 / sum;
+#pragma unroll
+    for (float& weight : weights)
+        weight *= inv_sum;
+}
+
+__device__ inline float lanczos4(const unsigned char* plane, size_t pitch, int stride, int width, int height, float x,
+                                 float y) {
+    const int ix = __float2int_rd(x), iy = __float2int_rd(y);
+    float wx[8], wy[8];
+    lanczos_weights(x - ix, wx);
+    lanczos_weights(y - iy, wy);
+    float value = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const auto* row = plane + static_cast<size_t>(min(max(iy + j - 3, 0), height - 1)) * pitch;
+        float line = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            line += row[static_cast<ptrdiff_t>(min(max(ix + i - 3, 0), width - 1)) * stride] * wx[i];
+        value += line * wy[j];
+    }
+    return fminf(fmaxf(value, 0), 255);
+}
+
+template <bool gyro>
+__device__ inline float reconstruct(const unsigned char* plane, size_t pitch, int stride, int width, int height,
+                                    float x, float y) {
+    if constexpr (gyro)
+        return lanczos4(plane, pitch, stride, width, height, x, y);
+    return bicubic(plane, pitch, stride, width, height, x, y);
+}
+
+// Visual warps use Catmull-Rom and gyro warps use Lanczos4. Chroma stays bilinear.
 // Border replication preserves constant images and integer samples at edges.
-template <bool yuv> __device__ float3 sample(const DeviceSource& s, float x, float y, int width, int height) {
+template <bool yuv, bool gyro = false>
+__device__ float3 sample(const DeviceSource& s, float x, float y, int width, int height) {
     if constexpr (!yuv) {
         const size_t pitch = static_cast<size_t>(width) * 3;
-        return {bicubic(s.bgr, pitch, 3, width, height, x, y), bicubic(s.bgr + 1, pitch, 3, width, height, x, y),
-                bicubic(s.bgr + 2, pitch, 3, width, height, x, y)};
+        return {reconstruct<gyro>(s.bgr, pitch, 3, width, height, x, y),
+                reconstruct<gyro>(s.bgr + 1, pitch, 3, width, height, x, y),
+                reconstruct<gyro>(s.bgr + 2, pitch, 3, width, height, x, y)};
     } else {
         const float2 p = coded_position(x, y, s.rotation, s.coded_width, s.coded_height);
         const int chroma_width = (s.coded_width + 1) / 2, chroma_height = (s.coded_height + 1) / 2;
         const float cx = (p.x - s.chroma_x) * 0.5f, cy = (p.y - s.chroma_y) * 0.5f;
-        float luma = bicubic(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y);
+        float luma = reconstruct<gyro>(s.luma, s.luma_pitch, 1, s.coded_width, s.coded_height, p.x, p.y);
         float cb = bilinear(s.chroma, s.chroma_pitch, 2, chroma_width, chroma_height, cx, cy) - 128;
         float cr = bilinear(s.chroma + 1, s.chroma_pitch, 2, chroma_width, chroma_height, cx, cy) - 128;
         if (s.full_range) {

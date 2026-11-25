@@ -221,24 +221,33 @@ double track_value(const OrientationTrack& raw, std::span<const double> values, 
     const double prev = raw.samples[i - 1].time_s;
     return std::lerp(values[i - 1], values[i], (t - prev) / (it->time_s - prev));
 }
-std::vector<double> angular_speeds(const OrientationTrack& raw) {
+void filter_rates(const OrientationTrack& raw, std::vector<Vec>& values) {
+    const auto filter = [&](size_t i, size_t from) {
+        const double dt = std::abs(raw.samples[i].time_s - raw.samples[from].time_s);
+        values[i] += std::exp(-dt / 0.1) * (values[from] - values[i]);
+    };
+    for (size_t i = 1; i < values.size(); ++i)
+        filter(i, i - 1);
+    for (size_t i = values.size() - 1; i > 0; --i)
+        filter(i - 1, i);
+}
+
+// Zero-phase angular speed in camera axes (or the rotation magnitude on all axes).
+std::vector<Vec> angular_speeds(const OrientationTrack& raw, bool per_axis) {
     const auto& samples = raw.samples;
-    std::vector<double> distance(samples.size()), speed(samples.size());
-    for (size_t i = 1; i < samples.size(); ++i) {
-        const auto d = log_so3(multiply(conjugate(samples[i - 1].q), samples[i].q));
-        distance[i] = distance[i - 1] + std::hypot(d[0], d[1], d[2]);
-    }
+    std::vector<Vec> speed(samples.size(), Vec::Zero());
     for (size_t i = 0; i < samples.size(); ++i) {
-        const double lo = std::max(samples.front().time_s, samples[i].time_s - 0.05);
-        const double hi = std::min(samples.back().time_s, samples[i].time_s + 0.05);
-        if (hi > lo)
-            speed[i] = (track_value(raw, distance, hi) - track_value(raw, distance, lo)) / (hi - lo);
+        const auto& before = samples[i == 0 ? 0 : i - 1];
+        const auto& after = samples[std::min(i + 1, samples.size() - 1)];
+        const auto delta = log_so3(multiply(conjugate(before.q), after.q));
+        const Vec rate = Eigen::Map<const Vec>(delta.data()) / (after.time_s - before.time_s);
+        speed[i] = per_axis ? Vec(rate.cwiseAbs()) : Vec::Constant(rate.norm());
     }
+    filter_rates(raw, speed);
     return speed;
 }
-} // namespace
-OrientationTrack smooth_orientations(const OrientationTrack& raw, const GyroSettings& s,
-                                     std::span<const double> local) {
+OrientationTrack smooth_track(const OrientationTrack& raw, const GyroSettings& s, std::span<const double> local,
+                              double velocity_scale) {
     validate_gyro_settings(s);
     const auto n = raw.samples.size();
     if (!local.empty() && (local.size() != n || !std::ranges::all_of(local, unit_interval)))
@@ -251,30 +260,67 @@ OrientationTrack smooth_orientations(const OrientationTrack& raw, const GyroSett
     }
     if (n < 2 || s.smoothness == 0)
         return raw;
-    const auto speed = angular_speeds(raw);
+    const auto speed = angular_speeds(raw, s.per_axis);
     OrientationTrack out = raw;
+    std::vector<Vec> adaptation(n, Vec::Ones());
     const auto step = [&](size_t i, size_t from) {
         const double dt = std::abs(raw.samples[i].time_s - raw.samples[from].time_s);
-        const auto gain = [&](double smoothness) {
-            const double slow = smoothness * s.max_smoothness;
-            // Approach the high-speed time constant at 500 degrees per second.
-            const double fraction = std::clamp(speed[i] / (500 * std::numbers::pi / 180), 0.0, 1.0);
-            const double tau = std::lerp(slow, std::min(slow, s.alpha_0_1s), fraction) * (local.empty() ? 1 : local[i]);
-            return tau > 0 ? -std::expm1(-dt / tau) : 1.0;
+        const auto gain = [&](double strength, int axis) {
+            const double local_factor = local.empty() ? 1 : local[i];
+            if (strength * local_factor == 0 || s.max_smoothness == 0)
+                return 1.0;
+            const double limit = (250 * std::numbers::pi / 180) * velocity_scale * strength * local_factor;
+            const double fraction = speed[i][axis] / limit * adaptation[i][axis];
+            const double slow = -std::expm1(-dt / s.max_smoothness);
+            const double fast = s.alpha_0_1s > 0 ? -std::expm1(-dt / s.alpha_0_1s) : 1.0;
+            return std::min(1.0, std::lerp(slow, std::max(slow, fast), fraction));
         };
         const Quaternion a = out.samples[from].q, b = out.samples[i].q;
         if (!s.per_axis)
-            return slerp(a, b, gain(s.smoothness));
+            return slerp(a, b, gain(s.smoothness, 0));
         const auto delta = log_so3(multiply(conjugate(a), b));
-        return normalize(multiply(a, exp_so3(delta[0] * gain(s.smoothness_pitch), delta[1] * gain(s.smoothness_yaw),
-                                             delta[2] * gain(s.smoothness_roll))));
+        return normalize(
+            multiply(a, exp_so3(delta[0] * gain(s.smoothness_pitch, 0), delta[1] * gain(s.smoothness_yaw, 1),
+                                delta[2] * gain(s.smoothness_roll, 2))));
     };
-    for (size_t i = 1; i < n; ++i)
-        out.samples[i].q = step(i, i - 1);
-    for (size_t i = n - 1; i > 0; --i)
-        out.samples[i - 1].q = step(i - 1, i);
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            Vec peak = Vec::Zero();
+            for (size_t i = 0; i < n; ++i) {
+                const auto d = log_so3(multiply(conjugate(raw.samples[i].q), out.samples[i].q));
+                const Eigen::Map<const Vec> angle(d.data());
+                adaptation[i] = s.per_axis ? Vec(angle.cwiseAbs()) : Vec::Constant(angle.norm());
+                peak = peak.cwiseMax(adaptation[i]);
+            }
+            for (auto& distance : adaptation) {
+                distance = distance.cwiseQuotient(peak.cwiseMax(1e-12));
+                distance = (distance.array() >= 0.5).select(distance, 0);
+            }
+            filter_rates(raw, adaptation);
+            peak.setZero();
+            for (const auto& distance : adaptation)
+                peak = peak.cwiseMax(distance);
+            for (auto& distance : adaptation)
+                distance = Vec::Constant(0.5) + 0.5 * distance.cwiseQuotient(peak.cwiseMax(1e-12));
+        }
+        const Quaternion endpoint = out.samples.back().q;
+        for (size_t i = 1; i < n; ++i)
+            out.samples[i].q = step(i, i - 1);
+        // Constant continuation beyond the endpoint contributes half of a
+        // symmetric exponential kernel. Carry that tail into the reverse pass.
+        out.samples.back().q = slerp(out.samples.back().q, endpoint, 0.5);
+        for (size_t i = n - 1; i > 0; --i)
+            out.samples[i - 1].q = step(i - 1, i);
+    }
     return out;
 }
+} // namespace
+
+OrientationTrack smooth_orientations(const OrientationTrack& raw, const GyroSettings& settings,
+                                     std::span<const double> local) {
+    return smooth_track(raw, settings, local, 1);
+}
+
 namespace {
 // Unclipped sensor coordinates are also needed to estimate the row exposure time.
 bool project_ray(const GyroFrameMap& m, Point p, const Matrix3& a, const Matrix3& b, double blend, double min_z,
@@ -297,12 +343,17 @@ bool project(const GyroFrameMap& m, Point p, double margin, double min_z, Point&
     if (m.row_rotations.empty() || !finite(p.x) || !finite(p.y))
         return false;
     const auto last = m.row_rotations.size() - 1;
-    const double row = std::clamp(p.y / std::max(1, m.output_size.height - 1), 0.0, 1.0) * last;
-    const auto index = static_cast<size_t>(row);
+    double fraction = p.y / std::max(1, m.output_size.height - 1);
     Point point;
-    if (!project_ray(m, p, m.row_rotations[index], m.row_rotations[std::min(index + 1, last)], row - index, min_z,
-                     point) ||
-        point.x < margin || point.y < margin || point.x > m.input_size.width - 1 - margin ||
+    for (int i = 0; i < (m.sensor_rows ? 3 : 1); ++i) {
+        const double row = std::clamp(fraction, 0.0, 1.0) * last;
+        const auto index = static_cast<size_t>(row);
+        if (!project_ray(m, p, m.row_rotations[index], m.row_rotations[std::min(index + 1, last)], row - index, min_z,
+                         point))
+            return false;
+        fraction = point.y / std::max(1, m.input_size.height - 1);
+    }
+    if (point.x < margin || point.y < margin || point.x > m.input_size.width - 1 - margin ||
         point.y > m.input_size.height - 1 - margin)
         return false;
     src = point;
@@ -311,34 +362,28 @@ bool project(const GyroFrameMap& m, Point p, double margin, double min_z, Point&
 
 struct FrameGeometry {
     const OrientationTrack& raw;
-    double time, base_fx, base_fy, signed_readout;
+    double time, base_fx, base_fy, signed_readout, identity_scale;
 
     void set_scale(GyroFrameMap& map, double scale) const {
         map.fov_scale = scale;
-        map.zoom_ratio = 1 / scale;
+        map.zoom_ratio = identity_scale / scale;
         map.out_fx = base_fx / scale;
         map.out_fy = base_fy / scale;
         if (!(finite(map.out_fx) && map.out_fx > 0 && finite(map.out_fy) && map.out_fy > 0))
             throw std::invalid_argument("Invalid output focal lengths");
-        const auto rotation = [&](Quaternion q) { return to_matrix3(multiply(conjugate(q), map.smooth_orientation)); };
-        if (signed_readout == 0) {
+    }
+    void set_orientation(GyroFrameMap& map, Quaternion smooth) const {
+        map.smooth_orientation = smooth;
+        const auto rotation = [&](Quaternion q) { return to_matrix3(multiply(conjugate(q), smooth)); };
+        map.sensor_rows = signed_readout != 0;
+        if (!map.sensor_rows) {
             map.row_rotations.assign(1, rotation(map.raw_orientation));
             return;
         }
         map.row_rotations.resize(64);
         for (size_t i = 0; i < map.row_rotations.size(); ++i) {
-            double fraction = double(i) / (map.row_rotations.size() - 1);
-            const Point center{map.out_cx, fraction * (map.output_size.height - 1)};
-            auto row_rotation = [&] { return rotation(raw.sample(time + (fraction - 0.5) * signed_readout)); };
-            auto matrix = row_rotation();
-            for (int j = 0; j < 2; ++j) {
-                Point sensor;
-                if (!project_ray(map, center, matrix, matrix, 0, 1e-6, sensor))
-                    break;
-                fraction = std::clamp(sensor.y / std::max(1, map.input_size.height - 1), 0.0, 1.0);
-                matrix = row_rotation();
-            }
-            map.row_rotations[i] = matrix;
+            const double fraction = double(i) / (map.row_rotations.size() - 1);
+            map.row_rotations[i] = rotation(raw.sample(time + (fraction - 0.5) * signed_readout));
         }
     }
     bool fits(GyroFrameMap& map, double scale) const {
@@ -353,13 +398,12 @@ struct FrameGeometry {
         }
         return true;
     }
-    double largest_scale(GyroFrameMap& map, double floor = 0.05) const {
-        // Requested FOV caps the search at one. Keep the lower endpoint certified.
-        if (fits(map, 1))
-            return 1;
+    double largest_scale(GyroFrameMap& map, double ceiling, double floor = 0.05) const {
+        if (fits(map, ceiling))
+            return ceiling;
         if (!fits(map, floor))
             return 0;
-        double lo = floor, hi = 1;
+        double lo = floor, hi = ceiling;
         for (int i = 0; i < 24; ++i) {
             const double mid = std::midpoint(lo, hi);
             if (fits(map, mid))
@@ -382,10 +426,8 @@ void attenuate(const Times& times, std::vector<double>& factors, double t, doubl
     }
 }
 
-std::vector<double> zoom_curve(std::span<const double> times, const std::vector<double>& scales,
-                               const GyroSettings& s) {
-    if (!s.adaptive_zoom || s.adaptive_zoom_window_s == 0)
-        return std::vector<double>(times.size(), std::ranges::min(scales));
+std::vector<double> gaussian_zoom(std::span<const double> times, const std::vector<double>& scales,
+                                  const GyroSettings& s) {
     const double half = s.adaptive_zoom_window_s / 2;
     std::deque<size_t> minima;
     std::vector<double> envelope(times.size()), result(scales);
@@ -416,6 +458,26 @@ std::vector<double> zoom_curve(std::span<const double> times, const std::vector<
     }
     return result;
 }
+
+std::vector<double> zoom_curve(std::span<const double> times, const std::vector<double>& scales,
+                               const GyroSettings& s) {
+    if (!s.adaptive_zoom || s.adaptive_zoom_window_s == 0)
+        return std::vector<double>(times.size(), std::ranges::min(scales));
+    if (!s.zoom_envelope)
+        return gaussian_zoom(times, scales, s);
+    std::vector<double> result(scales);
+    for (double tau : {s.adaptive_zoom_window_s, 0.2}) {
+        const auto advance = [&](size_t i, size_t from) {
+            const double dt = std::abs(times[i] - times[from]);
+            result[i] = std::min(result[i], std::lerp(result[i], result[from], std::exp(-dt / tau)));
+        };
+        for (size_t i = times.size() - 1; i > 0; --i)
+            advance(i - 1, i);
+        for (size_t i = 1; i < times.size(); ++i)
+            advance(i, i - 1);
+    }
+    return result;
+}
 } // namespace
 
 bool project_output_to_input(const GyroFrameMap& map, Point output_px, Point& input_px) {
@@ -431,24 +493,41 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
     const Size output = default_size(s.output_size) ? input_size : s.output_size;
     const double dim = double(output.width) / input_size.width / s.fov;
     const double readout = (s.readout_top_to_bottom ? 1 : -1) * s.readout_ms / 1000;
-    const double min_scale = std::max(0.05, 1 / s.max_zoom);
+    GyroFrameMap identity;
+    identity.input_size = input_size;
+    identity.output_size = output;
+    identity.lens = scaled;
+    identity.out_cx = (output.width - 1) * 0.5;
+    identity.out_cy = (output.height - 1) * 0.5;
+    // The output aspect sets the geometric search ceiling. Measure extra zoom
+    // against the uncropped sensor aspect: a 16:9 delivery crop of a 4:3 camera
+    // should not consume the stabilization budget before the camera has moved.
+    const double nominal = double(output.width) / input_size.width;
+    const FrameGeometry unrotated{raw, 0, scaled.fx * nominal, scaled.fy * nominal, 0, 4};
+    unrotated.set_orientation(identity, {});
+    const bool pinhole = scaled.model == LensModel::none || scaled.lens_correction_amount == 0;
+    const double output_limit = pinhole ? 1.0 : unrotated.largest_scale(identity, 4);
+    auto sensor = identity;
+    sensor.output_size = input_size;
+    sensor.out_cx = (input_size.width - 1) * 0.5;
+    sensor.out_cy = (input_size.height - 1) * 0.5;
+    const FrameGeometry full_sensor{raw, 0, scaled.fx, scaled.fy, 0, 4};
+    const double identity_scale = pinhole ? 1.0 : std::min(output_limit, full_sensor.largest_scale(sensor, 4));
+    if (identity_scale <= 0)
+        throw std::domain_error("Unrotated field of view exceeds sensor bounds");
+    const double min_scale = std::max(0.05, identity_scale / s.max_zoom);
+    // Reference velocity thresholds are specified at a 120 degree diagonal FOV.
+    const double velocity_scale = 2 * std::atan(std::hypot(input_size.width, input_size.height) / (2 * scaled.fy)) /
+                                  (120 * std::numbers::pi / 180);
     const double sigma = 0.5;
     const auto sample_times = raw.samples | std::views::transform(&OrientationSample::time_s);
     std::vector<double> local(raw.samples.size(), 1), scales(times.size());
-    std::vector<GyroFrameMap> maps(times.size());
+    std::vector<GyroFrameMap> maps(times.size(), identity);
     const auto geometry = [&](size_t i) {
-        return FrameGeometry{raw, times[i], scaled.fx * dim, scaled.fy * dim, readout};
+        return FrameGeometry{raw, times[i], scaled.fx * dim, scaled.fy * dim, readout, identity_scale};
     };
-    for (size_t i = 0; i < times.size(); ++i) {
-        auto& map = maps[i];
-        map.input_size = input_size;
-        map.output_size = output;
-        map.lens = scaled;
-        map.out_cx = (output.width - 1) * 0.5;
-        map.out_cy = (output.height - 1) * 0.5;
-    }
     for (int iteration = 0;; ++iteration) {
-        const auto smooth = smooth_orientations(raw, s, local);
+        const auto smooth = smooth_track(raw, s, local, velocity_scale);
         if (times.empty())
             return {};
         std::vector<double> reduction(local.size(), 1);
@@ -456,9 +535,9 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
         for (size_t i = 0; i < times.size(); ++i) {
             auto& map = maps[i];
             map.raw_orientation = raw.sample(times[i]);
-            map.smooth_orientation = smooth.sample(times[i]);
+            geometry(i).set_orientation(map, smooth.sample(times[i]));
             map.smooth_factor = local.empty() ? 1 : track_value(raw, local, times[i]);
-            scales[i] = geometry(i).largest_scale(map);
+            scales[i] = geometry(i).largest_scale(map, output_limit);
             if (scales[i] < min_scale - 1e-4 && iteration < s.max_zoom_iterations && !local.empty()) {
                 attenuate(sample_times, reduction, times[i], scales[i] / min_scale, sigma);
                 relax = true;
@@ -483,19 +562,19 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
             continue;
         }
         const auto target = map.smooth_orientation;
-        map.smooth_orientation = map.raw_orientation;
+        g.set_orientation(map, map.raw_orientation);
         if (!g.fits(map, min_scale))
             throw std::domain_error("Sensor bounds require more than max_zoom");
         double lo = 0, hi = 1;
         for (int j = 0; j < 24; ++j) {
             const double mid = std::midpoint(lo, hi);
-            map.smooth_orientation = slerp(map.raw_orientation, target, mid);
+            g.set_orientation(map, slerp(map.raw_orientation, target, mid));
             if (g.fits(map, min_scale))
                 lo = mid;
             else
                 hi = mid;
         }
-        map.smooth_orientation = target;
+        g.set_orientation(map, target);
         attenuate(times, retained, times[i], lo, sigma);
         retained[i] = std::min(retained[i], lo);
     }
@@ -503,15 +582,15 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
         if (retained[i] == 1)
             continue;
         auto& map = maps[i];
-        map.smooth_orientation = slerp(map.raw_orientation, map.smooth_orientation, retained[i]);
+        geometry(i).set_orientation(map, slerp(map.raw_orientation, map.smooth_orientation, retained[i]));
         map.smooth_factor *= retained[i];
-        scales[i] = geometry(i).largest_scale(map, min_scale);
+        scales[i] = geometry(i).largest_scale(map, output_limit, min_scale);
         if (scales[i] < min_scale)
             throw std::domain_error("Relaxed orientation exceeds sensor bounds");
     }
     const auto final_scales = zoom_curve(times, scales, s);
     for (size_t i = 0; i < times.size(); ++i)
-        if (!geometry(i).fits(maps[i], std::clamp(final_scales[i], min_scale, 1.0)))
+        if (!geometry(i).fits(maps[i], std::clamp(final_scales[i], min_scale, identity_scale)))
             throw std::domain_error("Final rolling shutter map exceeds sensor bounds");
     return maps;
 }
