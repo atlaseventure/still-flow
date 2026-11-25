@@ -1,6 +1,7 @@
 #pragma once
 #include "stillflow/application/image.hpp"
 #include "stillflow/application/profile.hpp"
+#include "stillflow/domain/gyro.hpp"
 #include "stillflow/domain/motion.hpp"
 #include <functional>
 #include <map>
@@ -36,6 +37,10 @@ class BackendError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
 };
+class NotImplementedError : public BackendError {
+  public:
+    using BackendError::BackendError;
+};
 class RenderBackend {
   public:
     virtual ~RenderBackend() = default;
@@ -44,6 +49,11 @@ class RenderBackend {
     virtual void upload(const Image& input) = 0;
     // Returns the completed fraction of out-of-bounds pixels in [0, 1].
     virtual double warp(const MapParameters& map) = 0;
+    // Renders a 3D lens + rolling-shutter map into map.output_size.
+    // Returns the fraction of out-of-bounds pixels in [0, 1].
+    virtual double warp_gyro(const GyroFrameMap& /*map*/) {
+        throw NotImplementedError("Gyro stabilization rendering is only implemented on the CUDA backend");
+    }
     // Return a ready image whose storage survives subsequent backend calls.
     virtual Image download() = 0;
 };
@@ -58,6 +68,10 @@ class Renderer {
     virtual ~Renderer() = default;
     virtual Image render(const Image& input, Warp& warp, Size analysis_size, double crop, bool horizontal,
                          Profile& profile) = 0;
+    virtual Image render_gyro(const Image& /*input*/, const GyroFrameMap& /*map*/, double& /*invalid_fraction*/,
+                              Profile& /*profile*/) {
+        throw NotImplementedError("Gyro stabilization rendering is only implemented on the CUDA backend");
+    }
     virtual RenderingReport report() const = 0;
 };
 class RendererFactory {

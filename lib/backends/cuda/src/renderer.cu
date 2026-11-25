@@ -1,7 +1,10 @@
 #include "frames.cuh"
 #include "stillflow/backends/cuda.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace stillflow {
 namespace {
@@ -17,6 +20,80 @@ struct DeviceMap {
     float offset_x[max_mesh_vertices], offset_y[max_mesh_vertices];
     int columns, rows;
 };
+
+struct DeviceGyroMap {
+    int input_width, input_height, output_width, output_height;
+    int lens_model, row_count;
+    float in_fx, in_fy, in_cx, in_cy;
+    float k0, k1, k2, k3, lens_correction_amount;
+    float out_fx, out_fy, out_cx, out_cy;
+};
+
+DeviceGyroMap pack_gyro_map(const GyroFrameMap& map, Size uploaded) {
+    const auto& lens = map.lens;
+    const auto finite = [](double value) { return std::isfinite(static_cast<float>(value)); };
+    const auto focal = [&](double value) { return finite(value) && static_cast<float>(value) > 0; };
+    if (uploaded.width < 2 || uploaded.height < 2 || map.input_size.width != uploaded.width ||
+        map.input_size.height != uploaded.height || map.output_size.width < 2 || map.output_size.height < 2 ||
+        map.row_rotations.empty() || map.row_rotations.size() > std::numeric_limits<int>::max() / 9 ||
+        !focal(map.out_fx) || !focal(map.out_fy) || !focal(lens.fx) || !focal(lens.fy) || !finite(map.out_cx) ||
+        !finite(map.out_cy) || !finite(lens.cx) || !finite(lens.cy) ||
+        !std::all_of(lens.k.begin(), lens.k.end(), finite) ||
+        !(lens.lens_correction_amount >= 0 && lens.lens_correction_amount <= 1) ||
+        (lens.model != LensModel::none && lens.model != LensModel::opencv_fisheye))
+        throw std::invalid_argument("Invalid CUDA gyro map");
+    return {uploaded.width,
+            uploaded.height,
+            map.output_size.width,
+            map.output_size.height,
+            static_cast<int>(lens.model),
+            static_cast<int>(map.row_rotations.size()),
+            static_cast<float>(lens.fx),
+            static_cast<float>(lens.fy),
+            static_cast<float>(lens.cx),
+            static_cast<float>(lens.cy),
+            static_cast<float>(lens.k[0]),
+            static_cast<float>(lens.k[1]),
+            static_cast<float>(lens.k[2]),
+            static_cast<float>(lens.k[3]),
+            static_cast<float>(lens.lens_correction_amount),
+            static_cast<float>(map.out_fx),
+            static_cast<float>(map.out_fy),
+            static_cast<float>(map.out_cx),
+            static_cast<float>(map.out_cy)};
+}
+
+__device__ bool gyro_source_position(const DeviceGyroMap& m, const float* row_matrices, float x, float y, float2& p) {
+    const float nx = (x - m.out_cx) / m.out_fx, ny = (y - m.out_cy) / m.out_fy;
+    const float row = fminf(fmaxf(y / (m.output_height - 1), 0), 1) * (m.row_count - 1);
+    const int lo = min(static_cast<int>(row), m.row_count - 1), hi = min(lo + 1, m.row_count - 1);
+    const float* a = row_matrices + static_cast<size_t>(lo) * 9;
+    const float* b = row_matrices + static_cast<size_t>(hi) * 9;
+    const auto component = [&](int i) {
+        const float first = a[i] * nx + a[i + 1] * ny + a[i + 2];
+        const float second = b[i] * nx + b[i + 1] * ny + b[i + 2];
+        return first + (row - lo) * (second - first);
+    };
+    const float rz = component(6);
+    if (!(rz > 1e-6f && isfinite(rz)))
+        return false;
+    float px = component(0) / rz, py = component(3) / rz;
+    if (m.lens_model == 1 && m.lens_correction_amount > 0) {
+        const float r = hypotf(px, py);
+        if (r > 0) {
+            const float theta = atanf(r), u = theta * theta;
+            const float theta_d = theta * (1 + u * (m.k0 + u * (m.k1 + u * (m.k2 + u * m.k3))));
+            const float scale = (r + (theta_d - r) * m.lens_correction_amount) / r;
+            px *= scale;
+            py *= scale;
+        }
+    }
+    // Preserve exact border coordinates when the ray and intrinsics are unchanged.
+    p.x = px == nx && m.in_fx == m.out_fx && m.in_cx == m.out_cx ? x : px * m.in_fx + m.in_cx;
+    p.y = py == ny && m.in_fy == m.out_fy && m.in_cy == m.out_cy ? y : py * m.in_fy + m.in_cy;
+    return isfinite(p.x) && isfinite(p.y) && p.x >= 0 && p.x <= m.input_width - 1 && p.y >= 0 &&
+           p.y <= m.input_height - 1;
+}
 
 __device__ float sample_mesh(const float* values, int a, int b, float fx, float fy) {
     return (values[a] * (1 - fx) + values[a + 1] * fx) * (1 - fy) + (values[b] * (1 - fx) + values[b + 1] * fx) * fy;
@@ -96,6 +173,48 @@ __global__ void render_bgr_kernel(DeviceSource source, unsigned char* output, in
         atomicAdd(invalid_count, static_cast<unsigned int>(invalid_in_block));
 }
 
+__global__ void render_gyro_bgr_kernel(DeviceSource source, unsigned char* output, const DeviceGyroMap* map,
+                                       const float* rows, unsigned int* invalid_count) {
+    const auto& m = *map;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    bool invalid = false;
+    if (x < m.output_width && y < m.output_height) {
+        float2 p;
+        invalid = !gyro_source_position(m, rows, x, y, p);
+        const float3 bgr = invalid ? float3{} : cuda::sample<false>(source, p.x, p.y, m.input_width, m.input_height);
+        auto* pixel = output + (static_cast<size_t>(y) * m.output_width + x) * 3;
+        pixel[0] = cuda::to_byte(bgr.x);
+        pixel[1] = cuda::to_byte(bgr.y);
+        pixel[2] = cuda::to_byte(bgr.z);
+    }
+    const int count = __syncthreads_count(invalid);
+    if (threadIdx.x == 0 && threadIdx.y == 0 && count)
+        atomicAdd(invalid_count, static_cast<unsigned int>(count));
+}
+
+__global__ void render_gyro_yuv_kernel(DeviceSource source, unsigned char* output, size_t pitch,
+                                       const DeviceGyroMap* map, const float* rows, unsigned int* invalid_count) {
+    const auto& m = *map;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    bool invalid = false;
+    if (x < m.output_width && y < m.output_height) {
+        float2 p;
+        invalid = !gyro_source_position(m, rows, x, y, p);
+        output[static_cast<size_t>(y) * pitch + x] =
+            invalid ? 16 : cuda::to_byte(output_yuv(source, p, m.input_width, m.input_height).x);
+        if (!(x & 1) && !(y & 1)) {
+            const bool valid = gyro_source_position(m, rows, x, fminf(y + 0.5f, m.output_height - 1), p);
+            const float3 uv = valid ? output_yuv(source, p, m.input_width, m.input_height) : float3{16, 128, 128};
+            auto* pixel = output + pitch * m.output_height + static_cast<size_t>(y / 2) * pitch + x;
+            pixel[0] = cuda::to_byte(uv.y);
+            pixel[1] = cuda::to_byte(uv.z);
+        }
+    }
+    const int count = __syncthreads_count(invalid);
+    if (threadIdx.x == 0 && threadIdx.y == 0 && count)
+        atomicAdd(invalid_count, static_cast<unsigned int>(count));
+}
+
 class CudaBackend final : public RenderBackend {
   public:
     explicit CudaBackend(std::string name) : name_(std::move(name)) {
@@ -113,6 +232,7 @@ class CudaBackend final : public RenderBackend {
     }
     void upload(const Image& input) override {
         lease_.reset();
+        frame_.reset();
         size_ = input->size();
         source_ = {};
         if (auto native = cuda::native_source(input)) {
@@ -136,11 +256,9 @@ class CudaBackend final : public RenderBackend {
             source_.bgr = input_.data();
             yuv_ = false;
         }
-        frame_ = pool_->acquire(size_);
-        if (!yuv_)
-            frame_->require_bgr();
     }
     double warp(const MapParameters& p) override {
+        prepare_output(size_);
         DeviceMap m{};
         m.origin_x = p.origin_x;
         m.origin_y = p.origin_y;
@@ -165,11 +283,34 @@ class CudaBackend final : public RenderBackend {
             render_bgr_kernel<<<grid, block, 0, stream_.value>>>(source_, frame_->bgr, size_.width, size_.height,
                                                                  map_.data(), invalid_.data());
         check(cudaGetLastError(), "Launch CUDA warp");
-        unsigned int invalid = 0;
-        check(cudaMemcpyAsync(&invalid, invalid_.data(), sizeof(invalid), cudaMemcpyDeviceToHost, stream_.value),
-              "Read CUDA crop check");
-        check(cudaStreamSynchronize(stream_.value), "Complete CUDA warp");
-        return static_cast<double>(invalid) / (static_cast<double>(size_.width) * size_.height);
+        return invalid_fraction(size_);
+    }
+    double warp_gyro(const GyroFrameMap& map) override {
+        if (!source_.bgr && !lease_)
+            throw std::invalid_argument("No uploaded CUDA gyro input");
+        const auto m = pack_gyro_map(map, size_);
+        std::vector<float> rows;
+        rows.reserve(map.row_rotations.size() * 9);
+        for (const auto& rotation : map.row_rotations)
+            rows.insert(rows.end(), rotation.values.begin(), rotation.values.end());
+        prepare_output(map.output_size);
+        row_matrices_.reserve(rows.size());
+        gyro_map_.reserve(1);
+        check(cudaMemcpyAsync(row_matrices_.data(), rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice,
+                              stream_.value),
+              "Upload gyro row rotations");
+        check(cudaMemcpyAsync(gyro_map_.data(), &m, sizeof(m), cudaMemcpyHostToDevice, stream_.value),
+              "Upload gyro map");
+        check(cudaMemsetAsync(invalid_.data(), 0, sizeof(unsigned int), stream_.value), "Reset CUDA crop check");
+        const dim3 block(16, 16), grid((m.output_width + 15) / 16, (m.output_height + 15) / 16);
+        if (yuv_)
+            render_gyro_yuv_kernel<<<grid, block, 0, stream_.value>>>(
+                source_, frame_->nv12, frame_->pitch, gyro_map_.data(), row_matrices_.data(), invalid_.data());
+        else
+            render_gyro_bgr_kernel<<<grid, block, 0, stream_.value>>>(source_, frame_->bgr, gyro_map_.data(),
+                                                                      row_matrices_.data(), invalid_.data());
+        check(cudaGetLastError(), "Launch CUDA gyro warp");
+        return invalid_fraction(map.output_size);
     }
     Image download() override {
         lease_.reset();
@@ -177,6 +318,20 @@ class CudaBackend final : public RenderBackend {
     }
 
   private:
+    void prepare_output(Size output) {
+        // Crop retries on the same upload reuse the existing allocation.
+        if (!frame_ || frame_->size.width != output.width || frame_->size.height != output.height)
+            frame_ = pool_->acquire(output);
+        if (!yuv_)
+            frame_->require_bgr();
+    }
+    double invalid_fraction(Size output) {
+        unsigned int invalid = 0;
+        check(cudaMemcpyAsync(&invalid, invalid_.data(), sizeof(invalid), cudaMemcpyDeviceToHost, stream_.value),
+              "Read CUDA crop check");
+        check(cudaStreamSynchronize(stream_.value), "Complete CUDA warp");
+        return static_cast<double>(invalid) / (static_cast<double>(output.width) * output.height);
+    }
     std::string name_;
     Size size_;
     Stream stream_;
@@ -190,6 +345,8 @@ class CudaBackend final : public RenderBackend {
     Buffer<unsigned char, true> staging_;
     Buffer<unsigned int> invalid_;
     Buffer<DeviceMap> map_;
+    Buffer<DeviceGyroMap> gyro_map_;
+    Buffer<float> row_matrices_;
 };
 } // namespace
 

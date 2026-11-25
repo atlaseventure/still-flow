@@ -233,6 +233,9 @@ class GlesBackend final : public RenderBackend {
         rendered_ = false;
     }
 
+    double warp_gyro(const GyroFrameMap&) override {
+        throw NotImplementedError("Gyro stabilization rendering is not implemented for GLES backend");
+    }
     double warp(const MapParameters& map) override {
         if (!uploaded_)
             throw std::logic_error("No uploaded image");

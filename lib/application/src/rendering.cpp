@@ -15,19 +15,10 @@ class CropRenderer {
             analysis.height < 2 || warp.boundary_search_steps < 0 || warp.boundary_search_steps > 16 ||
             !std::isfinite(crop) || crop < 0 || crop > 0.25)
             throw std::invalid_argument("Invalid render geometry");
-        const auto& formats = info_.capabilities.formats;
-        if (std::find(formats.begin(), formats.end(), input->format()) == formats.end())
-            throw BackendError("Backend does not support the input pixel format");
+        check_format(input);
         const std::string stage = "render." + info_.id;
         ScopeTimer total(profile, stage);
-        {
-            ScopeTimer timer(profile, stage + ".upload");
-            try {
-                backend_->upload(input);
-            } catch (const ImageAccessError& error) {
-                throw BackendError(error.what());
-            }
-        }
+        upload(input, profile, stage);
         {
             ScopeTimer timer(profile, stage + ".warp");
             const auto check = [&] {
@@ -65,15 +56,49 @@ class CropRenderer {
                 warp.render_strength = warp.planned_strength > 0 ? low / warp.planned_strength : 1;
             }
         }
+        return download(input, input->size(), profile, stage);
+    }
+    Image render_gyro(const Image& input, const GyroFrameMap& map, double& invalid_fraction, Profile& profile) {
+        if (!input || input->size().width < 2 || input->size().height < 2 ||
+            map.input_size.width != input->size().width || map.input_size.height != input->size().height ||
+            map.output_size.width < 2 || map.output_size.height < 2 || map.row_rotations.empty())
+            throw std::invalid_argument("Invalid gyro render geometry");
+        check_format(input);
+        const std::string stage = "render." + info_.id;
+        ScopeTimer total(profile, stage);
+        upload(input, profile, stage);
+        {
+            ScopeTimer timer(profile, stage + ".warp");
+            invalid_fraction = backend_->warp_gyro(map);
+            if (!std::isfinite(invalid_fraction) || invalid_fraction < 0 || invalid_fraction > 1)
+                throw BackendError("Backend returned an invalid boundary fraction");
+        }
+        return download(input, map.output_size, profile, stage);
+    }
+
+  private:
+    void check_format(const Image& input) const {
+        const auto& formats = info_.capabilities.formats;
+        if (std::find(formats.begin(), formats.end(), input->format()) == formats.end())
+            throw BackendError("Backend does not support the input pixel format");
+    }
+    void upload(const Image& input, Profile& profile, const std::string& stage) {
+        ScopeTimer timer(profile, stage + ".upload");
+        try {
+            backend_->upload(input);
+        } catch (const ImageAccessError& error) {
+            throw BackendError(error.what());
+        }
+    }
+    Image download(const Image& input, Size expected, Profile& profile, const std::string& stage) {
         ScopeTimer timer(profile, stage + ".download");
         auto output = backend_->download();
-        if (!output || output->size().width != input->size().width || output->size().height != input->size().height ||
+        if (!output || output->size().width != expected.width || output->size().height != expected.height ||
             output->format() != input->format())
             throw BackendError("Backend returned incompatible output geometry or format");
         return output;
     }
 
-  private:
     std::unique_ptr<RenderBackend> backend_;
     BackendInfo info_;
 };
@@ -105,6 +130,29 @@ class FallbackRenderer final : public Renderer {
             }
         }
     }
+    Image render_gyro(const Image& input, const GyroFrameMap& map, double& invalid_fraction,
+                      Profile& profile) override {
+        if (!active_)
+            throw BackendError("No active rendering backend");
+        bool only_unimplemented = true;
+        for (;;) {
+            try {
+                auto result = active_->render_gyro(input, map, invalid_fraction, profile);
+                ++report_.backends.back().frames;
+                return result;
+            } catch (const BackendError& error) {
+                report_.failures.push_back({active_->info().id, "render", error.what()});
+                if (report_.requested != "auto")
+                    throw;
+                if (!dynamic_cast<const NotImplementedError*>(&error)) {
+                    only_unimplemented = false;
+                    active_.reset();
+                }
+                // An unsupported backend can still render visual frames if the search is exhausted.
+                activate_next(only_unimplemented);
+            }
+        }
+    }
     RenderingReport report() const override {
         auto result = report_;
         size_t used = 0;
@@ -122,7 +170,7 @@ class FallbackRenderer final : public Renderer {
     }
 
   private:
-    void activate_next() {
+    void activate_next(bool only_unimplemented = false) {
         while (next_ < candidates_.size()) {
             const auto& provider = candidates_[next_++];
             try {
@@ -141,6 +189,8 @@ class FallbackRenderer final : public Renderer {
         std::string message = "No rendering backend available";
         for (const auto& failure : report_.failures)
             message += "; " + failure.backend + ": " + failure.reason;
+        if (only_unimplemented)
+            throw NotImplementedError(message);
         throw BackendError(message);
     }
     std::vector<BackendProvider> candidates_;

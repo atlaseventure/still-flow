@@ -23,6 +23,9 @@ class CpuBackend final : public RenderBackend {
                   mapping_.format == PixelFormat::i420;
         channels_ = planar_ ? 1 : pixel_bytes(mapping_.format);
     }
+    double warp_gyro(const GyroFrameMap&) override {
+        throw NotImplementedError("Gyro stabilization rendering is not implemented for CPU backend");
+    }
     double warp(const MapParameters& map) override {
         if (mapping_.planes.empty())
             throw std::logic_error("No uploaded image");
