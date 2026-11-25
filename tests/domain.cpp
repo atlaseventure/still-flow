@@ -201,6 +201,18 @@ TEST_CASE("Bidirectional smoothing attenuates jitter without shifting its peak",
     REQUIRE_THROWS_AS(smooth_orientations(raw, s, local), std::invalid_argument);
 }
 
+TEST_CASE("Gyro smoothing holds the forward filter endpoint beyond the final sample", "[domain][gyro]") {
+    using namespace stillflow;
+    GyroSettings s;
+    s.alpha_0_1s = s.max_smoothness = 1;
+    const OrientationTrack raw{{{0, {}}, {std::log(2.0), exp_so3(0, 0.8, 0)}}};
+    // Half gain at each step: the first forward/reverse pair yields [0.2, 0.4],
+    // and the second forward pass ends at 0.3 radians.
+    const auto smooth = smooth_orientations(raw, s);
+    same_rotation(smooth.sample(raw.samples.back().time_s), exp_so3(0, 0.3, 0));
+    same_rotation(smooth.sample(2), smooth.samples.back().q);
+}
+
 TEST_CASE("Two-pass smoothing preserves the interior angular velocity of a steady pan", "[domain][gyro]") {
     using namespace stillflow;
     OrientationTrack raw;
@@ -250,7 +262,11 @@ TEST_CASE("Fisheye planning preserves sensor pixel aspect and inverts the output
     const auto maps = plan_gyro_frames(std::array{1.0}, {}, lens, input, s);
     const auto& m = maps.at(0);
     REQUIRE(m.row_rotations.size() == 1);
-    REQUIRE(m.fov_scale > 1);
+    auto sensor_settings = s;
+    sensor_settings.output_size = input;
+    const auto sensor = plan_gyro_frames(std::array{1.0}, {}, lens, input, sensor_settings);
+    REQUIRE(m.fov_scale > sensor.front().fov_scale);
+    REQUIRE(sensor.front().fov_scale > 1);
     REQUIRE(m.zoom_ratio == Catch::Approx(1));
     REQUIRE(m.out_fx == Catch::Approx(lens.fx / m.fov_scale));
     REQUIRE(m.out_fy == Catch::Approx(lens.fy / m.fov_scale));
@@ -297,6 +313,37 @@ TEST_CASE("Rolling shutter samples the cropped sensor rows in either readout dir
             REQUIRE(src.x == Catch::Approx(lens.cx + lens.fx * std::tan(bearing - 2 * dt)).margin(0.001));
         }
         require_containment(map);
+    }
+}
+
+TEST_CASE("Rolling shutter maps clamp continuously at both ends of IMU coverage", "[domain][gyro]") {
+    using namespace stillflow;
+    const Size size{129, 65};
+    const OrientationTrack raw{{{2, exp_so3(0, 0.1, 0)}, {2.5, exp_so3(0, 0.15, 0)}, {3, exp_so3(0, 0.3, 0)}}};
+    GyroSettings s;
+    s.readout_ms = 10;
+    s.fov = 0.9;
+    constexpr double epsilon = 1e-7;
+    const std::array times{0.0, 1.9, 2.0, 2 + epsilon, 3 - epsilon, 3.0, 3.1, 4.2};
+    const auto maps = plan_gyro_frames(times, raw, centered_lens(size), size, s);
+    REQUIRE(maps.size() == times.size());
+    for (size_t i = 0; i < maps.size(); ++i) {
+        const auto& map = maps[i];
+        const bool head = times[i] <= 2 + epsilon;
+        const auto& boundary = maps[head ? 2 : 5];
+        CAPTURE(times[i]);
+        same_rotation(map.raw_orientation, head ? raw.samples.front().q : raw.samples.back().q, epsilon);
+        same_rotation(map.smooth_orientation, boundary.smooth_orientation, epsilon);
+        REQUIRE(std::isfinite(map.zoom_ratio));
+        require_containment(map);
+        if (times[i] < 1.99 || times[i] > 3.01) {
+            const auto expected =
+                to_matrix3(multiply(conjugate(boundary.raw_orientation), boundary.smooth_orientation));
+            REQUIRE(map.row_rotations.size() == 64);
+            for (const auto& row : map.row_rotations)
+                for (size_t j = 0; j < row.values.size(); ++j)
+                    REQUIRE(row.values[j] == Catch::Approx(expected.values[j]).margin(1e-10));
+        }
     }
 }
 

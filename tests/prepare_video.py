@@ -3,6 +3,7 @@
 import argparse
 import json
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -41,6 +42,29 @@ def main():
         ],
         check=True,
     )
+
+    def timestamps(path):
+        info = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=time_base:packet=pts",
+                    "-of",
+                    "json",
+                    str(path),
+                ]
+            )
+        )
+        tick = Fraction(info["streams"][0]["time_base"])
+        return sorted(int(packet["pts"]) * tick for packet in info["packets"])
+
+    if timestamps(fixture / "input.mp4") != timestamps(args.output / "output.mp4"):
+        raise RuntimeError("Output presentation times differ from the source track")
 
     def read(name):
         result = subprocess.run(

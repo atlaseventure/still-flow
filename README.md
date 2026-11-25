@@ -25,6 +25,18 @@ Input must be progressive 8-bit SDR with square pixels and even dimensions.
 - Rolling shutter correction is enabled by default; `--rs off` disables it.
 - Output preserves frame timestamps. `--audio auto` copies compatible tracks and converts others to AAC; `--audio none` omits audio.
 
+### Gyroscope stabilization (Host CUDA)
+
+Offline processing accepts a stabilization JSON or a Gyroflow project with its companion `<stem>.imu_camera.csv`. CPU, GLES and realtime gyro processing return `SF_UNSUPPORTED`.
+
+```sh
+./build/linux-gcc/stillflow input.mp4 output.mp4 --gyro-config camera.gyroflow --backend cuda
+```
+
+- Override the camera-frame CSV with `--imu PATH`, shift IMU time with `--gyro-offset MS`, and select `--imu-integration auto|gyro|complementary`.
+- Set framing with `--output-size WxH`, `--fov FACTOR`, `--max-zoom RATIO` and `--zoom-window SECONDS` (0 for static zoom).
+- Adjust `--gyro-smooth` and `--lens-correction` from 0 to 1. Set rolling shutter readout with `--readout-ms MS`.
+
 ## Core SDK
 
 Build and install the standalone SDK, or run the C memory-frame example:

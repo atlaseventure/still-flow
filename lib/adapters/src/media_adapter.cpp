@@ -91,7 +91,7 @@ class FfmpegWriter final : public VideoWriter {
   public:
     FfmpegWriter(const std::filesystem::path& path, Size size, double fps, VideoReader& source, int64_t origin,
                  const EncodingSettings& settings, const CodecRequest& encoder, HardwareDevices& devices)
-        : writer_(path, {size.width, size.height}, fps, dynamic_cast<FfmpegReader&>(source).reader.context(), origin,
+        : writer_(path, {size.width, size.height}, fps, dynamic_cast<FfmpegReader&>(source).reader, origin,
                   settings.threads, settings.crf, settings.preset, settings.audio, encoder, devices) {}
     void video(const Image& input, int64_t pts, int64_t duration) override {
         if (!input)

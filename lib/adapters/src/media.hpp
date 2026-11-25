@@ -78,6 +78,7 @@ class Reader {
     bool scan_timestamps(const std::function<void(FrameTimestamp)>& visit, const std::function<void()>& cancel);
     [[nodiscard]] const VideoInfo& info() const;
     [[nodiscard]] AVFormatContext* context() const;
+    [[nodiscard]] AVRational video_time_base() const;
     void set_audio_callback(std::function<void(const AVPacket*)> callback);
     [[nodiscard]] CodecReport codec() const;
 
@@ -88,7 +89,7 @@ class Reader {
 
 class Writer {
   public:
-    Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
+    Writer(const std::filesystem::path& path, cv::Size size, double fps, const Reader& reader, int64_t origin_us,
            int threads, int crf, const std::string& preset, AudioMode audio, const CodecRequest& encoder,
            HardwareDevices& devices);
     ~Writer();

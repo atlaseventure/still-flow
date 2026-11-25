@@ -25,6 +25,18 @@ cmake --build --preset linux-gcc
 - 默认启用滚动快门校正；`--rs off` 关闭校正。
 - 输出保留帧时间戳。`--audio auto` 复制兼容音轨，其余转为 AAC；`--audio none` 移除音频。
 
+### 陀螺仪防抖（Host CUDA）
+
+离线处理支持防抖配置 JSON 或带同名 `<stem>.imu_camera.csv` 的 Gyroflow 项目。CPU、GLES 后端和实时模式请求陀螺仪防抖时返回 `SF_UNSUPPORTED`。
+
+```sh
+./build/linux-gcc/stillflow input.mp4 output.mp4 --gyro-config camera.gyroflow --backend cuda
+```
+
+- 使用 `--imu PATH` 指定相机坐标系 IMU 数据，`--gyro-offset MS` 调整时间偏移，`--imu-integration auto|gyro|complementary` 选择积分方式。
+- 使用 `--output-size WxH`、`--fov FACTOR` 和 `--max-zoom RATIO` 调整构图，`--zoom-window SECONDS` 设置变焦窗口（0 为固定缩放）。
+- `--gyro-smooth` 和 `--lens-correction` 分别调整平滑强度和镜头校正量，取值均为 0 到 1。`--readout-ms MS` 设置滚动快门读出时间。
+
 ## 核心 SDK
 
 构建、安装独立 SDK，或运行 C 内存帧示例：

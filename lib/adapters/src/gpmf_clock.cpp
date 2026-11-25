@@ -74,9 +74,12 @@ std::optional<double> gpmf_sample_period(const std::filesystem::path& path, std:
                 (!anchors.empty() && tick * 0.001 <= anchors.back().time))
                 return false;
             // Match the CSV to the packet interpolation before changing its clock.
-            if (total < samples.size()) {
-                const double dt = (samples[total].time_s - samples[seen].time_s) / count;
-                for (size_t i = 1; i < count; ++i)
+            // The final packet has no following packet start. Its last CSV sample
+            // still anchors the interpolation of all intermediate samples.
+            const size_t end = total < samples.size() ? total : total - 1;
+            if (end > seen + 1) {
+                const double dt = (samples[end].time_s - samples[seen].time_s) / (end - seen);
+                for (size_t i = 1; i < end - seen; ++i)
                     if (std::abs(samples[seen + i].time_s - (samples[seen].time_s + i * dt)) > 2e-6)
                         return false;
             }

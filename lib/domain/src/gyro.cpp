@@ -303,12 +303,9 @@ OrientationTrack smooth_track(const OrientationTrack& raw, const GyroSettings& s
             for (auto& distance : adaptation)
                 distance = Vec::Constant(0.5) + 0.5 * distance.cwiseQuotient(peak.cwiseMax(1e-12));
         }
-        const Quaternion endpoint = out.samples.back().q;
         for (size_t i = 1; i < n; ++i)
             out.samples[i].q = step(i, i - 1);
-        // Constant continuation beyond the endpoint contributes half of a
-        // symmetric exponential kernel. Carry that tail into the reverse pass.
-        out.samples.back().q = slerp(out.samples.back().q, endpoint, 0.5);
+        // Start the reverse filter at the last observed forward-filtered orientation.
         for (size_t i = n - 1; i > 0; --i)
             out.samples[i - 1].q = step(i - 1, i);
     }
@@ -366,7 +363,8 @@ struct FrameGeometry {
 
     void set_scale(GyroFrameMap& map, double scale) const {
         map.fov_scale = scale;
-        map.zoom_ratio = identity_scale / scale;
+        // Extra zoom relative to the full sensor. A wider delivery crop consumes no zoom budget.
+        map.zoom_ratio = std::max(1.0, identity_scale / scale);
         map.out_fx = base_fx / scale;
         map.out_fy = base_fy / scale;
         if (!(finite(map.out_fx) && map.out_fx > 0 && finite(map.out_fy) && map.out_fy > 0))
@@ -386,27 +384,37 @@ struct FrameGeometry {
             map.row_rotations[i] = rotation(raw.sample(time + (fraction - 0.5) * signed_readout));
         }
     }
-    bool fits(GyroFrameMap& map, double scale) const {
+    bool fits(GyroFrameMap& map, double scale, bool full_perimeter = false) const {
         set_scale(map, scale);
         Point src;
         const double w = map.output_size.width - 1, h = map.output_size.height - 1;
-        for (int i = 0; i < 64; ++i) {
-            const double u = i / 63.0;
+        if (full_perimeter) {
+            for (int x = 0; x < map.output_size.width; ++x)
+                for (double y : {0.0, h})
+                    if (!project(map, {double(x), y}, 0.5, 1e-4, src))
+                        return false;
+            for (int y = 1; y < map.output_size.height - 1; ++y)
+                for (double x : {0.0, w})
+                    if (!project(map, {x, double(y)}, 0.5, 1e-4, src))
+                        return false;
+        }
+        for (int i = 0; i <= 64; ++i) {
+            const double u = i / 64.0;
             for (Point p : {Point{u * w, 0}, Point{u * w, h}, Point{0, u * h}, Point{w, u * h}})
                 if (!project(map, p, 0.5, 1e-4, src))
                     return false;
         }
         return true;
     }
-    double largest_scale(GyroFrameMap& map, double ceiling, double floor = 0.05) const {
-        if (fits(map, ceiling))
+    double largest_scale(GyroFrameMap& map, double ceiling, double floor = 0.05, bool full_perimeter = false) const {
+        if (fits(map, ceiling, full_perimeter))
             return ceiling;
-        if (!fits(map, floor))
+        if (!fits(map, floor, full_perimeter))
             return 0;
         double lo = floor, hi = ceiling;
         for (int i = 0; i < 24; ++i) {
             const double mid = std::midpoint(lo, hi);
-            if (fits(map, mid))
+            if (fits(map, mid, full_perimeter))
                 lo = mid;
             else
                 hi = mid;
@@ -589,9 +597,14 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
             throw std::domain_error("Relaxed orientation exceeds sensor bounds");
     }
     const auto final_scales = zoom_curve(times, scales, s);
-    for (size_t i = 0; i < times.size(); ++i)
-        if (!geometry(i).fits(maps[i], std::clamp(final_scales[i], min_scale, identity_scale)))
+    for (size_t i = 0; i < times.size(); ++i) {
+        const double ceiling = std::clamp(final_scales[i], min_scale, output_limit);
+        const auto g = geometry(i);
+        const double scale = g.largest_scale(maps[i], ceiling, min_scale, true);
+        if (scale == 0)
             throw std::domain_error("Final rolling shutter map exceeds sensor bounds");
+        g.set_scale(maps[i], scale);
+    }
     return maps;
 }
 } // namespace stillflow

@@ -411,6 +411,15 @@ TEST_CASE("Gyro adapters resolve projects and camera-frame IMU samples", "[gyro]
         REQUIRE(input.imu.back().has_accel);
         REQUIRE(input.imu.back().az == 12);
         REQUIRE(input.imu.back().time_s == 0.12);
+        const auto track = integrate_imu(input.imu, input.settings);
+        const auto maps = plan_gyro_frames(std::array{0.0, 0.06, 0.12}, track, input.lens, {32, 16}, input.settings);
+        REQUIRE(maps.size() == 3);
+        REQUIRE(maps.back().raw_orientation.w == Catch::Approx(track.samples.back().q.w));
+        REQUIRE(maps.back().raw_orientation.w < 1);
+        for (const auto& map : maps) {
+            Point src;
+            REQUIRE(project_output_to_input(map, {map.out_cx, map.out_cy}, src));
+        }
         const auto override = temp.path / "rates.csv";
         std::ofstream(override) << "t_video_s,wx,wy,wz\n0,4,5,6\n";
         auto rates = load_gyro_input(path, override);
@@ -429,8 +438,21 @@ TEST_CASE("Packet-timed IMU uses continuous camera ticks and project sync when t
     using namespace stillflow;
     test::TempDirectory temp;
     const auto csv = temp.path / "imu.csv";
-    std::ofstream(csv) << "t_video_s,wx,wy,wz\n0.0275,1,2,3\n0.033,1,2,3\n0.0385,1,2,3\n"
-                          "0.0435,1,2,3\n0.0485,1,2,3\n0.054,1,2,3\n";
+    std::array times{0.0275, 0.033, 0.0385, 0.044, 0.049, 0.054, 0.059, 0.0645, 0.070};
+    bool microsecond_clock = false;
+    bool packet_timed = false;
+    bool truncate = false;
+    SECTION("Packet-interpolated CSV") { packet_timed = true; }
+    SECTION("Truncated GPMF") { truncate = true; }
+    SECTION("Microsecond stream clock") { microsecond_clock = true; }
+    SECTION("Irregular CSV in first packet") { times[1] += 0.001; }
+    SECTION("Irregular CSV in final packet") { times[7] -= 0.001; }
+
+    std::ofstream samples(csv);
+    samples << "t_video_s,wx,wy,wz\n";
+    for (double t : times)
+        samples << t << ",1,2,3\n";
+    samples.close();
     const auto config = temp.path / "stabilization.json";
     std::ofstream(config) << R"({
         "imu":{"file":"imu.csv","time_offset_s":-0.0275},
@@ -450,20 +472,24 @@ TEST_CASE("Packet-timed IMU uses continuous camera ticks and project sync when t
     const auto bin = temp.path / "gyro.bin";
     std::ofstream packets(bin, std::ios::binary);
     for (int i = 0; i < 3; ++i) {
-        const auto stream =
-            scalar("TICK", 1000 + 10 * i) + scalar("TSMP", 2 * (i + 1)) + record("GYRO", 's', 6, std::string(12, '\0'));
+        auto stream =
+            scalar("TICK", 1000 + 15 * i) + scalar("TSMP", 3 * (i + 1)) + record("GYRO", 's', 6, std::string(18, '\0'));
+        if (i == 2 && microsecond_clock)
+            stream += record("STMP", 'J', 8, std::string(8, '\0'));
         packets << record("DEVC", 0, 1, record("STRM", 0, 1, stream));
     }
     packets.close();
-    const auto corrected = load_gyro_input(config);
-    REQUIRE(corrected.camera_clock);
-    REQUIRE(corrected.imu.front().time_s == Catch::Approx(0.0475));
-    REQUIRE(corrected.imu.back().time_s == Catch::Approx(0.072525));
+    if (truncate)
+        std::filesystem::resize_file(bin, std::filesystem::file_size(bin) - 1);
+
     const auto explicit_csv = load_gyro_input(config, csv);
     REQUIRE(!explicit_csv.camera_clock);
-    REQUIRE(explicit_csv.imu.front().time_s == 0.0275);
-    std::filesystem::resize_file(bin, std::filesystem::file_size(bin) - 1);
-    const auto incomplete = load_gyro_input(config);
-    REQUIRE(!incomplete.camera_clock);
-    REQUIRE(incomplete.imu.back().time_s == 0.054);
+    const auto loaded = load_gyro_input(config);
+    REQUIRE(loaded.imu.size() == times.size());
+    REQUIRE(explicit_csv.imu.size() == times.size());
+    REQUIRE(loaded.camera_clock == packet_timed);
+    for (size_t i = 0; i < times.size(); ++i) {
+        REQUIRE(explicit_csv.imu[i].time_s == Catch::Approx(times[i]));
+        REQUIRE(loaded.imu[i].time_s == Catch::Approx(packet_timed ? 0.0475 + i * 0.005005 : times[i]));
+    }
 }

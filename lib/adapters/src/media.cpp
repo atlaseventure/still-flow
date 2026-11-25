@@ -505,6 +505,7 @@ CodecReport Reader::codec() const {
 }
 const VideoInfo& Reader::info() const { return impl_->info; }
 AVFormatContext* Reader::context() const { return impl_->format; }
+AVRational Reader::video_time_base() const { return impl_->format->streams[impl_->video_stream]->time_base; }
 void Reader::set_audio_callback(std::function<void(const AVPacket*)> callback) {
     impl_->audio_callback = std::move(callback);
 }
@@ -842,11 +843,12 @@ EncoderContext open_nvenc(const EncoderSettings& settings, AVBufferRef* device) 
 }
 } // namespace
 
-Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVFormatContext* source, int64_t origin_us,
+Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, const Reader& reader, int64_t origin_us,
                int threads, int crf, const std::string& preset, AudioMode audio, const CodecRequest& request,
                HardwareDevices& devices)
     : impl_(std::make_unique<Impl>()) {
     auto& s = *impl_;
+    auto* source = reader.context();
     for (unsigned i = 0; i < source->nb_streams; ++i)
         s.source_time_base.push_back(source->streams[i]->time_base);
     s.origin_us = origin_us;
@@ -886,6 +888,10 @@ Writer::Writer(const std::filesystem::path& path, cv::Size size, double fps, AVF
     if (!s.video)
         throw std::bad_alloc();
     s.video->time_base = s.encoder->time_base;
+    // Recover the original MP4 ticks when muxing the microsecond processing timeline.
+    if (source->iformat == av_find_input_format("mov") && s.format->oformat == av_guess_format("mp4", nullptr, nullptr))
+        check(av_opt_set_int(s.format->priv_data, "video_track_timescale", reader.video_time_base().den, 0),
+              "Set MP4 video timescale");
     s.video->avg_frame_rate = s.encoder->framerate;
     check(avcodec_parameters_from_context(s.video->codecpar, s.encoder), "Copy encoder parameters");
     const bool cuda_input = s.encoder->pix_fmt == AV_PIX_FMT_CUDA;
