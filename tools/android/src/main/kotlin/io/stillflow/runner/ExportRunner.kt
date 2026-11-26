@@ -40,9 +40,9 @@ class ExportRunner : Instrumentation() {
             val directory = File(targetContext.filesDir, runId)
             val config = JSONObject(File(directory, "config.json").readText())
             val realtime = config.optBoolean("realtime")
-            require(!(realtime && config.has("gyro"))) { "Gyroscope export requires offline mode" }
             if (config.optBoolean("verifyBackends")) report.put("backend_verification", verifyGyroBackends())
             when {
+                realtime && config.has("gyro") -> exportGyroStream(directory, config)
                 config.has("gyro") -> exportGyro(directory, config)
                 realtime -> exportStream(directory, config)
                 else -> exportOffline(directory, config)
@@ -180,6 +180,43 @@ class ExportRunner : Instrumentation() {
         val verification = JSONObject()
         StillFlow.Renderer(StillFlow.Backend.CPU).use { cpu ->
             StillFlow.Renderer(StillFlow.Backend.GLES).use { gles ->
+                fun compareFrame(step: StillFlow.FramePlan, moving: Boolean, settings: StillFlow.GyroSettings): Int {
+                    var maximum = 0
+                    val map = step.gyroMap()
+                    if (moving) check(map.sensorRows && map.rowCount > 1) else {
+                        check(map.outFx == map.inFx && map.outFy == map.inFy && map.fovScale == 1.0)
+                        check(map.rowRotation(0).contentEquals(doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)))
+                    }
+                    for (format in StillFlow.PixelFormat.entries) {
+                        val channels = format.bytesPerPixel
+                        val pixels = ByteBuffer.allocateDirect(width * height * channels)
+                        for (y in 0 until height) for (x in 0 until width) for (c in 0 until channels) {
+                            pixels.put(((x * 7 + y * 13 + c * 37) % 256).toByte())
+                        }
+                        pixels.flip()
+                        val frame = StillFlow.Frame(width, height, format, width * channels, pixels)
+                        fun render(renderer: StillFlow.Renderer): ByteBuffer {
+                            val destination = ByteBuffer.allocateDirect(settings.outputWidth * settings.outputHeight * channels)
+                            val output = renderer.render(step, frame, destination)
+                            check(output.width == settings.outputWidth && output.height == settings.outputHeight && output.format == format)
+                            return output.pixels
+                        }
+                        val a = render(cpu)
+                        val b = render(gles)
+                        for (i in 0 until a.remaining()) {
+                            if (!moving) {
+                                val stride = settings.outputWidth * channels
+                                val expected = pixels[((i / stride + 2) * width + 2) * channels + i % stride]
+                                check(a[i] == expected && b[i] == expected) { "Identity mismatch at $format byte $i" }
+                            }
+                            val delta = abs((a[i].toInt() and 255) - (b[i].toInt() and 255))
+                            check(delta <= 1) { "CPU/GLES mismatch at $format byte $i: $delta" }
+                            maximum = maxOf(maximum, delta)
+                        }
+                    }
+                    return maximum
+                }
+
                 for (moving in listOf(false, true)) {
                     val lens = StillFlow.LensProfile().apply {
                         fx = 70.2
@@ -205,38 +242,45 @@ class ExportRunner : Instrumentation() {
                     }
                     StillFlow.planGyro(width, height, times, durations, imu, lens, settings).use { plan ->
                         plan.frame(3).use { step ->
-                            val map = step.gyroMap()
-                            if (moving) check(map.sensorRows && map.rowCount > 1) else {
-                                check(map.outFx == map.inFx && map.outFy == map.inFy && map.fovScale == 1.0)
-                                check(map.rowRotation(0).contentEquals(doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)))
+                            maxDelta = maxOf(maxDelta, compareFrame(step, moving, settings))
+                        }
+                    }
+                    if (moving) {
+                        val streaming = StillFlow.StreamSettings().apply { maxBufferedFrames = 2 }
+                        StillFlow.GyroStream(width, height, lens, settings, streaming).use { stream ->
+                            check(stream.outputWidth == settings.outputWidth && stream.outputHeight == settings.outputHeight)
+                            check(stream.poll() === StillFlow.StreamResult.Pending)
+                            stream.pushImu(emptyList())
+                            var cursor = 0
+                            var emitted = 0
+                            var retries = 0
+                            var streamDelta = 0
+                            fun consumeReady() {
+                                val result = stream.poll()
+                                check(result is StillFlow.StreamResult.Ready)
+                                result.plan.use { step ->
+                                    val info = step.info
+                                    check(info.index == emitted.toLong() && info.ptsUs == times[emitted] && info.durationUs == durations[emitted])
+                                    streamDelta = maxOf(streamDelta, compareFrame(step, true, settings))
+                                }
+                                emitted++
                             }
-                            for (format in StillFlow.PixelFormat.entries) {
-                                val channels = format.bytesPerPixel
-                                val pixels = ByteBuffer.allocateDirect(width * height * channels)
-                                for (y in 0 until height) for (x in 0 until width) for (c in 0 until channels) {
-                                    pixels.put(((x * 7 + y * 13 + c * 37) % 256).toByte())
-                                }
-                                pixels.flip()
-                                val frame = StillFlow.Frame(width, height, format, width * channels, pixels)
-                                fun render(renderer: StillFlow.Renderer): ByteBuffer {
-                                    val destination = ByteBuffer.allocateDirect(settings.outputWidth * settings.outputHeight * channels)
-                                    val output = renderer.render(step, frame, destination)
-                                    check(output.width == settings.outputWidth && output.height == settings.outputHeight && output.format == format)
-                                    return output.pixels
-                                }
-                                val a = render(cpu)
-                                val b = render(gles)
-                                for (i in 0 until a.remaining()) {
-                                    if (!moving) {
-                                        val stride = settings.outputWidth * channels
-                                        val expected = pixels[((i / stride + 2) * width + 2) * channels + i % stride]
-                                        check(a[i] == expected && b[i] == expected) { "Identity mismatch at $format byte $i" }
-                                    }
-                                    val delta = abs((a[i].toInt() and 255) - (b[i].toInt() and 255))
-                                    check(delta <= 1) { "CPU/GLES mismatch at $format byte $i: $delta" }
-                                    maxDelta = maxOf(maxDelta, delta)
+                            for (i in times.indices) {
+                                val cutoff = times[i] / 1e6 + settings.readoutMs / 2000
+                                while (cursor < imu.size && imu[cursor].timeSeconds <= cutoff) stream.pushImu(imu[cursor++])
+                                if (!stream.tryPushFrame(times[i], durations[i])) {
+                                    consumeReady()
+                                    check(stream.tryPushFrame(times[i], durations[i]))
+                                    retries++
                                 }
                             }
+                            check(retries > 0)
+                            stream.pushImu(imu.subList(cursor, imu.size))
+                            stream.finish()
+                            stream.finish()
+                            while (emitted < times.size) consumeReady()
+                            check(stream.poll() === StillFlow.StreamResult.End)
+                            verification.put("stream_max_channel_delta", streamDelta)
                         }
                     }
                 }
@@ -248,10 +292,9 @@ class ExportRunner : Instrumentation() {
             .put("formats", org.json.JSONArray(StillFlow.PixelFormat.entries.map { it.name }))
     }
 
-    private fun exportGyro(directory: File, config: JSONObject) {
-        val began = System.nanoTime()
-        val stages = linkedMapOf<String, TimingStatistics>()
-        val gyro = config.getJSONObject("gyro")
+    private data class GyroInput(val lens: StillFlow.LensProfile, val settings: StillFlow.GyroSettings, val samples: List<StillFlow.ImuSample>)
+
+    private fun gyroInput(directory: File, gyro: JSONObject): GyroInput {
         val calibration = gyro.getJSONObject("lens")
         val lens = StillFlow.LensProfile().apply {
             model = StillFlow.LensModel.valueOf(calibration.getString("model"))
@@ -297,6 +340,14 @@ class ExportRunner : Instrumentation() {
                 else StillFlow.ImuSample(v[0], v[1], v[2], v[3])
             }.toList()
         }
+        return GyroInput(lens, settings, samples)
+    }
+
+    private fun exportGyro(directory: File, config: JSONObject) {
+        val began = System.nanoTime()
+        val stages = linkedMapOf<String, TimingStatistics>()
+        val gyro = config.getJSONObject("gyro")
+        val (lens, settings, samples) = gyroInput(directory, gyro)
         val input = File(directory, "input.mp4")
         val timestamps = timed(stages, "analysis.timestamps") {
             val ex = extractor(input)
@@ -463,7 +514,6 @@ class ExportRunner : Instrumentation() {
 
     private fun exportStream(directory: File, config: JSONObject) {
         val input = File(directory, "input.mp4")
-        val output = File(directory, "output.mp4")
         val width = config.getInt("width")
         val height = config.getInt("height")
         val fps = config.getDouble("fps")
@@ -495,26 +545,271 @@ class ExportRunner : Instrumentation() {
             put("crop", settings.crop)
             put("rsStrength", settings.rsStrength)
         })
-        val streaming = StillFlow.StreamSettings().apply {
-            lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
-            adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
-        }
+        val streaming = streamSettings(options)
         report.getJSONObject("settings").put("adaptiveTracking", streaming.adaptiveTracking)
         val scale = minOf(1.0, settings.analysisWidth.toDouble() / width)
         val aw = maxOf(32, Math.round(width * scale).toInt())
         val ah = maxOf(32, Math.round(height * scale).toInt())
         val duration = Math.round(1_000_000 / fps)
-        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+        val began = System.nanoTime()
+        withStreamSurface(directory, config, width, height, streaming.maxBufferedFrames, width, height,
+            config.optBoolean("computeReadback", true), began) { gpu, images, sink, encoded, encoder ->
+            StreamPlanner(StillFlow.Video(width, height, fps, config.getBoolean("horizontalScan")), settings, streaming).use { planner ->
+                val pending = java.util.ArrayDeque<Pending>()
+                val awaitingAnalysis = java.util.ArrayDeque<Pending>()
+                val stages = linkedMapOf<String, TimingStatistics>()
+                fun mark(name: String, start: Long) { stages.getOrPut(name) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6) }
+                var received = 0
+                var rendered = 0
+                var peak = 0
+                var firstOutputSeconds = 0.0
+                var firstOutputAfterInputs = 0
+                var origin = 0L
+                var latest = 0L
+                val events = org.json.JSONArray()
+                fun drain(flushing: Boolean) {
+                    while (true) {
+                        val ready = planner.takeReady() ?: break
+                        val item = pending.removeFirst()
+                        check(ready.index == item.index && ready.index == rendered.toLong() && ready.ptsUs == item.pts)
+                        val start = System.nanoTime()
+                        sink.drain(0)
+                        gpu.render(item.frame, ready, origin)
+                        val renderCompleted = System.nanoTime()
+                        stages.getOrPut("render.cpu_submit") { TimingStatistics() }.add(gpu.renderSubmitMs)
+                        stages.getOrPut("render.surface_submit_wait") { TimingStatistics() }.add(gpu.surfaceSubmitMs)
+                        sink.drain(0)
+                        mark("render.surface", start)
+                        events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
+                            .put("duration_us", ready.durationUs).put("flushing", flushing)
+                            .put("input_ns", item.receivedNs - began)
+                            .put("analysis_start_ns", ready.analysisStartedNs - began)
+                            .put("analysis_complete_ns", ready.analysisCompletedNs - began)
+                            .put("plan_complete_ns", ready.planCompletedNs - began)
+                            .put("render_start_ns", start - began).put("render_complete_ns", renderCompleted - began))
+                        stages.getOrPut("stream.residence") { TimingStatistics() }.add((System.nanoTime()-item.receivedNs)/1e6)
+                        if (rendered == 0) {
+                            firstOutputSeconds = (System.nanoTime()-began)/1e9
+                            firstOutputAfterInputs = received
+                        }
+                        rendered++
+                    }
+                }
+                fun submitAnalysis(wait: Boolean) {
+                    while (awaitingAnalysis.isNotEmpty()) {
+                        val item = awaitingAnalysis.first()
+                        val luma = gpu.readLuma(item.frame, wait) ?: break
+                        stages.getOrPut("decode.proxy_readback_wait") { TimingStatistics() }.add(gpu.proxyReadbackMs)
+                        stages.getOrPut("decode.proxy_transfer") { TimingStatistics() }.add(gpu.proxyTransferMs)
+                        while (!planner.trySubmit(luma, item.pts, duration)) {
+                            drain(false)
+                            Thread.sleep(1)
+                        }
+                        awaitingAnalysis.removeFirst()
+                    }
+                }
+                val decoded = decode(input, images = images) { image, pts, _ ->
+                    if (received == 0) origin = pts else check(pts > latest)
+                    latest = pts
+                    if (config.optBoolean("paced")) {
+                        val target = began + (pts - origin) * 1000
+                        while (System.nanoTime() < target) {
+                            submitAnalysis(false)
+                            drain(false)
+                            Thread.sleep(1)
+                        }
+                    }
+                    if (awaitingAnalysis.size >= 2 || pending.size == streaming.maxBufferedFrames) submitAnalysis(true)
+                    while (pending.size == streaming.maxBufferedFrames) {
+                        drain(false)
+                        if (pending.size == streaming.maxBufferedFrames) Thread.sleep(1)
+                    }
+                    val start = System.nanoTime()
+                    val synchronous = config.optBoolean("synchronousCapture", false)
+                    val frame = if (synchronous) gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                        else gpu.captureAsync(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                    stages.getOrPut("decode.capture_proxy") { TimingStatistics() }.add(
+                        (System.nanoTime() - start) / 1e6 - if (synchronous) gpu.proxyReadbackMs else 0.0)
+                    stages.getOrPut("decode.capture_cpu_submit") { TimingStatistics() }.add(gpu.captureSubmitMs)
+                    stages.getOrPut("decode.source_release_wait") { TimingStatistics() }.add(gpu.sourceReleaseWaitMs)
+                    val item = Pending(received.toLong(), pts, frame, start)
+                    pending.addLast(item)
+                    awaitingAnalysis.addLast(item)
+                    received++
+                    peak = maxOf(peak, pending.size)
+                    submitAnalysis(false)
+                    drain(false)
+                    if (received % 60 == 0) progress("gpu_stream", received)
+                }
+                submitAnalysis(true)
+                val beforeFlush = rendered
+                while (!planner.tryFinish()) { drain(false); Thread.sleep(1) }
+                while (!planner.finished) { drain(true); Thread.sleep(1) }
+                timed(stages, "encode.drain_eos") { sink.finish() }
+                check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
+                report.put("peak_rss_mib", peakRssMiB())
+                report.put("retained_texture_bytes", gpu.retainedTextureBytes)
+                report.put("readback_backend", gpu.readbackBackend)
+                val cpu = planner.cpuProfile()
+                report.put("worker_cpu", JSONObject().put("analysis_ms", cpu.analysisMs).put("planning_ms", cpu.planningMs))
+                report.put("frames", received).put("width", width).put("height", height)
+                    .put("backend", "gles").put("gpu", true).put("device", gpu.device)
+                    .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
+                    .put("mode", "realtime").put("gpu_surface", true)
+                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events).put("encoded_events", encoded)
+                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", streaming.lookaheadSeconds)
+                        .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
+                        .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
+            }
+        }
+    }
+
+    private fun exportGyroStream(directory: File, config: JSONObject) {
+        val began = System.nanoTime()
+        val width = config.getInt("width")
+        val height = config.getInt("height")
+        val duration = Math.round(1_000_000 / config.getDouble("fps"))
+        val gyro = config.getJSONObject("gyro")
+        val (lens, settings, samples) = gyroInput(directory, gyro)
+        val streaming = streamSettings(config.getJSONObject("settings"))
+        val stages = linkedMapOf<String, TimingStatistics>()
+        fun record(name: String, ms: Double) { stages.getOrPut(name) { TimingStatistics() }.add(ms) }
+        val readoutHalfS = abs(settings.readoutMs) / 2000
+        val bt709 = config.getBoolean("bt709")
+        val fullRange = config.getBoolean("fullRange")
+        val paced = config.optBoolean("paced")
+        StillFlow.GyroStream(width, height, lens, settings, streaming).use { stream ->
+            withStreamSurface(directory, config, width, height, streaming.maxBufferedFrames, stream.outputWidth,
+                stream.outputHeight, false, began) { gpu, images, sink, encoded, encoder ->
+                val pending = java.util.ArrayDeque<Pending>()
+                val events = org.json.JSONArray()
+                var imuCursor = 0
+                var origin = 0L
+                var received = 0
+                var rendered = 0
+                var peak = 0
+                var firstOutputSeconds = 0.0
+                var firstOutputAfterInputs = 0
+                var minZoom = Double.POSITIVE_INFINITY
+                var sumZoom = 0.0
+                var maxZoom = 0.0
+
+                fun drain(flushing: Boolean) {
+                    while (true) {
+                        val result = stream.poll()
+                        when (result) {
+                            StillFlow.StreamResult.Pending -> { check(!flushing); return }
+                            StillFlow.StreamResult.End -> { check(flushing); return }
+                            is StillFlow.StreamResult.Ready -> {
+                                val (info, map) = result.plan.use { it.info to it.gyroMap() }
+                                val item = pending.removeFirst()
+                                check(info.index == item.index && info.ptsUs == item.pts && info.index == rendered.toLong())
+                                minZoom = minOf(minZoom, map.zoomRatio)
+                                sumZoom += map.zoomRatio
+                                maxZoom = maxOf(maxZoom, map.zoomRatio)
+                                val start = System.nanoTime()
+                                sink.drain(0)
+                                gpu.render(item.frame, map, info.ptsUs - origin)
+                                val completed = System.nanoTime()
+                                sink.drain(0)
+                                record("render.surface", (System.nanoTime() - start) / 1e6)
+                                record("render.cpu_submit", gpu.renderSubmitMs)
+                                record("render.surface_submit_wait", gpu.surfaceSubmitMs)
+                                record("stream.residence", (completed - item.receivedNs) / 1e6)
+                                events.put(JSONObject().put("frame", info.index).put("pts_us", info.ptsUs)
+                                    .put("duration_us", info.durationUs).put("flushing", flushing)
+                                    .put("input_ns", item.receivedNs - began).put("plan_complete_ns", start - began)
+                                    .put("render_start_ns", start - began).put("render_complete_ns", completed - began))
+                                if (rendered == 0) {
+                                    firstOutputSeconds = (completed - began) / 1e9
+                                    firstOutputAfterInputs = received
+                                }
+                                rendered++
+                            }
+                        }
+                    }
+                }
+
+                val decoded = decode(File(directory, "input.mp4"), images = images) { image, pts, _ ->
+                    if (received == 0) origin = pts
+                    val frameT = (pts - origin) / 1e6
+                    if (paced) {
+                        val target = began + (pts - origin) * 1000
+                        while (System.nanoTime() < target) {
+                            drain(false)
+                            Thread.sleep(1)
+                        }
+                    }
+                    val start = System.nanoTime()
+                    val first = imuCursor
+                    while (imuCursor < samples.size && samples[imuCursor].timeSeconds + settings.timeOffsetS <= frameT + readoutHalfS) imuCursor++
+                    if (first < imuCursor) stream.pushImu(samples.subList(first, imuCursor))
+                    if (pending.size >= streaming.maxBufferedFrames) drain(false)
+                    check(pending.size < streaming.maxBufferedFrames) { "Gyro stream did not release a texture at capacity" }
+                    val frame = gpu.captureTexture(image, bt709, fullRange)
+                    record("decode.capture_cpu_submit", gpu.captureSubmitMs)
+                    record("decode.source_release_wait", gpu.sourceReleaseWaitMs)
+                    while (!stream.tryPushFrame(pts, duration)) {
+                        val previous = pending.size
+                        drain(false)
+                        check(pending.size < previous) { "Gyro stream made no progress under backpressure" }
+                    }
+                    pending.addLast(Pending(received.toLong(), pts, frame, start))
+                    received++
+                    peak = maxOf(peak, pending.size)
+                    drain(false)
+                    if (received % 60 == 0) progress("gyro_stream", received)
+                }
+                val beforeFlush = rendered
+                if (imuCursor < samples.size) stream.pushImu(samples.subList(imuCursor, samples.size))
+                stream.finish()
+                drain(true)
+                timed(stages, "encode.drain_eos") { sink.finish() }
+                check(decoded > 0 && decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) {
+                    "GPU gyro stream lost frames"
+                }
+                gyro.put("zoom_ratio", JSONObject().put("min", minZoom).put("mean", sumZoom / rendered).put("max", maxZoom))
+                report.put("mode", "realtime_gyro").put("decode_passes", 1).put("frames", rendered)
+                    .put("width", width).put("height", height).put("output_width", stream.outputWidth).put("output_height", stream.outputHeight)
+                    .put("backend", "gles").put("gpu", true).put("gpu_surface", true).put("device", gpu.device)
+                    .put("encoder", encoder.name).put("peak_rss_mib", peakRssMiB()).put("retained_texture_bytes", gpu.retainedTextureBytes)
+                    .put("gyro", gyro).put("frame_events", events).put("encoded_events", encoded)
+                    .put("native_profile", org.json.JSONArray(stream.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson())
+                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", streaming.lookaheadSeconds)
+                        .put("max_buffered_frames", streaming.maxBufferedFrames).put("first_output_seconds", firstOutputSeconds)
+                        .put("first_output_after_inputs", firstOutputAfterInputs).put("frames_before_flush", beforeFlush)
+                        .put("frames_during_flush", rendered - beforeFlush).put("decode_passes", 1))
+                    .put("total_seconds", (System.nanoTime() - began) / 1e9)
+            }
+        }
+    }
+
+    private fun peakRssMiB() = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
+        ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024) ?: JSONObject.NULL
+
+    private fun streamSettings(options: JSONObject) = StillFlow.StreamSettings().apply {
+        lookaheadSeconds = options.optDouble("lookaheadSeconds", lookaheadSeconds)
+        maxBufferedFrames = options.optInt("maxBufferedFrames", maxBufferedFrames)
+        adaptiveTracking = options.optBoolean("adaptiveTracking", adaptiveTracking)
+    }
+
+    private data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
+
+    private fun withStreamSurface(
+        directory: File, config: JSONObject, width: Int, height: Int, capacity: Int,
+        outputWidth: Int, outputHeight: Int, computeReadback: Boolean, began: Long,
+        process: (GpuFrames, ImageReader, EncoderSink, org.json.JSONArray, MediaCodec) -> Unit,
+    ) {
+        val format = MediaFormat.createVideoFormat("video/avc", outputWidth, outputHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, config.getInt("bitrate"))
-            setFloat(MediaFormat.KEY_FRAME_RATE, fps.toFloat())
+            setFloat(MediaFormat.KEY_FRAME_RATE, config.getDouble("fps").toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
             setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
             setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         }
-        val began = System.nanoTime()
         val encoder = HardwareCodecs.encoder(format)
         try {
             val surface = encoder.createInputSurface()
@@ -526,114 +821,9 @@ class ExportRunner : Instrumentation() {
                         encoded.put(JSONObject().put("pts_us", pts).put("output_ns", ns - began))
                     }
                     encoder.start()
-                    GpuFrames(width, height, streaming.maxBufferedFrames, surface, config.optBoolean("computeReadback", true)).use { gpu ->
+                    GpuFrames(width, height, capacity, surface, computeReadback, outputWidth, outputHeight).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
-                            StreamPlanner(StillFlow.Video(width, height, fps, config.getBoolean("horizontalScan")), settings, streaming).use { planner ->
-                                data class Pending(val index: Long, val pts: Long, val frame: GpuFrames.Frame, val receivedNs: Long)
-                                val pending = java.util.ArrayDeque<Pending>()
-                                val awaitingAnalysis = java.util.ArrayDeque<Pending>()
-                                val stages = linkedMapOf<String, TimingStatistics>()
-                                fun mark(name: String, start: Long) { stages.getOrPut(name) { TimingStatistics() }.add((System.nanoTime() - start) / 1e6) }
-                                var received = 0
-                                var rendered = 0
-                                var peak = 0
-                                var firstOutputSeconds = 0.0
-                                var firstOutputAfterInputs = 0
-                                var origin = 0L
-                                var latest = 0L
-                                val events = org.json.JSONArray()
-                                fun drain(flushing: Boolean) {
-                                    while (true) {
-                                        val ready = planner.takeReady() ?: break
-                                        val item = pending.removeFirst()
-                                        check(ready.index == item.index && ready.index == rendered.toLong() && ready.ptsUs == item.pts)
-                                        val start = System.nanoTime()
-                                        sink.drain(0)
-                                        gpu.render(item.frame, ready, origin)
-                                        val renderCompleted = System.nanoTime()
-                                        stages.getOrPut("render.cpu_submit") { TimingStatistics() }.add(gpu.renderSubmitMs)
-                                        stages.getOrPut("render.surface_submit_wait") { TimingStatistics() }.add(gpu.surfaceSubmitMs)
-                                        sink.drain(0)
-                                        mark("render.surface", start)
-                                        events.put(JSONObject().put("frame", ready.index).put("pts_us", ready.ptsUs)
-                                            .put("duration_us", ready.durationUs).put("flushing", flushing)
-                                            .put("input_ns", item.receivedNs - began)
-                                            .put("analysis_start_ns", ready.analysisStartedNs - began)
-                                            .put("analysis_complete_ns", ready.analysisCompletedNs - began)
-                                            .put("plan_complete_ns", ready.planCompletedNs - began)
-                                            .put("render_start_ns", start - began).put("render_complete_ns", renderCompleted - began))
-                                        stages.getOrPut("stream.residence") { TimingStatistics() }.add((System.nanoTime()-item.receivedNs)/1e6)
-                                        if (rendered == 0) {
-                                            firstOutputSeconds = (System.nanoTime()-began)/1e9
-                                            firstOutputAfterInputs = received
-                                        }
-                                        rendered++
-                                    }
-                                }
-                                fun submitAnalysis(wait: Boolean) {
-                                    while (awaitingAnalysis.isNotEmpty()) {
-                                        val item = awaitingAnalysis.first()
-                                        val luma = gpu.readLuma(item.frame, wait) ?: break
-                                        stages.getOrPut("decode.proxy_readback_wait") { TimingStatistics() }.add(gpu.proxyReadbackMs)
-                                        stages.getOrPut("decode.proxy_transfer") { TimingStatistics() }.add(gpu.proxyTransferMs)
-                                        while (!planner.trySubmit(luma, item.pts, duration)) {
-                                            drain(false)
-                                            Thread.sleep(1)
-                                        }
-                                        awaitingAnalysis.removeFirst()
-                                    }
-                                }
-                                val decoded = decode(input, images = images) { image, pts, _ ->
-                                    if (received == 0) origin = pts else check(pts > latest)
-                                    latest = pts
-                                    if (config.optBoolean("paced")) {
-                                        val target = began + (pts - origin) * 1000
-                                        while (System.nanoTime() < target) {
-                                            submitAnalysis(false)
-                                            drain(false)
-                                            Thread.sleep(1)
-                                        }
-                                    }
-                                    if (awaitingAnalysis.size >= 2) submitAnalysis(true)
-                                    val start = System.nanoTime()
-                                    val synchronous = config.optBoolean("synchronousCapture", false)
-                                    val frame = if (synchronous) gpu.capture(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
-                                        else gpu.captureAsync(image, aw, ah, config.getBoolean("bt709"), config.getBoolean("fullRange"))
-                                    stages.getOrPut("decode.capture_proxy") { TimingStatistics() }.add(
-                                        (System.nanoTime() - start) / 1e6 - if (synchronous) gpu.proxyReadbackMs else 0.0)
-                                    stages.getOrPut("decode.capture_cpu_submit") { TimingStatistics() }.add(gpu.captureSubmitMs)
-                                    stages.getOrPut("decode.source_release_wait") { TimingStatistics() }.add(gpu.sourceReleaseWaitMs)
-                                    val item = Pending(received.toLong(), pts, frame, start)
-                                    pending.addLast(item)
-                                    awaitingAnalysis.addLast(item)
-                                    received++
-                                    peak = maxOf(peak, pending.size)
-                                    submitAnalysis(false)
-                                    drain(false)
-                                    if (received % 60 == 0) progress("gpu_stream", received)
-                                }
-                                submitAnalysis(true)
-                                val beforeFlush = rendered
-                                while (!planner.tryFinish()) { drain(false); Thread.sleep(1) }
-                                while (!planner.finished) { drain(true); Thread.sleep(1) }
-                                timed(stages, "encode.drain_eos") { sink.finish() }
-                                check(decoded == received && rendered == received && sink.frames == received && pending.isEmpty()) { "GPU streaming lost frames" }
-                                val peakRss = File("/proc/self/status").readLines().firstOrNull { it.startsWith("VmHWM:") }
-                                    ?.trim()?.split(Regex("\\s+"))?.get(1)?.toDouble()?.div(1024)
-                                report.put("peak_rss_mib", peakRss ?: JSONObject.NULL)
-                                report.put("retained_texture_bytes", gpu.retainedTextureBytes)
-                                report.put("readback_backend", gpu.readbackBackend)
-                                val cpu = planner.cpuProfile()
-                                report.put("worker_cpu", JSONObject().put("analysis_ms", cpu.analysisMs).put("planning_ms", cpu.planningMs))
-                                report.put("frames", received).put("width", width).put("height", height)
-                                    .put("backend", "gles").put("gpu", true).put("device", gpu.device)
-                                    .put("encoder", encoder.name).put("total_seconds", (System.nanoTime() - began) / 1e9)
-                                    .put("mode", "realtime").put("gpu_surface", true)
-                                    .put("native_profile", org.json.JSONArray(planner.profile())).put("stages", timingJson(stages)).put("profiling", profilingJson()).put("frame_events", events).put("encoded_events", encoded)
-                                    .put("streaming", JSONObject().put("peak_buffered_frames", peak).put("lookahead_seconds", streaming.lookaheadSeconds)
-                                        .put("first_output_seconds", firstOutputSeconds).put("first_output_after_inputs", firstOutputAfterInputs)
-                                        .put("frames_before_flush", beforeFlush).put("frames_during_flush", rendered-beforeFlush).put("decode_passes", 1))
-                            }
+                            process(gpu, images, sink, encoded, encoder)
                         }
                     }
                 } finally { writer.release() }

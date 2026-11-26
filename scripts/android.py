@@ -114,6 +114,7 @@ def run(args):
         "crop": "crop",
         "rs_strength": "rsStrength",
         "lookahead": "lookaheadSeconds",
+        "buffer_frames": "maxBufferedFrames",
     }
     for name, field in keys.items():
         value = getattr(args, name)
@@ -236,7 +237,8 @@ def run(args):
             requested = (settings.get("outputWidth", 0), settings.get("outputHeight", 0))
             if size != (result["output_width"], result["output_height"]) or (requested != (0, 0) and size != requested):
                 raise RuntimeError(f"Gyro output dimensions mismatch: {size}")
-            if result["mode"] != "offline_gyro" or result["decode_passes"] != 1:
+            expected_mode = "realtime_gyro" if args.realtime else "offline_gyro"
+            if result["mode"] != expected_mode or result["decode_passes"] != 1:
                 raise RuntimeError("Expected single-pass gyro rendering")
         if args.verify_backends and result.get("backend_verification", {}).get("status") != "passed":
             raise RuntimeError("Missing successful CPU/GLES backend verification")
@@ -306,6 +308,7 @@ def main():
     parser.add_argument("--imu-integration", choices=("auto", "gyro", "complementary"))
     parser.add_argument("--verify-backends", action="store_true")
     parser.add_argument("--paced", action="store_true", help="Pace streaming input by source PTS")
+    parser.add_argument("--buffer-frames", type=int, help="Maximum retained streaming frames, 2..600")
     parser.add_argument("--lookahead", type=float, help="Streaming lookahead in seconds, 0..10")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
     parser.add_argument("--analysis-width", type=int)
@@ -327,8 +330,8 @@ def main():
     )
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
-    if args.realtime and args.gyro_config:
-        parser.error("--gyro-config requires offline mode")
+    if args.buffer_frames is not None and not 2 <= args.buffer_frames <= 600:
+        parser.error("buffer-frames must be between 2 and 600")
     for name in (
         "imu",
         "output_size",

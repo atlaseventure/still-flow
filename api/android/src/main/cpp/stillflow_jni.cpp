@@ -124,22 +124,72 @@ jfloatArray frame_map(JNIEnv* env, const sf_frame_plan* plan, jint width, jint h
         env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
     return result;
 }
-} // namespace
 
-extern "C" {
-JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeThreads(JNIEnv* env, jclass, jint threads) {
-    boundary(env, [&] {
-        sf_error error{};
-        check(sf_opencv_set_threads(threads, &error), error);
-    });
+sf_lens_profile gyro_lens(JNIEnv* env, jint lens_model, jint calib_width, jint calib_height, jdouble fx, jdouble fy,
+                          jdouble cx, jdouble cy, jdoubleArray distortion, jdouble lens_correction_amount) {
+    if (!distortion || env->GetArrayLength(distortion) != 4)
+        throw Failure(SF_INVALID_ARGUMENT, "Expected four lens distortion coefficients");
+    sf_lens_profile lens{lens_model, calib_width, calib_height, fx, fy, cx, cy, {}, lens_correction_amount};
+    env->GetDoubleArrayRegion(distortion, 0, 4, lens.k);
+    return lens;
 }
-JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env, jclass, jlong handle) {
+
+sf_gyro_settings gyro_settings(jdouble smoothness, jboolean per_axis, jdouble smoothness_pitch, jdouble smoothness_yaw,
+                               jdouble smoothness_roll, jdouble max_smoothness, jdouble alpha_0_1s, jdouble readout_ms,
+                               jboolean readout_top_to_bottom, jdouble fov, jdouble max_zoom, jint max_zoom_iterations,
+                               jdouble adaptive_zoom_window_s, jboolean adaptive_zoom, jdouble time_offset_s,
+                               jint integration_method, jint output_width, jint output_height, jboolean zoom_envelope) {
+    return {smoothness,
+            per_axis,
+            smoothness_pitch,
+            smoothness_yaw,
+            smoothness_roll,
+            max_smoothness,
+            alpha_0_1s,
+            readout_ms,
+            readout_top_to_bottom,
+            fov,
+            max_zoom,
+            max_zoom_iterations,
+            adaptive_zoom_window_s,
+            adaptive_zoom,
+            time_offset_s,
+            integration_method,
+            output_width,
+            output_height,
+            zoom_envelope};
+}
+
+std::vector<sf_imu_sample> imu_samples(JNIEnv* env, jdoubleArray imu, jbooleanArray accel) {
+    if (!imu || !accel)
+        throw Failure(SF_INVALID_ARGUMENT, "Missing IMU arrays");
+    const auto samples = env->GetArrayLength(accel);
+    const auto length = env->GetArrayLength(imu);
+    if (length != 7LL * samples)
+        throw Failure(SF_INVALID_ARGUMENT, "Expected seven values per IMU sample");
+    if (!samples)
+        return {};
+    std::vector<jdouble> data(length);
+    std::vector<jboolean> flags(samples);
+    env->GetDoubleArrayRegion(imu, 0, length, data.data());
+    env->GetBooleanArrayRegion(accel, 0, samples, flags.data());
+    if (env->ExceptionCheck())
+        return {};
+    std::vector<sf_imu_sample> measurements(samples);
+    for (size_t i = 0; i < measurements.size(); ++i) {
+        const auto* v = &data[i * 7];
+        measurements[i] = {v[0], v[1], v[2], v[3], v[4], v[5], v[6], flags[i]};
+    }
+    return measurements;
+}
+
+template <class T, class F> jstring profile_json(JNIEnv* env, jlong value, F query) {
     jstring result = nullptr;
     boundary(env, [&] {
         std::string json = "[";
         sf_error error{};
-        check(sf_stream_get_profile(
-                  ::handle<sf_stream>(handle),
+        check(query(
+                  handle<T>(value),
                   [](void* data, const sf_profile_entry* entry) {
                       auto& output = *static_cast<std::string*>(data);
                       if (output.size() > 1)
@@ -159,6 +209,53 @@ JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env,
         result = env->NewStringUTF(json.c_str());
     });
     return result;
+}
+
+template <class T, class F> jlongArray stream_ready(JNIEnv* env, jlong value, F query) {
+    jlongArray result = nullptr;
+    boundary(env, [&] {
+        result = env->NewLongArray(2);
+        if (!result)
+            return;
+        sf_error error{};
+        sf_frame_plan* plan = nullptr;
+        const auto status = query(handle<T>(value), &plan, &error);
+        if (status != SF_AGAIN && status != SF_END)
+            check(status, error);
+        const jlong values[] = {status, reinterpret_cast<jlong>(plan)};
+        env->SetLongArrayRegion(result, 0, 2, values);
+        if (env->ExceptionCheck())
+            sf_frame_plan_destroy(plan);
+    });
+    return result;
+}
+
+template <class T, class F> jintArray output_size(JNIEnv* env, jlong value, F query) {
+    jintArray result = nullptr;
+    boundary(env, [&] {
+        sf_error error{};
+        jint size[2];
+        check(query(handle<T>(value), &size[0], &size[1], &error), error);
+        result = env->NewIntArray(2);
+        if (result)
+            env->SetIntArrayRegion(result, 0, 2, size);
+    });
+    return result;
+}
+} // namespace
+
+extern "C" {
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeThreads(JNIEnv* env, jclass, jint threads) {
+    boundary(env, [&] {
+        sf_error error{};
+        check(sf_opencv_set_threads(threads, &error), error);
+    });
+}
+JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeProfile(JNIEnv* env, jclass, jlong value) {
+    return profile_json<sf_stream>(env, value, sf_stream_get_profile);
+}
+JNIEXPORT jstring JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamProfile(JNIEnv* env, jclass, jlong value) {
+    return profile_json<sf_gyro_stream>(env, value, sf_gyro_stream_get_profile);
 }
 
 JNIEXPORT jdoubleArray JNICALL Java_io_stillflow_StillFlow_nativeDefaults(JNIEnv* env, jclass) {
@@ -228,52 +325,31 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeGyroPlanCreate(
     jint integration_method, jint output_width, jint output_height, jboolean zoom_envelope) {
     jlong result = 0;
     boundary(env, [&] {
-        if (!pts || !durations || !imu || !accel || !distortion)
-            throw Failure(SF_INVALID_ARGUMENT, "Missing gyro planning arrays");
+        if (!pts || !durations || !env->GetArrayLength(pts) ||
+            env->GetArrayLength(pts) != env->GetArrayLength(durations))
+            throw Failure(SF_INVALID_ARGUMENT, "Invalid gyro timestamp arrays");
         const auto frames = env->GetArrayLength(pts);
-        const auto samples = env->GetArrayLength(accel);
-        const auto imu_length = env->GetArrayLength(imu);
-        if (!frames || !samples || env->GetArrayLength(durations) != frames || imu_length != 7LL * samples ||
-            env->GetArrayLength(distortion) != 4)
-            throw Failure(SF_INVALID_ARGUMENT, "Invalid gyro planning array lengths");
-        sf_lens_profile lens{lens_model, calib_width, calib_height, fx, fy, cx, cy, {}, lens_correction_amount};
-        sf_gyro_settings settings{smoothness,
-                                  per_axis,
-                                  smoothness_pitch,
-                                  smoothness_yaw,
-                                  smoothness_roll,
-                                  max_smoothness,
-                                  alpha_0_1s,
-                                  readout_ms,
-                                  readout_top_to_bottom,
-                                  fov,
-                                  max_zoom,
-                                  max_zoom_iterations,
-                                  adaptive_zoom_window_s,
-                                  adaptive_zoom,
-                                  time_offset_s,
-                                  integration_method,
-                                  output_width,
-                                  output_height,
-                                  zoom_envelope};
+        const auto lens =
+            gyro_lens(env, lens_model, calib_width, calib_height, fx, fy, cx, cy, distortion, lens_correction_amount);
+        if (env->ExceptionCheck())
+            return;
+        const auto settings = gyro_settings(
+            smoothness, per_axis, smoothness_pitch, smoothness_yaw, smoothness_roll, max_smoothness, alpha_0_1s,
+            readout_ms, readout_top_to_bottom, fov, max_zoom, max_zoom_iterations, adaptive_zoom_window_s,
+            adaptive_zoom, time_offset_s, integration_method, output_width, output_height, zoom_envelope);
+        const auto measurements = imu_samples(env, imu, accel);
+        if (env->ExceptionCheck())
+            return;
+        if (measurements.empty())
+            throw Failure(SF_INVALID_ARGUMENT, "Expected IMU samples");
         std::vector<jlong> times(frames), lengths(frames);
-        std::vector<jdouble> data(imu_length);
-        std::vector<jboolean> flags(samples);
         env->GetLongArrayRegion(pts, 0, frames, times.data());
         env->GetLongArrayRegion(durations, 0, frames, lengths.data());
-        env->GetDoubleArrayRegion(imu, 0, imu_length, data.data());
-        env->GetBooleanArrayRegion(accel, 0, samples, flags.data());
-        env->GetDoubleArrayRegion(distortion, 0, 4, lens.k);
         if (env->ExceptionCheck())
             return;
         std::vector<sf_frame_timestamp> timestamps(frames);
         for (size_t i = 0; i < timestamps.size(); ++i)
             timestamps[i] = {times[i], lengths[i]};
-        std::vector<sf_imu_sample> measurements(samples);
-        for (size_t i = 0; i < measurements.size(); ++i) {
-            const auto* v = &data[i * 7];
-            measurements[i] = {v[0], v[1], v[2], v[3], v[4], v[5], v[6], flags[i]};
-        }
         sf_error error{};
         sf_plan* plan = nullptr;
         check(sf_gyro_plan_create(&settings, &lens, width, height, timestamps.data(), timestamps.size(),
@@ -284,17 +360,73 @@ JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeGyroPlanCreate(
     return result;
 }
 
-JNIEXPORT jintArray JNICALL Java_io_stillflow_StillFlow_nativeFrameOutputSize(JNIEnv* env, jclass, jlong value) {
-    jintArray result = nullptr;
+JNIEXPORT jlong JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamCreate(
+    JNIEnv* env, jclass, jint width, jint height, jint lens_model, jint calib_width, jint calib_height, jdouble fx,
+    jdouble fy, jdouble cx, jdouble cy, jdoubleArray distortion, jdouble lens_correction_amount, jdouble smoothness,
+    jboolean per_axis, jdouble smoothness_pitch, jdouble smoothness_yaw, jdouble smoothness_roll,
+    jdouble max_smoothness, jdouble alpha_0_1s, jdouble readout_ms, jboolean readout_top_to_bottom, jdouble fov,
+    jdouble max_zoom, jint max_zoom_iterations, jdouble adaptive_zoom_window_s, jboolean adaptive_zoom,
+    jdouble time_offset_s, jint integration_method, jint output_width, jint output_height, jboolean zoom_envelope,
+    jdouble lookahead_seconds, jint max_buffered_frames, jboolean adaptive_tracking) {
+    jlong result = 0;
     boundary(env, [&] {
+        if (max_buffered_frames < 2)
+            throw Failure(SF_INVALID_ARGUMENT, "Streaming capacity must be at least two frames");
+        const auto lens =
+            gyro_lens(env, lens_model, calib_width, calib_height, fx, fy, cx, cy, distortion, lens_correction_amount);
+        if (env->ExceptionCheck())
+            return;
+        const auto settings = gyro_settings(
+            smoothness, per_axis, smoothness_pitch, smoothness_yaw, smoothness_roll, max_smoothness, alpha_0_1s,
+            readout_ms, readout_top_to_bottom, fov, max_zoom, max_zoom_iterations, adaptive_zoom_window_s,
+            adaptive_zoom, time_offset_s, integration_method, output_width, output_height, zoom_envelope);
+        sf_stream_settings streaming{lookahead_seconds, static_cast<size_t>(max_buffered_frames), adaptive_tracking};
         sf_error error{};
-        jint size[2];
-        check(sf_frame_plan_get_output_size(handle<sf_frame_plan>(value), &size[0], &size[1], &error), error);
-        result = env->NewIntArray(2);
-        if (result)
-            env->SetIntArrayRegion(result, 0, 2, size);
+        sf_gyro_stream* stream = nullptr;
+        check(sf_gyro_stream_create(&settings, &lens, &streaming, width, height, nullptr, &stream, &error), error);
+        result = reinterpret_cast<jlong>(stream);
     });
     return result;
+}
+
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamPushImu(JNIEnv* env, jclass, jlong value,
+                                                                           jdoubleArray imu, jbooleanArray accel) {
+    boundary(env, [&] {
+        const auto measurements = imu_samples(env, imu, accel);
+        if (env->ExceptionCheck())
+            return;
+        sf_error error{};
+        check(sf_gyro_stream_push_imu(handle<sf_gyro_stream>(value), measurements.data(), measurements.size(), &error),
+              error);
+    });
+}
+
+JNIEXPORT jboolean JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamPushFrame(JNIEnv* env, jclass, jlong value,
+                                                                                 jlong pts, jlong duration) {
+    jboolean result = false;
+    boundary(env, [&] {
+        sf_error error{};
+        const auto status = sf_gyro_stream_push_frame(handle<sf_gyro_stream>(value), pts, duration, &error);
+        if (status == SF_AGAIN)
+            return;
+        check(status, error);
+        result = true;
+    });
+    return result;
+}
+
+JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamFinish(JNIEnv* env, jclass, jlong value) {
+    boundary(env, [&] {
+        sf_error error{};
+        check(sf_gyro_stream_finish(handle<sf_gyro_stream>(value), &error), error);
+    });
+}
+
+JNIEXPORT jintArray JNICALL Java_io_stillflow_StillFlow_nativeFrameOutputSize(JNIEnv* env, jclass, jlong value) {
+    return output_size<sf_frame_plan>(env, value, sf_frame_plan_get_output_size);
+}
+JNIEXPORT jintArray JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamOutputSize(JNIEnv* env, jclass, jlong value) {
+    return output_size<sf_gyro_stream>(env, value, sf_gyro_stream_get_output_size);
 }
 
 JNIEXPORT jdoubleArray JNICALL Java_io_stillflow_StillFlow_nativeFrameGyroMap(JNIEnv* env, jclass, jlong value) {
@@ -396,22 +528,10 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeStreamFinish(JNIEnv* en
     });
 }
 JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeStreamReady(JNIEnv* env, jclass, jlong value) {
-    jlongArray result = nullptr;
-    boundary(env, [&] {
-        result = env->NewLongArray(2);
-        if (!result)
-            return;
-        sf_error error{};
-        sf_frame_plan* plan = nullptr;
-        const auto status = sf_stream_take_ready(handle<sf_stream>(value), &plan, &error);
-        if (status != SF_AGAIN && status != SF_END)
-            check(status, error);
-        const jlong values[] = {status, reinterpret_cast<jlong>(plan)};
-        env->SetLongArrayRegion(result, 0, 2, values);
-        if (env->ExceptionCheck())
-            sf_frame_plan_destroy(plan);
-    });
-    return result;
+    return stream_ready<sf_stream>(env, value, sf_stream_take_ready);
+}
+JNIEXPORT jlongArray JNICALL Java_io_stillflow_StillFlow_nativeGyroStreamReady(JNIEnv* env, jclass, jlong value) {
+    return stream_ready<sf_gyro_stream>(env, value, sf_gyro_stream_take_ready);
 }
 JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeAnalyze(JNIEnv* env, jclass, jlong value, jint width,
                                                                  jint height, jint format, jint stride, jobject pixels,
@@ -542,6 +662,9 @@ JNIEXPORT void JNICALL Java_io_stillflow_StillFlow_nativeDestroy(JNIEnv*, jclass
         break;
     case 4:
         sf_renderer_destroy(handle<sf_renderer>(value));
+        break;
+    case 5:
+        sf_gyro_stream_destroy(handle<sf_gyro_stream>(value));
         break;
     default:
         break;

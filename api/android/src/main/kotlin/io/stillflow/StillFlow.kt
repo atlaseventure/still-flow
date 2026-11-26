@@ -104,10 +104,7 @@ object StillFlow {
         @get:JvmSynthetic internal val distortionFloat = FloatArray(4) { packed[9 + it].toFloat() }
     }
 
-    @JvmStatic @JvmOverloads fun planGyro(
-        inputWidth: Int, inputHeight: Int, timestampsUs: LongArray, durationsUs: LongArray,
-        imuSamples: List<ImuSample>, lens: LensProfile, settings: GyroSettings = GyroSettings(),
-    ): Plan {
+    private fun packImu(imuSamples: List<ImuSample>): Pair<DoubleArray, BooleanArray> {
         val data = DoubleArray(Math.multiplyExact(imuSamples.size, 7))
         val accel = BooleanArray(imuSamples.size)
         imuSamples.forEachIndexed { i, sample ->
@@ -120,6 +117,14 @@ object StillFlow {
             data[i * 7 + 6] = sample.az
             accel[i] = sample.hasAccel
         }
+        return data to accel
+    }
+
+    @JvmStatic @JvmOverloads fun planGyro(
+        inputWidth: Int, inputHeight: Int, timestampsUs: LongArray, durationsUs: LongArray,
+        imuSamples: List<ImuSample>, lens: LensProfile, settings: GyroSettings = GyroSettings(),
+    ): Plan {
+        val (data, accel) = packImu(imuSamples)
         return Plan.own(nativeGyroPlanCreate(
             inputWidth, inputHeight, timestampsUs, durationsUs, data, accel,
             lens.model.nativeValue, lens.calibWidth, lens.calibHeight, lens.fx, lens.fy, lens.cx, lens.cy, lens.k, lens.lensCorrectionAmount,
@@ -306,6 +311,13 @@ object StillFlow {
         object End : StreamResult()
     }
 
+    private fun streamResult(values: LongArray): StreamResult = when (values[0]) {
+        0L -> StreamResult.Ready(FramePlan.own(values[1]))
+        1L -> StreamResult.Pending
+        2L -> StreamResult.End
+        else -> error("Unexpected native stream status")
+    }
+
     class Stream @JvmOverloads constructor(
         video: Video, settings: Settings = Settings(), streaming: StreamSettings = StreamSettings(),
     ) : AutoCloseable {
@@ -315,19 +327,57 @@ object StillFlow {
             nativeStreamPush(it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, ptsUs, durationUs)
         }
         /** Ready plans are independently owned. Retain full input frames by their plan index. */
-        fun poll(): StreamResult = resource.access {
-            val values = nativeStreamReady(it)
-            when (values[0]) {
-                0L -> StreamResult.Ready(FramePlan.own(values[1]))
-                1L -> StreamResult.Pending
-                2L -> StreamResult.End
-                else -> error("Unexpected native stream status")
-            }
-        }
+        fun poll(): StreamResult = resource.access { streamResult(nativeStreamReady(it)) }
         /** Seals input. Continue polling until End; repeated finish calls are harmless. */
         fun finish() = resource.access { nativeStreamFinish(it) }
         /** Bounded native stage aggregates in JSON. */
         fun profile(): String = resource.access { nativeProfile(it) }
+        override fun close() = resource.close()
+    }
+
+    class GyroStream @JvmOverloads constructor(
+        inputWidth: Int, inputHeight: Int, lens: LensProfile,
+        settings: GyroSettings = GyroSettings(), streaming: StreamSettings = StreamSettings(),
+    ) : AutoCloseable {
+        private val resource = Resource(nativeGyroStreamCreate(
+            inputWidth, inputHeight,
+            lens.model.nativeValue, lens.calibWidth, lens.calibHeight, lens.fx, lens.fy, lens.cx, lens.cy, lens.k, lens.lensCorrectionAmount,
+            settings.smoothness, settings.perAxis, settings.smoothnessPitch, settings.smoothnessYaw, settings.smoothnessRoll,
+            settings.maxSmoothness, settings.alpha01s, settings.readoutMs, settings.readoutTopToBottom, settings.fov,
+            settings.maxZoom, settings.maxZoomIterations, settings.adaptiveZoomWindowS, settings.adaptiveZoom, settings.timeOffsetS,
+            settings.integrationMethod.nativeValue, settings.outputWidth, settings.outputHeight, settings.zoomEnvelope,
+            streaming.lookaheadSeconds, streaming.maxBufferedFrames, streaming.adaptiveTracking,
+        ), 5)
+
+        val outputWidth: Int
+        val outputHeight: Int
+
+        init {
+            try {
+                val size = resource.access { nativeGyroStreamOutputSize(it) }
+                outputWidth = size[0]
+                outputHeight = size[1]
+            } catch (error: Throwable) {
+                resource.close()
+                throw error
+            }
+        }
+
+        fun pushImu(samples: List<ImuSample>) = resource.access {
+            val (data, accel) = packImu(samples)
+            nativeGyroStreamPushImu(it, data, accel)
+        }
+
+        fun pushImu(sample: ImuSample) = resource.access {
+            nativeGyroStreamPushImu(it, doubleArrayOf(sample.timeSeconds, sample.wx, sample.wy, sample.wz,
+                sample.ax, sample.ay, sample.az), booleanArrayOf(sample.hasAccel))
+        }
+
+        /** On backpressure, drain ready plans and retry the same timestamp. */
+        fun tryPushFrame(ptsUs: Long, durationUs: Long): Boolean = resource.access { nativeGyroStreamPushFrame(it, ptsUs, durationUs) }
+        fun poll(): StreamResult = resource.access { streamResult(nativeGyroStreamReady(it)) }
+        fun finish() = resource.access { nativeGyroStreamFinish(it) }
+        fun profile(): String = resource.access { nativeGyroStreamProfile(it) }
         override fun close() = resource.close()
     }
 
@@ -374,6 +424,21 @@ object StillFlow {
         adaptiveZoomWindowS: Double, adaptiveZoom: Boolean, timeOffsetS: Double, integrationMethod: Int,
         outputWidth: Int, outputHeight: Int, zoomEnvelope: Boolean,
     ): Long
+    @JvmStatic private external fun nativeGyroStreamCreate(
+        width: Int, height: Int,
+        lensModel: Int, calibWidth: Int, calibHeight: Int, fx: Double, fy: Double, cx: Double, cy: Double,
+        distortion: DoubleArray, lensCorrectionAmount: Double, smoothness: Double, perAxis: Boolean,
+        smoothnessPitch: Double, smoothnessYaw: Double, smoothnessRoll: Double, maxSmoothness: Double, alpha01s: Double,
+        readoutMs: Double, readoutTopToBottom: Boolean, fov: Double, maxZoom: Double, maxZoomIterations: Int,
+        adaptiveZoomWindowS: Double, adaptiveZoom: Boolean, timeOffsetS: Double, integrationMethod: Int,
+        outputWidth: Int, outputHeight: Int, zoomEnvelope: Boolean, lookaheadSeconds: Double, maxBufferedFrames: Int, adaptiveTracking: Boolean,
+    ): Long
+    @JvmStatic private external fun nativeGyroStreamPushImu(handle: Long, imuData: DoubleArray, imuHasAccel: BooleanArray)
+    @JvmStatic private external fun nativeGyroStreamPushFrame(handle: Long, ptsUs: Long, durationUs: Long): Boolean
+    @JvmStatic private external fun nativeGyroStreamFinish(handle: Long)
+    @JvmStatic private external fun nativeGyroStreamReady(handle: Long): LongArray
+    @JvmStatic private external fun nativeGyroStreamOutputSize(handle: Long): IntArray
+    @JvmStatic private external fun nativeGyroStreamProfile(handle: Long): String
     @JvmStatic private external fun nativeFrameOutputSize(handle: Long): IntArray
     @JvmStatic private external fun nativeFrameGyroMap(handle: Long): DoubleArray
     @JvmStatic private external fun nativeDefaults(): DoubleArray
