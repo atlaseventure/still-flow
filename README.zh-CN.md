@@ -27,20 +27,22 @@ cmake --build --preset linux-gcc
 
 ### 陀螺仪防抖
 
-离线陀螺仪防抖在桌面端支持 CUDA 和 CPU，在 Android 上支持 GLES Surface 渲染、GLES 计算和 CPU。实时流式陀螺仪防抖请求返回 `SF_UNSUPPORTED`。
+离线和固定前视流式（`--mode realtime`）陀螺仪防抖均支持桌面端 CUDA、CPU，以及 Android 上的 GLES Surface 渲染、GLES 计算和 CPU。
 
 输入防抖配置 JSON，或提供 Gyroflow 项目及其配套的 `<stem>.imu_camera.csv`。桌面端的 `--backend auto` 优先使用 CUDA，无法使用时回退到 CPU。
 
 ```sh
 ./build/linux-gcc/stillflow input.mp4 auto.mp4 --gyro-config camera.gyroflow --backend auto
 ./build/linux-gcc/stillflow input.mp4 cpu.mp4 --gyro-config camera.gyroflow --backend cpu --decoder cpu --encoder openh264
+./build/linux-gcc/stillflow input.mp4 stream.mp4 --mode realtime --lookahead 1.35 --gyro-config camera.gyroflow
 ```
 
+- 流式处理时，`--lookahead` 设置前视秒数，`--buffer-frames` 限制缓存帧数。
 - 使用 `--imu PATH` 指定相机坐标系 IMU 数据，`--gyro-offset MS` 调整时间偏移，`--imu-integration auto|gyro|complementary` 选择积分方式。
 - 使用 `--output-size WxH`、`--fov FACTOR` 和 `--max-zoom RATIO` 调整构图，`--zoom-window SECONDS` 设置变焦窗口（0 为固定缩放）。
 - `--gyro-smooth` 和 `--lens-correction` 分别调整平滑强度和镜头校正量，取值均为 0 到 1。`--readout-ms MS` 设置滚动快门读出时间。
 
-核心 C API 通过 `sf_gyro_plan_create` 创建离线计划，通过 `sf_frame_plan_get_gyro_map` 读取逐帧映射。Android AAR 提供 `StillFlow.planGyro` 和 `GpuFrames.render`。
+核心 C API 通过 `sf_gyro_plan_create` 创建离线计划，或通过 `sf_gyro_stream_create` 创建流。使用 `sf_gyro_stream_push_imu` 和 `sf_gyro_stream_push_frame` 送入 IMU 样本和帧时间戳，通过 `sf_gyro_stream_take_ready` 取出就绪计划。推帧返回 `SF_AGAIN` 时先取出就绪计划，再重试同一时间戳。调用 `sf_gyro_stream_finish` 后继续取出计划，直到返回 `SF_END`。两种模式均通过 `sf_frame_plan_get_gyro_map` 读取逐帧映射。Android AAR 提供 `StillFlow.planGyro` 和 `StillFlow.GyroStream`。
 
 ## 核心 SDK
 

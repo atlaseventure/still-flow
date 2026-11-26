@@ -86,6 +86,36 @@ StillFlow.planGyro(width, height, timestampsUs, durationsUs, imuSamples, lens, s
 
 对于紧凑排列的像素帧，`StillFlow.Renderer` 支持使用 `StillFlow.Backend.GLES`（计算着色器）或 `StillFlow.Backend.CPU` 渲染陀螺仪帧计划。按帧计划的 `outputWidth × outputHeight` 和输入像素格式分配直接缓冲区，返回的 `StillFlow.Frame` 使用该输出尺寸。
 
+在 API 29 及以上版本，固定前视流式处理使用 `StillFlow.GyroStream`。将编码器 Surface 配置为流的 `outputWidth × outputHeight`。在同一工作线程上，`decodeFrames` 按显示顺序提供从零开始的微秒时间戳、帧时长和该帧的新 IMU 样本，并在回调返回时关闭图像。
+
+```kotlin
+StillFlow.GyroStream(width, height, lens, settings, streaming).use { stream ->
+    GpuFrames(width, height, streaming.maxBufferedFrames, encoderSurface,
+        outputWidth = stream.outputWidth, outputHeight = stream.outputHeight).use { gpu ->
+        val pending = ArrayDeque<GpuFrames.Frame>()
+        fun drain(): StillFlow.StreamResult {
+            while (true) {
+                val result = stream.poll()
+                if (result !is StillFlow.StreamResult.Ready) return result
+                result.plan.use { gpu.render(pending.removeFirst(), it.gyroMap(), it.info.ptsUs) }
+            }
+        }
+
+        decodeFrames { image, ptsUs, durationUs, imuBatch ->
+            stream.pushImu(imuBatch)
+            while (!stream.tryPushFrame(ptsUs, durationUs)) drain()
+            pending.addLast(gpu.captureTexture(image, bt709, fullRange))
+            drain()
+        }
+        stream.pushImu(remainingImu)
+        stream.finish()
+        check(drain() == StillFlow.StreamResult.End)
+    }
+}
+```
+
+`captureTexture` 将待渲染图像保留在 GPU 上，无需回读像素。`render` 按计划顺序消耗纹理并将其归还纹理池，池大小受 `maxBufferedFrames` 限制。关闭流前可调用 `profile()` 读取各阶段的累计耗时统计。
+
 ## 流式处理
 
 使用独立的 `StreamSettings` 创建 `StillFlow.Stream(video, settings, streaming)`，默认前视 1.35 秒。通过 `tryPush()` 推帧，按索引保留全分辨率帧，再调用 `poll()`。`Ready` 持有独立的 `FramePlan`，渲染或提取不可变 `WarpMap` 后关闭；`Pending` 表示需要更多输入。结束时调用 `finish()`，持续取出结果直到 `End`。被拒绝的输入未被消费，可先处理就绪结果再重试，或丢弃新到达的直播帧。

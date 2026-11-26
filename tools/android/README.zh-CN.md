@@ -31,7 +31,10 @@ uv run --locked --group video python scripts/android.py --help
 
 ```sh
 uv run --locked --group video python scripts/android.py input.mp4 --gyro-config camera.gyroflow --output-size 2704x1520 --verify-backends
+uv run --locked --group video python scripts/android.py input.mp4 --realtime --gyro-config camera.gyroflow --lookahead 1.35 --buffer-frames 120
 ```
+
+同时使用 `--realtime` 和 `--gyro-config` 可在一次解码中完成流式导出。帧在 GPU 纹理池中等待渲染到编码器 Surface，全程无需回读像素。`--lookahead` 设置前视秒数，`--buffer-frames` 限制缓存帧数，`--paced` 按源视频的显示时间戳送帧。
 
 - `--gyro-config PATH` 读取防抖配置 JSON 或 Gyroflow 项目。使用 `--imu PATH` 指定相机坐标系 IMU CSV，`--gyro-offset MS` 调整 IMU 时间偏移，`--imu-integration auto|gyro|complementary` 选择积分方式。
 - `--output-size WxH` 设置偶数输出宽高。`--fov FACTOR` 调整视场，`--max-zoom RATIO` 设置变焦上限，`--zoom-window SECONDS` 设置自适应变焦窗口（0 为固定缩放）。

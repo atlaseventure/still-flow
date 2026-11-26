@@ -86,6 +86,36 @@ StillFlow.planGyro(width, height, timestampsUs, durationsUs, imuSamples, lens, s
 
 For packed frames, `StillFlow.Renderer` accepts gyro frame plans with `StillFlow.Backend.GLES` (compute) or `StillFlow.Backend.CPU`. Size the direct destination buffer for the frame plan's `outputWidth × outputHeight` and the input pixel format. The returned `StillFlow.Frame` has those output dimensions.
 
+For fixed-lookahead streaming on API 29+, configure the encoder Surface for the `StillFlow.GyroStream` output dimensions. On one worker thread, the app's `decodeFrames` supplies each image in presentation order with its zero-based timestamp and duration in microseconds and its new IMU samples. It closes the image when the callback returns.
+
+```kotlin
+StillFlow.GyroStream(width, height, lens, settings, streaming).use { stream ->
+    GpuFrames(width, height, streaming.maxBufferedFrames, encoderSurface,
+        outputWidth = stream.outputWidth, outputHeight = stream.outputHeight).use { gpu ->
+        val pending = ArrayDeque<GpuFrames.Frame>()
+        fun drain(): StillFlow.StreamResult {
+            while (true) {
+                val result = stream.poll()
+                if (result !is StillFlow.StreamResult.Ready) return result
+                result.plan.use { gpu.render(pending.removeFirst(), it.gyroMap(), it.info.ptsUs) }
+            }
+        }
+
+        decodeFrames { image, ptsUs, durationUs, imuBatch ->
+            stream.pushImu(imuBatch)
+            while (!stream.tryPushFrame(ptsUs, durationUs)) drain()
+            pending.addLast(gpu.captureTexture(image, bt709, fullRange))
+            drain()
+        }
+        stream.pushImu(remainingImu)
+        stream.finish()
+        check(drain() == StillFlow.StreamResult.End)
+    }
+}
+```
+
+`captureTexture` keeps pending images on the GPU without pixel readback. Rendering in plan order returns textures to the pool, bounded by `maxBufferedFrames`. Call `profile()` before closing the stream to read cumulative stage timings.
+
 ## Streaming
 
 Create `StillFlow.Stream(video, settings, streaming)` with separate `StreamSettings`; lookahead defaults to 1.35 seconds. Push with `tryPush()`, retain full frames by index, and call `poll()`. A `Ready` result owns a `FramePlan`; close it after rendering or extracting an immutable `WarpMap`. `Pending` means more input is needed. End with `finish()` and drain until `End`. Rejected pushes consume nothing: drain and retry, or drop the incoming live frame.

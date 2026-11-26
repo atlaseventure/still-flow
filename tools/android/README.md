@@ -31,7 +31,10 @@ Offline gyro export plans from frame timestamps and IMU samples, then decodes th
 
 ```sh
 uv run --locked --group video python scripts/android.py input.mp4 --gyro-config camera.gyroflow --output-size 2704x1520 --verify-backends
+uv run --locked --group video python scripts/android.py input.mp4 --realtime --gyro-config camera.gyroflow --lookahead 1.35 --buffer-frames 120
 ```
+
+Combine `--realtime` and `--gyro-config` for single-pass streaming export. Frames stay in GPU textures until rendered to the encoder Surface, with zero pixel readback. `--lookahead` sets the lookahead in seconds, `--buffer-frames` caps retained frames, and `--paced` feeds frames at their source presentation times.
 
 - `--gyro-config PATH` loads a stabilization JSON or a Gyroflow project. Use `--imu PATH` to override the camera-frame IMU CSV, `--gyro-offset MS` to shift IMU time and `--imu-integration auto|gyro|complementary` to select integration.
 - `--output-size WxH` sets even output dimensions. Set the field of view with `--fov FACTOR`, the zoom limit with `--max-zoom RATIO` and the adaptive zoom window with `--zoom-window SECONDS` (0 for static zoom).
