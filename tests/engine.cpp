@@ -197,14 +197,15 @@ class TimestampWriter final : public VideoWriter {
 };
 class TimestampMedia final : public MediaFactory {
   public:
+    bool expect_gpu = false;
     void validate_output(const std::filesystem::path&) const override {}
     std::unique_ptr<VideoReader> reader(const std::filesystem::path&, int, const CodecRequest& request) override {
-        REQUIRE(request.prefer_hardware);
+        REQUIRE(request.prefer_hardware == expect_gpu);
         return std::make_unique<TimestampReader>();
     }
     std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double, VideoReader&,
                                         int64_t origin, const EncodingSettings&, const CodecRequest& request) override {
-        REQUIRE(request.prefer_hardware);
+        REQUIRE(request.prefer_hardware == expect_gpu);
         REQUIRE(size.width == 48);
         REQUIRE(size.height == 32);
         REQUIRE(origin == 120001);
@@ -228,6 +229,7 @@ class GyroRenderer final : public Renderer {
     size_t count_ = 0;
 };
 struct GyroFactory final : RendererFactory {
+    bool prefers_gpu(const std::string& backend) const override { return backend == "cuda"; }
     std::unique_ptr<Renderer> create(const std::string&) const override { return std::make_unique<GyroRenderer>(); }
 };
 struct GyroProgress final : Progress {
@@ -262,15 +264,16 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     options.realtime = true;
     REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
     options.realtime = false;
-    options.backend = "cpu";
-    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
-    options.backend = "auto";
-    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
-    options.backend = "cuda";
-    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
-    options.backend = "auto";
-    GyroFactory factory;
-    Services services{media, *images, factory, *outputs, *host, progress};
+    GyroFactory gpu;
+    RendererFactory* factory = cpu.get();
+    SECTION("Explicit CPU") { options.backend = "cpu"; }
+    SECTION("Automatic CPU") { options.backend = "auto"; }
+    SECTION("Automatic GPU") {
+        factory = &gpu;
+        options.backend = "auto";
+        media.expect_gpu = true;
+    }
+    Services services{media, *images, *factory, *outputs, *host, progress};
     options.compare = temp.path / "comparison";
     REQUIRE_THROWS_AS(stabilize(options, services), std::invalid_argument);
     REQUIRE(!std::filesystem::exists(options.output));
@@ -289,7 +292,7 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     REQUIRE(report["video"]["width"] == 64);
     REQUIRE(report["video"]["output_width"] == 48);
     REQUIRE(report["video"]["output_height"] == 32);
-    REQUIRE(report["gyro"]["invalid_frames"] == 1);
+    REQUIRE(report["gyro"]["invalid_frames"] == (media.expect_gpu ? 1 : 0));
     REQUIRE(report["trajectory"]["method"] == "gyro_quaternion_slerp");
     std::ifstream csv(frames_report_path(options));
     std::string line;
@@ -299,7 +302,7 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     REQUIRE(line.starts_with("0,0,0.030003,"));
     REQUIRE(std::getline(csv, line));
     REQUIRE(line.starts_with("1,0.030003,0.040006,"));
-    REQUIRE(line.ends_with(",0.25"));
+    REQUIRE(line.ends_with(media.expect_gpu ? ",0.25" : ",0"));
 }
 } // namespace
 #endif

@@ -1,5 +1,6 @@
 #ifdef STILLFLOW_TEST_DESKTOP
 #include "stillflow/desktop.h"
+#include "temp_directory.hpp"
 #endif
 #include "stillflow/stillflow.h"
 #include <array>
@@ -132,14 +133,17 @@ TEST_CASE("C ABI copies borrowed frames and validates YUV plane extents", "[c-ap
 #ifdef STILLFLOW_TEST_DESKTOP
 TEST_CASE("Desktop C API rejects unsupported gyro requests before opening input files", "[c-api][gyro]") {
     auto options = sf_file_options_default();
-    options.gyro.config = "stabilization.json";
+    stillflow::test::TempDirectory temp;
+    const auto missing = (temp.path / "stabilization.json").string();
+    options.gyro.config = missing.c_str();
     sf_run_summary summary{};
     sf_error error{};
-    for (const auto backend : {SF_BACKEND_CPU, SF_BACKEND_GLES}) {
-        options.backend = backend;
-        REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_UNSUPPORTED);
-        REQUIRE(std::string_view(error.message).find("CUDA") != std::string_view::npos);
-    }
+    options.backend = SF_BACKEND_GLES;
+    REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_UNSUPPORTED);
+    REQUIRE(std::string_view(error.message).find("GLES") != std::string_view::npos);
+    options.backend = SF_BACKEND_CPU;
+    REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_INTERNAL_ERROR);
+    REQUIRE(std::string_view(error.message).find("Cannot open gyro configuration") != std::string_view::npos);
     options.backend = SF_BACKEND_AUTO;
     options.mode = SF_FILE_STREAM;
     REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_UNSUPPORTED);

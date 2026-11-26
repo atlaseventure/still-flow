@@ -63,13 +63,8 @@ std::filesystem::path path(const char* text) {
     return text ? std::filesystem::path(reinterpret_cast<const char8_t*>(text)) : std::filesystem::path{};
 }
 stillflow::GyroInput gyro_options(const sf_file_options& options) {
-    if (options.backend == SF_BACKEND_CPU || options.backend == SF_BACKEND_GLES)
-        throw stillflow::NotImplementedError("Gyro stabilization is only implemented on the CUDA backend");
     if (options.mode == SF_FILE_STREAM)
         throw stillflow::NotImplementedError("Realtime streaming mode is not implemented for gyro stabilization");
-#ifndef STILLFLOW_C_CUDA
-    throw stillflow::NotImplementedError("Gyro stabilization requires CUDA support");
-#else
     const auto& value = options.gyro;
     auto gyro = stillflow::load_gyro_input(path(value.config), path(value.imu));
     auto& settings = gyro.settings;
@@ -104,7 +99,6 @@ stillflow::GyroInput gyro_options(const sf_file_options& options) {
     else if (value.integration != SF_IMU_AUTO)
         throw std::invalid_argument("Invalid IMU integration method");
     return gyro;
-#endif
 }
 } // namespace
 extern "C" {
@@ -160,14 +154,14 @@ sf_status sf_stabilize_file(const sf_file_options* value, const sf_file_callback
         options.scan_axis = scans[value->scan_axis];
         options.preset = value->preset;
         options.backend = stillflow::c_api::backend_name(value->backend);
-        if (value->gyro.config)
-            options.gyro = gyro_options(*value);
         if (value->backend == SF_BACKEND_GLES)
             throw stillflow::BackendError("GLES is unavailable in the desktop file adapter");
 #ifndef STILLFLOW_C_CUDA
         if (value->backend == SF_BACKEND_CUDA)
             throw stillflow::BackendError("CUDA is unavailable in this build");
 #endif
+        if (value->gyro.config)
+            options.gyro = gyro_options(*value);
         options.decoder = decoders[value->decoder];
         options.encoder = encoders[value->encoder];
         options.threads = value->threads;

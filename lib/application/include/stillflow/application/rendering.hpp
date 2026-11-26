@@ -52,7 +52,7 @@ class RenderBackend {
     // Renders a 3D lens + rolling-shutter map into map.output_size.
     // Returns the fraction of out-of-bounds pixels in [0, 1].
     virtual double warp_gyro(const GyroFrameMap& /*map*/) {
-        throw NotImplementedError("Gyro stabilization rendering is only implemented on the CUDA backend");
+        throw NotImplementedError("Gyro stabilization rendering is not implemented for this backend");
     }
     // Return a ready image whose storage survives subsequent backend calls.
     virtual Image download() = 0;
@@ -70,7 +70,7 @@ class Renderer {
                          Profile& profile) = 0;
     virtual Image render_gyro(const Image& /*input*/, const GyroFrameMap& /*map*/, double& /*invalid_fraction*/,
                               Profile& /*profile*/) {
-        throw NotImplementedError("Gyro stabilization rendering is only implemented on the CUDA backend");
+        throw NotImplementedError("Gyro stabilization rendering is not implemented for this backend");
     }
     virtual RenderingReport report() const = 0;
 };

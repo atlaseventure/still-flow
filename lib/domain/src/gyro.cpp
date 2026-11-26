@@ -333,7 +333,9 @@ bool project_ray(const GyroFrameMap& m, Point p, const Matrix3& a, const Matrix3
     if (!(z > min_z && finite(z)))
         return false;
     const Point d = distort_point(m.lens, {component(0) / z, component(1) / z});
-    src = {d.x * m.lens.fx + m.lens.cx, d.y * m.lens.fy + m.lens.cy};
+    // Keep exact sensor borders when an unchanged ray uses the same intrinsics.
+    src = {d.x == x && m.lens.fx == m.out_fx && m.lens.cx == m.out_cx ? p.x : d.x * m.lens.fx + m.lens.cx,
+           d.y == y && m.lens.fy == m.out_fy && m.lens.cy == m.out_cy ? p.y : d.y * m.lens.fy + m.lens.cy};
     return finite(src.x) && finite(src.y);
 }
 bool project(const GyroFrameMap& m, Point p, double margin, double min_z, Point& src) {

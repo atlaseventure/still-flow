@@ -447,8 +447,9 @@ RunSummary render_offline(const Options& options, Services& services, Clock::tim
     if (analysis.recovery_decoder)
         codecs.emplace_back("recovery_decoder", *analysis.recovery_decoder);
     {
-        const auto backends = renderer.report().backends;
-        const bool gpu = options.gyro.has_value() || (!backends.empty() && backends.back().gpu);
+        const auto backend = renderer.report();
+        const bool gpu =
+            !backend.backends.empty() ? backend.backends.back().gpu : services.renderers.prefers_gpu(backend.backend);
         auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         const CodecRequest encoder{options.encoder, gpu};
         const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
@@ -565,24 +566,16 @@ RunSummary render_offline(const Options& options, Services& services, Clock::tim
 
 RunSummary stabilize_gyro(const Options& options, const GyroInput& gyro, Services& services, Clock::time_point start) {
     Profile profile(now_ms);
-    std::unique_ptr<Renderer> renderer;
-    try {
-        renderer = services.renderers.create(options.backend);
-    } catch (const std::invalid_argument& error) {
-        // An explicit CUDA request can reach a factory with no registered CUDA provider.
-        throw NotImplementedError(std::string("Gyro stabilization requires CUDA: ") + error.what());
-    } catch (const BackendError& error) {
-        throw NotImplementedError(std::string("Gyro stabilization requires CUDA: ") + error.what());
-    }
+    auto renderer = services.renderers.create(options.backend);
     const auto backend = renderer->report();
-    if (backend.backend != "cuda")
-        throw NotImplementedError("Gyro stabilization requires the CUDA rendering backend");
+    const bool gpu =
+        !backend.backends.empty() ? backend.backends.back().gpu : services.renderers.prefers_gpu(backend.backend);
     services.progress.backend(backend);
     Analysis analysis;
     std::vector<double> times;
     {
         ScopeTimer timer(profile, "analysis.timestamps");
-        auto reader = services.media.reader(options.input, options.threads, {options.decoder, true});
+        auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu});
         analysis.info = reader->info();
         const auto& info = analysis.info;
         analysis.size = {info.width, info.height};
