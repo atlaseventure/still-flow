@@ -2,90 +2,37 @@
 
 [English](README.md) | 简体中文
 
-视频防抖与滚动快门校正，支持离线和固定前视流式处理，提供桌面 CLI、C/C++ SDK 和 Kotlin/Java Android AAR。支持 Linux amd64 与 Android arm64-v8a。
+Still Flow 仅凭视频画面即可完成防抖和滚动快门校正。离线和流式处理也都支持陀螺仪数据。
 
-## 构建与使用
+## Linux 命令行
 
-需要 Linux amd64、C++20 编译器、CMake、Ninja、Make、pkg-config、Python 和 Perl。依赖自动下载。
+在 Linux amd64 上使用支持 C++20 的 GCC 构建，需要 CMake、Ninja、Make、pkg-config、Python 和 Perl。首次构建会下载依赖。
 
 ```sh
 cmake --preset linux-gcc
 cmake --build --preset linux-gcc
 ./build/linux-gcc/stillflow input.mp4 output.mp4
-./build/linux-gcc/stillflow input.mp4 output.mp4 --compare comparison.mp4
-./build/linux-gcc/stillflow input.mp4 output.mp4 --mode realtime --lookahead 1.35
-./build/linux-gcc/stillflow --help
 ```
 
-输入须为逐行扫描、方形像素、偶数尺寸的 8 位 SDR 视频。
+- **输入输出。** 输入须为逐行扫描、方形像素、宽高均为偶数的 8 位 SDR 视频。输出为 H.264 编码的 MP4 或 MKV，保留帧时间戳。兼容音轨直接复制，其余转为 AAC。
+- **视觉防抖。** 默认离线处理并启用滚动快门校正。每个镜头内的裁剪窗口固定，默认每边最多裁剪 8%。收紧裁剪预算会降低校正强度。
+- **流式处理。** 添加 `--mode realtime` 即可单遍处理，默认前视 1.35 秒。
+- **陀螺仪输入。** 通过 `--gyro-config` 指定 `stabilization.json` 或 Gyroflow 项目。使用 `camera.gyroflow` 时，将 `camera.imu_camera.csv` 放在同一目录，或用 `--imu PATH` 指定相机坐标系下的 IMU 数据文件。
 
-- 默认离线处理；实时模式默认前视 1.35 秒。
-- `--backend auto` 优先使用 CUDA，失败时回退 CPU。使用 `--backend cpu --decoder cpu --encoder openh264` 启用软件处理。
-- 默认裁剪预算为每边 8%。`--crop-mode auto` 为每个镜头选择固定窗口，`fixed` 使用精确居中裁剪，`adaptive` 允许窗口缓慢移动。
-- 默认启用滚动快门校正；`--rs off` 关闭校正。
-- 输出保留帧时间戳。`--audio auto` 复制兼容音轨，其余转为 AAC；`--audio none` 移除音频。
+渲染优先使用 CUDA，无法使用时回退到 CPU。全程使用软件处理需指定 `--backend cpu --decoder cpu --encoder openh264`。
 
-### 陀螺仪防抖
+## SDK
 
-离线和固定前视流式（`--mode realtime`）陀螺仪防抖均支持桌面端 CUDA、CPU，以及 Android 上的 GLES Surface 渲染、GLES 计算和 CPU。
-
-输入防抖配置 JSON，或提供 Gyroflow 项目及其配套的 `<stem>.imu_camera.csv`。桌面端的 `--backend auto` 优先使用 CUDA，无法使用时回退到 CPU。
-
-```sh
-./build/linux-gcc/stillflow input.mp4 auto.mp4 --gyro-config camera.gyroflow --backend auto
-./build/linux-gcc/stillflow input.mp4 cpu.mp4 --gyro-config camera.gyroflow --backend cpu --decoder cpu --encoder openh264
-./build/linux-gcc/stillflow input.mp4 stream.mp4 --mode realtime --lookahead 1.35 --gyro-config camera.gyroflow
-```
-
-- 流式处理时，`--lookahead` 设置前视秒数，`--buffer-frames` 限制缓存帧数。
-- 使用 `--imu PATH` 指定相机坐标系 IMU 数据，`--gyro-offset MS` 调整时间偏移，`--imu-integration auto|gyro|complementary` 选择积分方式。
-- 使用 `--output-size WxH`、`--fov FACTOR` 和 `--max-zoom RATIO` 调整构图，`--zoom-window SECONDS` 设置变焦窗口（0 为固定缩放）。
-- `--gyro-smooth` 和 `--lens-correction` 分别调整平滑强度和镜头校正量，取值均为 0 到 1。`--readout-ms MS` 设置滚动快门读出时间。
-
-核心 C API 通过 `sf_gyro_plan_create` 创建离线计划，或通过 `sf_gyro_stream_create` 创建流。使用 `sf_gyro_stream_push_imu` 和 `sf_gyro_stream_push_frame` 送入 IMU 样本和帧时间戳，通过 `sf_gyro_stream_take_ready` 取出就绪计划。推帧返回 `SF_AGAIN` 时先取出就绪计划，再重试同一时间戳。调用 `sf_gyro_stream_finish` 后继续取出计划，直到返回 `SF_END`。两种模式均通过 `sf_frame_plan_get_gyro_map` 读取逐帧映射。Android AAR 提供 `StillFlow.planGyro` 和 `StillFlow.GyroStream`。
-
-## 核心 SDK
-
-构建、安装独立 SDK，或运行 C 内存帧示例：
+构建并安装独立的 C/C++ SDK 后，通过 `find_package(StillFlow CONFIG REQUIRED)` 引入。[C 示例](examples/memory)
 
 ```sh
 cmake --preset core
 cmake --build --preset core
-./build/core-sdk/examples/memory/stillflow_memory
 cmake --install build/core-sdk --prefix /path/to/sdk
 ```
 
-通过 `find_package(StillFlow CONFIG REQUIRED)` 引入 SDK。用法见 [C 示例](examples/memory)和 [API 头文件](api/c/include/stillflow)。
-
-## Android
-
-要求 Android API 26 及以上。构建 AAR 需要 JDK、Android SDK/NDK 和 CMake，并将 `ANDROID_HOME` 指向 SDK 目录：
-
-```sh
-./api/android/gradlew -p api/android assembleRelease
-```
-
-构建原生 SDK 时，将 `ANDROID_NDK_HOME` 指向 NDK 目录：
-
-```sh
-cmake --preset android-arm64
-cmake --build --preset android-arm64
-```
-
-应用接入见 [Android 集成](api/android/README.zh-CN.md)，设备视频处理见 [Android 视频运行器](tools/android/README.zh-CN.md)。
-
-## 测试与质量
-
-质量检查和合成视频生成需要 [uv](https://docs.astral.sh/uv/getting-started/installation/)，视频回归还需要 FFmpeg。测试前先构建对应预设。
-
-```sh
-ctest --preset linux-gcc
-uv run --locked --group quality python scripts/quality.py check --build-dir build/linux-gcc/app
-uv run --locked --group video python scripts/generate_video.py --output .local/synthetic --frames 60
-```
+Kotlin/Java AAR 支持 Android arm64-v8a，要求 API 26 及以上。[Android 集成](api/android/README.zh-CN.md) · [设备视频运行器](tools/android/README.zh-CN.md)
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 hiro。
-
-分发二进制时保留附带的依赖许可声明和对应源码。FFmpeg、NVIDIA 运行库等依赖各自遵循其许可条款。
+[MIT](LICENSE) © 2026 hiro。分发二进制时须保留随附的依赖许可声明和对应源码。

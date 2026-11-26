@@ -2,17 +2,17 @@
 
 [English](README.md) | 简体中文
 
-为 Kotlin 和 Java 应用提供视频防抖，支持 Android arm64，要求 API 26 及以上。
+Still Flow 为 Kotlin 和 Java 应用中的解码帧提供防抖，支持 Android arm64-v8a（API 26 及以上）。应用负责解码、输出编码和音频处理。
 
-## 构建与集成
+## 集成 AAR
 
-安装 JDK、Android SDK/NDK 和 CMake，将 `ANDROID_HOME` 指向 SDK 目录。在仓库根目录运行：
+安装 JDK、Android SDK/NDK 和 CMake，将 `ANDROID_HOME` 指向 SDK 目录，在仓库根目录构建。
 
 ```sh
 ./api/android/gradlew -p api/android assembleRelease
 ```
 
-将生成的 AAR 复制到应用的 `libs` 目录，并添加依赖：
+将 `stillflow-release.aar` 复制到应用的 `libs/` 目录，在应用的 Gradle 构建脚本中添加以下依赖。纯 Java 应用还需引入 Kotlin 标准库。
 
 ```kotlin
 dependencies {
@@ -20,106 +20,18 @@ dependencies {
 }
 ```
 
-应用需要 Kotlin 标准库，启用 Kotlin 的 Android 项目已包含该依赖。
+## 离线处理
 
-## 帧防抖
+按显示顺序送帧，时间戳须递增，帧时间戳和帧时长均以微秒计。视觉防抖使用 `StillFlow.Analyzer`。调用 `finish()` 前，对 `nextRecoveryFrame()` 请求的每一帧，用原始像素和时间戳调用 `recover()` 补送。处理视频文件时可按需重新解码。
 
-在工作线程执行处理。应用负责提供解码后的帧，以及输出编码和音频处理。渲染默认优先使用 GPU，失败时回退 CPU。
-
-以下离线示例中，`frames` 是全分辨率 RGBA8 格式的 `StillFlow.Frame` 列表，使用直接缓冲区并显式指定行跨度。显示时间戳须递增，时间戳和帧时长均以微秒为单位。`consume` 须在缓冲区复用前完成输出读取。
-
-```kotlin
-import io.stillflow.StillFlow
-import java.nio.ByteBuffer
-
-val video = StillFlow.Video(width, height, fps)
-val plan = StillFlow.Analyzer(video).use { analyzer ->
-    frames.forEachIndexed { index, frame ->
-        analyzer.push(frame, timestampsUs[index], durationsUs[index])
-    }
-    var request = analyzer.nextRecoveryFrame()
-    while (request != null) {
-        val index = request.index.toInt()
-        analyzer.recover(frames[index], timestampsUs[index])
-        request = analyzer.nextRecoveryFrame()
-    }
-    analyzer.finish()
-}
-plan.use {
-    StillFlow.Renderer().use { renderer ->
-        val output = ByteBuffer.allocateDirect(width * height * 4)
-        frames.forEachIndexed { index, frame ->
-            plan.frame(index.toLong()).use { framePlan ->
-                consume(renderer.render(framePlan, frame, output))
-            }
-        }
-    }
-}
-```
-
-调用 `finish()` 前，使用原始像素和时间戳补送全部请求的恢复帧。处理视频文件时可按需重新解码，避免将整个视频保存在内存中。
-
-## 陀螺仪防抖
-
-`StillFlow.planGyro` 接收输入尺寸、以微秒为单位的逐帧时间戳和时长、相机坐标系 IMU 样本、镜头配置和陀螺仪设置，返回标准离线计划 `StillFlow.Plan`。
-
-在 API 29 及以上版本，使用 `FramePlan.gyroMap()` 和 `GpuFrames` 将解码图像零拷贝渲染到编码器 Surface。编码器和 `GpuFrames` 使用计划的输出宽高，可独立于解码尺寸设置。示例中的 `nextDecodedImage()` 按显示顺序提供解码图像，`bt709` 和 `fullRange` 描述输入的色彩矩阵与范围。
-
-```kotlin
-val settings = StillFlow.GyroSettings().apply {
-    outputWidth = 2704
-    outputHeight = 1520
-}
-StillFlow.planGyro(width, height, timestampsUs, durationsUs, imuSamples, lens, settings).use { plan ->
-    GpuFrames(width, height, 2, encoderSurface,
-        outputWidth = settings.outputWidth, outputHeight = settings.outputHeight).use { gpu ->
-        timestampsUs.forEachIndexed { index, ptsUs ->
-            plan.frame(index.toLong()).use { frame ->
-                nextDecodedImage().use { image ->
-                    gpu.render(image, frame.gyroMap(), ptsUs - timestampsUs[0], bt709, fullRange)
-                }
-            }
-        }
-    }
-}
-```
-
-对于紧凑排列的像素帧，`StillFlow.Renderer` 支持使用 `StillFlow.Backend.GLES`（计算着色器）或 `StillFlow.Backend.CPU` 渲染陀螺仪帧计划。按帧计划的 `outputWidth × outputHeight` 和输入像素格式分配直接缓冲区，返回的 `StillFlow.Frame` 使用该输出尺寸。
-
-在 API 29 及以上版本，固定前视流式处理使用 `StillFlow.GyroStream`。将编码器 Surface 配置为流的 `outputWidth × outputHeight`。在同一工作线程上，`decodeFrames` 按显示顺序提供从零开始的微秒时间戳、帧时长和该帧的新 IMU 样本，并在回调返回时关闭图像。
-
-```kotlin
-StillFlow.GyroStream(width, height, lens, settings, streaming).use { stream ->
-    GpuFrames(width, height, streaming.maxBufferedFrames, encoderSurface,
-        outputWidth = stream.outputWidth, outputHeight = stream.outputHeight).use { gpu ->
-        val pending = ArrayDeque<GpuFrames.Frame>()
-        fun drain(): StillFlow.StreamResult {
-            while (true) {
-                val result = stream.poll()
-                if (result !is StillFlow.StreamResult.Ready) return result
-                result.plan.use { gpu.render(pending.removeFirst(), it.gyroMap(), it.info.ptsUs) }
-            }
-        }
-
-        decodeFrames { image, ptsUs, durationUs, imuBatch ->
-            stream.pushImu(imuBatch)
-            while (!stream.tryPushFrame(ptsUs, durationUs)) drain()
-            pending.addLast(gpu.captureTexture(image, bt709, fullRange))
-            drain()
-        }
-        stream.pushImu(remainingImu)
-        stream.finish()
-        check(drain() == StillFlow.StreamResult.End)
-    }
-}
-```
-
-`captureTexture` 将待渲染图像保留在 GPU 上，无需回读像素。`render` 按计划顺序消耗纹理并将其归还纹理池，池大小受 `maxBufferedFrames` 限制。关闭流前可调用 `profile()` 读取各阶段的累计耗时统计。
+陀螺仪防抖使用 `StillFlow.planGyro`，根据帧时间戳和时长、镜头配置及相机坐标系下的 IMU 样本生成计划。IMU 时间戳以**秒**计。渲染紧凑排列的像素帧时，按帧计划的输出宽高和输入像素格式为 `StillFlow.Renderer` 分配直接缓冲区，读取完输出后再复用。
 
 ## 流式处理
 
-使用独立的 `StreamSettings` 创建 `StillFlow.Stream(video, settings, streaming)`，默认前视 1.35 秒。通过 `tryPush()` 推帧，按索引保留全分辨率帧，再调用 `poll()`。`Ready` 持有独立的 `FramePlan`，渲染或提取不可变 `WarpMap` 后关闭；`Pending` 表示需要更多输入。结束时调用 `finish()`，持续取出结果直到 `End`。被拒绝的输入未被消费，可先处理就绪结果再重试，或丢弃新到达的直播帧。
+`StillFlow.Stream` 和 `StillFlow.GyroStream` 默认前视 1.35 秒。每个已接收帧的全分辨率图像都要保留到对应的帧计划就绪。
 
-计划和单帧计划在父对象关闭后仍有效。`FramePlan.map(width, height)` 用于 `GpuFrames` Surface 渲染。`StreamPlanner` 提供有界工作线程，返回带不可变映射的计划。使用 `configureThreads()` 时，在启动工作线程前设置进程级 OpenCV 线程数。
+- `tryPush()` 或 `tryPushFrame()` 返回 `false` 表示该帧尚未被接收。先调用 `poll()` 取出就绪计划，再重试同一帧。
+- 使用 `GyroStream` 时，通过 `pushImu()` 送入新增样本，在调用 `finish()` 前送完剩余样本。
+- 调用 `finish()` 后，继续取出结果并渲染剩余帧，直到收到 `End`。每个 `Ready` 结果持有独立的帧计划，渲染或提取映射后须关闭该计划。
 
-硬件视频输入输出用法见[视频运行器示例](../../tools/android/src/main/kotlin/io/stillflow/runner/ExportRunner.kt)。
+在 API 29 及以上版本，可在同一工作线程上使用 `GpuFrames` 渲染到编码器 Surface。陀螺仪帧计划使用 `gyroMap()`，编码器尺寸和 `GpuFrames` 输出尺寸均须与计划的输出宽高一致，可与解码尺寸不同。[MediaCodec 集成示例](../../tools/android/src/main/kotlin/io/stillflow/runner/ExportRunner.kt)
