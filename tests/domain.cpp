@@ -423,3 +423,291 @@ TEST_CASE("Gyro planner validates settings, sizes and timelines", "[domain][gyro
     s.smoothness = std::numeric_limits<double>::quiet_NaN();
     REQUIRE_THROWS_AS(validate_gyro_settings(s), std::invalid_argument);
 }
+
+TEST_CASE("Incremental IMU integration preserves batch orientation through pruning and duplicate samples",
+          "[domain][gyro][stream]") {
+    using namespace stillflow;
+    std::vector<ImuSample> imu;
+    for (int i = 0; i <= 180; ++i) {
+        const double t = i * 0.01;
+        imu.push_back({t, 0.3 * std::cos(t), -0.1, 0.5, -2 - t, -9, 1, i > 2});
+        if (i == 30)
+            imu.push_back({t, 1, 0, 0});
+    }
+    for (auto method : {ImuIntegrationMethod::gyro_only, ImuIntegrationMethod::complementary}) {
+        GyroSettings s;
+        s.integration_method = method;
+        s.time_offset_s = 0.007;
+        ImuIntegrator incremental(s);
+        const auto expected = integrate_imu(imu, s);
+        for (size_t i = 0; i < imu.size(); i += 3) {
+            const auto batch = std::span(imu).subspan(i, std::min(size_t{3}, imu.size() - i));
+            incremental.push(batch);
+            const double t = batch.back().time_s + s.time_offset_s;
+            if (t < 0.12) {
+                const auto prefix = integrate_imu(std::span(imu).first(i + batch.size()), s);
+                same_rotation(incremental.track().sample(0.022), prefix.sample(0.022));
+            } else {
+                const double cutoff = t - 0.065;
+                incremental.prune_before(cutoff);
+                REQUIRE(incremental.size() <= 8);
+                REQUIRE(incremental.track().samples.front().time_s <= cutoff);
+                for (double u : {cutoff, t - 0.033, t, t + 1})
+                    same_rotation(incremental.track().sample(u), expected.sample(std::min(t, u)));
+            }
+        }
+        incremental.prune_before(100);
+        REQUIRE(incremental.size() == 1);
+        same_rotation(incremental.track().sample(100), expected.sample(100));
+    }
+}
+
+TEST_CASE("Streaming gyro rejects invalid samples atomically and validates queue settings", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    GyroSettings s;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    s.integration_method = ImuIntegrationMethod::complementary;
+    ImuIntegrator integrator(s);
+    integrator.push(std::array{ImuSample{0, 1}});
+    for (ImuSample bad : {ImuSample{-1}, ImuSample{nan}, ImuSample{1, nan}, ImuSample{1, 0, 0, 0, nan, 0, 0, true}}) {
+        REQUIRE_THROWS_AS(integrator.push(std::array{ImuSample{0.5}, bad}), std::invalid_argument);
+        REQUIRE(integrator.size() == 1);
+    }
+    // A numerically unrepresentable rotation can fail after valid samples in the batch.
+    const double huge = std::numeric_limits<double>::max();
+    REQUIRE_THROWS_AS(integrator.push(std::array{ImuSample{0.05}, ImuSample{4, huge}}), std::invalid_argument);
+    REQUIRE(integrator.size() == 1);
+    integrator.push(std::array{ImuSample{0.2, 1}});
+    REQUIRE_THROWS_AS(integrator.push(std::array{ImuSample{0.4}, ImuSample{4, huge}}), std::invalid_argument);
+    REQUIRE(integrator.size() == 2);
+    same_rotation(integrator.track().sample(1), exp_so3(0.2, 0, 0));
+    const Size size{129, 73};
+    const auto lens = centered_lens(size);
+    for (GyroStreamConfig invalid : {GyroStreamConfig{nan, 2}, {-0.01, 2}, {10.1, 2}, {0, 1}, {0, 601}})
+        REQUIRE_THROWS_AS(GyroStreamPlanner(s, lens, size, invalid), std::invalid_argument);
+    REQUIRE_THROWS_AS(GyroStreamPlanner(s, {}, size), std::invalid_argument);
+    REQUIRE_THROWS_AS(GyroStreamPlanner(s, lens, {1, 73}), std::invalid_argument);
+    s.smoothness = nan;
+    REQUIRE_THROWS_AS(ImuIntegrator{s}, std::invalid_argument);
+    REQUIRE_THROWS_AS(GyroStreamPlanner(s, lens, size), std::invalid_argument);
+}
+
+TEST_CASE("A bounded streaming gyro window retains offline angular acceleration reduction", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    const Size size{129, 73};
+    const auto lens = centered_lens(size);
+    GyroSettings settings;
+    GyroStreamPlanner planner(settings, lens, size);
+    std::vector<ImuSample> imu;
+    std::vector<double> times;
+    std::vector<GyroFrameMap> streamed;
+    size_t peak_imu = 0;
+    for (int i = 0; i < 600; ++i) {
+        const double t = i / 30.0;
+        const size_t first = imu.size();
+        while (double(imu.size()) / 200 <= t) {
+            const double u = double(imu.size()) / 200;
+            const double x = (u - 8) / 0.12;
+            imu.push_back({u, 0.45 * std::cos(31 * u), 0.12 + 0.55 * std::cos(25 * u), -1.5 * x * std::exp(-x * x)});
+        }
+        planner.push_imu(std::span(imu).subspan(first));
+        peak_imu = std::max(peak_imu, planner.imu_buffered());
+        REQUIRE(planner.push_frame(t));
+        times.push_back(t);
+        GyroFrameMap map;
+        while (planner.take_ready(map))
+            streamed.push_back(std::move(map));
+    }
+    planner.finish();
+    GyroFrameMap map;
+    while (planner.take_ready(map))
+        streamed.push_back(std::move(map));
+    REQUIRE(peak_imu < 1600);
+    REQUIRE(streamed.size() == times.size());
+    const auto raw = integrate_imu(imu, settings);
+    const auto offline = plan_gyro_frames(times, raw, lens, size, settings);
+    std::array<double, 3> energy{};
+    std::array<std::array<double, 3>, 3> previous_velocity{};
+    for (size_t i = 0; i < times.size(); ++i) {
+        require_containment(streamed[i]);
+        REQUIRE(streamed[i].zoom_ratio <= settings.max_zoom + 1e-12);
+        same_rotation(streamed[i].raw_orientation, raw.sample(times[i]));
+        if (i == 0)
+            continue;
+        const std::array before{offline[i - 1].raw_orientation, offline[i - 1].smooth_orientation,
+                                streamed[i - 1].smooth_orientation};
+        const std::array after{offline[i].raw_orientation, offline[i].smooth_orientation,
+                               streamed[i].smooth_orientation};
+        for (size_t path = 0; path < energy.size(); ++path) {
+            const auto delta = log_so3(multiply(conjugate(before[path]), after[path]));
+            for (size_t axis = 0; axis < 3; ++axis) {
+                const double velocity = 30 * delta[axis];
+                if (i >= 2)
+                    energy[path] += std::pow(30 * (velocity - previous_velocity[path][axis]), 2);
+                previous_velocity[path][axis] = velocity;
+            }
+        }
+    }
+    const double offline_reduction = 1 - std::sqrt(energy[1] / energy[0]);
+    const double stream_reduction = 1 - std::sqrt(energy[2] / energy[0]);
+    CAPTURE(offline_reduction, stream_reduction, peak_imu);
+    REQUIRE(offline_reduction > 0.5);
+    REQUIRE(stream_reduction >= 0.85 * offline_reduction);
+}
+
+TEST_CASE("Streaming zoom anticipates an impulse and releases the crop smoothly", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    const Size size{161, 91};
+    GyroSettings s;
+    s.max_zoom = 1.14;
+    s.adaptive_zoom_window_s = 0.6;
+    for (bool adaptive : {true, false}) {
+        s.adaptive_zoom = adaptive;
+        GyroStreamPlanner planner(s, centered_lens(size), size);
+        std::vector<GyroFrameMap> maps;
+        for (int i = 0; i <= 240; ++i) {
+            const double t = i / 30.0, x = (t - 4) / 0.18;
+            planner.push_imu(std::array{ImuSample{t, 0, 0, -7 * x * std::exp(-x * x)}});
+            REQUIRE(planner.push_frame(t));
+            GyroFrameMap map;
+            if (planner.take_ready(map))
+                maps.push_back(std::move(map));
+        }
+        planner.finish();
+        GyroFrameMap tail;
+        while (planner.take_ready(tail))
+            maps.push_back(std::move(tail));
+        REQUIRE(maps.size() == 241);
+        REQUIRE(maps[111].zoom_ratio > maps.front().zoom_ratio + 0.025);
+        REQUIRE(maps[120].smooth_factor < 0.95);
+        REQUIRE(maps[120].zoom_ratio > 1.12);
+        for (size_t i = 0; i < maps.size(); ++i) {
+            require_containment(maps[i]);
+            REQUIRE(maps[i].zoom_ratio <= s.max_zoom + 1e-12);
+            if (i > 0) {
+                if (adaptive)
+                    REQUIRE(maps[i].fov_scale - maps[i - 1].fov_scale < 0.01);
+                else
+                    REQUIRE(maps[i].fov_scale <= maps[i - 1].fov_scale);
+            }
+        }
+        if (adaptive)
+            REQUIRE(maps.back().zoom_ratio < maps[120].zoom_ratio - 0.1);
+    }
+}
+
+TEST_CASE("Gyro stream emits by lookahead or capacity and preserves physical row readout", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    const Size size{129, 73};
+    for (bool down : {true, false}) {
+        GyroSettings s;
+        s.smoothness = 0;
+        s.readout_ms = 15;
+        s.readout_top_to_bottom = down;
+        for (double lag : {0.0, 1.35}) {
+            GyroStreamPlanner planner(s, centered_lens(size), size, {lag, 4});
+            GyroFrameMap map;
+            int emitted = 0;
+            const auto check = [&] {
+                same_rotation(map.raw_orientation, exp_so3(0, emitted * 0.05, 0));
+                if (emitted > 0 && emitted < 19) {
+                    REQUIRE(map.sensor_rows);
+                    REQUIRE(map.row_rotations.size() == 64);
+                    REQUIRE(map.row_rotations.front()(0, 2) == Catch::Approx(std::sin((down ? 1 : -1) * 0.0075)));
+                }
+                require_containment(map);
+                REQUIRE(map.zoom_ratio <= s.max_zoom + 1e-12);
+                ++emitted;
+            };
+            for (int i = 0; i < 20; ++i) {
+                const double time = i * 0.05;
+                planner.push_imu(std::array{ImuSample{time, 0, 1}, ImuSample{time + 0.0075, 0, 1}});
+                REQUIRE(planner.push_frame(i * 0.05));
+                const bool ready = planner.buffered() >= (lag == 0 ? 2 : 4);
+                double ahead = -1;
+                REQUIRE(planner.take_ready(map, &ahead) == ready);
+                if (ready) {
+                    REQUIRE(ahead == Catch::Approx(lag == 0 ? 0.05 : 0.15));
+                    check();
+                }
+            }
+            planner.finish();
+            while (planner.take_ready(map))
+                check();
+            REQUIRE(emitted == 20);
+        }
+    }
+}
+
+TEST_CASE("Streaming fisheye maps depend only on IMU and frames inside the lookahead", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    const Size size{161, 121};
+    auto lens = centered_lens(size);
+    lens.model = LensModel::opencv_fisheye;
+    lens.fx = 86;
+    lens.fy = 91;
+    lens.k = {-0.05, 0.006, 0, 0};
+    GyroSettings settings;
+    settings.per_axis = true;
+    settings.readout_ms = 15;
+    settings.output_size = {151, 85};
+    const GyroStreamConfig config{0.295, 64};
+    GyroStreamPlanner eager(settings, lens, size, config), paced(settings, lens, size, config);
+    std::vector<ImuSample> imu;
+    for (int i = 0; i < 300; ++i) {
+        const double t = i * 0.011;
+        imu.push_back({t, std::cos(t * 19), 0.25, std::sin(t * 27)});
+    }
+    eager.push_imu(imu);
+    for (int i = 0; i < 60; ++i)
+        REQUIRE(eager.push_frame(i * 0.05));
+    size_t next = 0;
+    for (int i = 0; i < 45; ++i) {
+        REQUIRE(paced.push_frame(i * 0.05));
+        if (i < 6)
+            continue;
+        const double time = (i - 6) * 0.05;
+        const size_t first = next;
+        while (next < imu.size() && imu[next].time_s <= time + config.lookahead_seconds + 0.0075)
+            ++next;
+        paced.push_imu(std::span(imu).subspan(first, next - first));
+        GyroFrameMap a, b;
+        REQUIRE(eager.take_ready(a));
+        REQUIRE(paced.take_ready(b));
+        same_rotation(a.raw_orientation, b.raw_orientation);
+        same_rotation(a.smooth_orientation, b.smooth_orientation);
+        REQUIRE(a.fov_scale == b.fov_scale);
+        REQUIRE(a.zoom_ratio <= settings.max_zoom + 1e-12);
+        REQUIRE(a.row_rotations.size() == 64);
+        for (size_t j = 0; j < a.row_rotations.size(); ++j)
+            REQUIRE(a.row_rotations[j].values == b.row_rotations[j].values);
+        for (int y = 0; y < a.output_size.height; ++y) {
+            for (int x = 0; x < a.output_size.width; ++x) {
+                if (x > 0 && x + 1 < a.output_size.width && y > 0 && y + 1 < a.output_size.height)
+                    continue;
+                Point src;
+                REQUIRE(project_output_to_input(a, {double(x), double(y)}, src));
+                REQUIRE(src.x >= 0.5);
+                REQUIRE(src.y >= 0.5);
+                REQUIRE(src.x <= size.width - 1.5);
+                REQUIRE(src.y <= size.height - 1.5);
+            }
+        }
+    }
+}
+
+TEST_CASE("An infeasible gyro zoom budget leaves the pending frame intact", "[domain][gyro][stream]") {
+    using namespace stillflow;
+    GyroSettings settings;
+    settings.max_zoom = 1;
+    const Size size{129, 73};
+    GyroStreamPlanner planner(settings, centered_lens(size), size, {0, 2});
+    REQUIRE(planner.push_frame(1));
+    REQUIRE_THROWS_AS(planner.push_frame(1), std::invalid_argument);
+    REQUIRE_THROWS_AS(planner.push_frame(std::numeric_limits<double>::infinity()), std::invalid_argument);
+    REQUIRE(planner.push_frame(2));
+    REQUIRE(!planner.push_frame(3));
+    GyroFrameMap map;
+    REQUIRE_THROWS_AS(planner.take_ready(map), std::domain_error);
+    REQUIRE(planner.buffered() == 2);
+}

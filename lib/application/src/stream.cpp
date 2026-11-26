@@ -1,6 +1,8 @@
 #include "stillflow/application/stream.hpp"
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <optional>
 
 namespace stillflow {
 
@@ -307,5 +309,63 @@ void StreamAnalyzer::consume_ready() {
         base_ += count;
         next_ -= count;
     }
+}
+
+GyroStream::GyroStream(GyroSettings settings, LensProfile lens, StreamSettings stream, Size input_size,
+                       ExecutionSettings execution)
+    : planner_(settings, lens, input_size, {stream.lookahead_seconds, stream.max_buffered_frames}),
+      execution_(execution) {}
+
+void GyroStream::push_imu(std::span<const ImuSample> samples) {
+    execution_.check();
+    planner_.push_imu(samples);
+}
+
+bool GyroStream::push_frame(int64_t pts_us, int64_t duration_us) {
+    execution_.check();
+    if (finished_)
+        throw std::logic_error("Stream is already finished");
+    if (duration_us < 0 || (!frames_.empty() && pts_us <= frames_.back().pts_us))
+        throw std::invalid_argument("Stream timestamps must increase and durations must be nonnegative");
+    if (full())
+        return false;
+    if (frames_.empty())
+        origin_us_ = pts_us;
+    else if (frames_.back().pts_us < 0 && pts_us > std::numeric_limits<int64_t>::max() + frames_.back().pts_us)
+        throw std::invalid_argument("Frame duration exceeds timestamp range");
+
+    const double seconds = static_cast<double>((static_cast<long double>(pts_us) - origin_us_) / 1000000);
+    auto* previous = frames_.empty() ? nullptr : &frames_.back();
+    frames_.push_back({pts_us, duration_us});
+    try {
+        planner_.push_frame(seconds);
+    } catch (...) {
+        frames_.pop_back();
+        throw;
+    }
+    if (previous)
+        previous->duration_us = pts_us - previous->pts_us;
+    return true;
+}
+
+bool GyroStream::take_ready(ReadyGyroFrame& output, Profile* profile) {
+    execution_.check();
+    std::optional<ScopeTimer> timer;
+    if (profile)
+        timer.emplace(*profile, "plan.gyro_stream");
+    GyroFrameMap map;
+    double ahead = 0;
+    if (!planner_.take_ready(map, &ahead))
+        return false;
+    const auto frame = frames_.front();
+    output = {emitted_++, frame.pts_us, frame.duration_us, std::move(map), ahead};
+    frames_.pop_front();
+    return true;
+}
+
+void GyroStream::finish(Profile*) {
+    execution_.check();
+    planner_.finish();
+    finished_ = true;
 }
 } // namespace stillflow

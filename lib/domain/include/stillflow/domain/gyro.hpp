@@ -1,5 +1,7 @@
 #pragma once
 #include "stillflow/domain/geometry.hpp"
+#include <deque>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -66,6 +68,21 @@ OrientationTrack integrate_imu(std::span<const ImuSample> samples, const GyroSet
 OrientationTrack smooth_orientations(const OrientationTrack& raw, const GyroSettings& settings,
                                      std::span<const double> local_smoothness = {});
 
+class ImuIntegrator {
+  public:
+    explicit ImuIntegrator(GyroSettings settings);
+    void push(std::span<const ImuSample> samples);
+    void prune_before(double time_s);
+    const OrientationTrack& track() const { return track_; }
+    size_t size() const { return track_.samples.size(); }
+
+  private:
+    GyroSettings settings_;
+    OrientationTrack track_;
+    std::optional<ImuSample> previous_;
+    std::vector<ImuSample> initial_samples_;
+};
+
 struct GyroFrameMap {
     Size input_size{}, output_size{};
     LensProfile lens;
@@ -80,4 +97,34 @@ bool project_output_to_input(const GyroFrameMap& map, Point output_px, Point& in
 // Throws std::domain_error when the zoom limit and sensor margin are incompatible.
 std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> frame_times_s, const OrientationTrack& raw,
                                            const LensProfile& lens, Size input_size, const GyroSettings& settings);
+
+struct GyroStreamConfig {
+    double lookahead_seconds = 1.35;
+    size_t max_buffered_frames = 120;
+};
+// IMU timestamps (after time_offset_s) and frame timestamps share a time base.
+// Supply IMU through the preview and row readout before draining ready frames.
+class GyroStreamPlanner {
+  public:
+    GyroStreamPlanner(GyroSettings settings, LensProfile lens, Size input_size, GyroStreamConfig stream = {});
+    Size output_size() const { return identity_.output_size; }
+    void push_imu(std::span<const ImuSample> samples);
+    bool push_frame(double time_s);
+    void finish();
+    bool take_ready(GyroFrameMap& out, double* lookahead_seconds = nullptr);
+    size_t buffered() const { return pending_times_.size(); }
+    bool full() const { return buffered() >= stream_.max_buffered_frames; }
+    size_t imu_buffered() const { return integrator_.size(); }
+
+  private:
+    GyroSettings settings_;
+    GyroStreamConfig stream_;
+    ImuIntegrator integrator_;
+    GyroFrameMap identity_;
+    double dim_, readout_, output_limit_, identity_scale_, min_scale_, velocity_scale_;
+    std::deque<double> pending_times_;
+    std::array<double, 3> running_peak_{};
+    double prev_time_ = 0, prev_scale_ = 1, prev_retained_ = 1;
+    bool has_prev_ = false, finished_ = false;
+};
 } // namespace stillflow

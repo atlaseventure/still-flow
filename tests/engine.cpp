@@ -306,3 +306,58 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
 }
 } // namespace
 #endif
+
+TEST_CASE("Gyro stream retries full queues and returns exact variable frame timing", "[engine][gyro][stream]") {
+    using namespace stillflow;
+    const Size size{129, 73};
+    LensProfile lens{.fx = 100, .fy = 100, .cx = 64, .cy = 36};
+    GyroSettings gyro;
+    gyro.output_size = {97, 55};
+    Token token;
+    GyroStream stream(gyro, lens, {1.35, 3}, size, {&token});
+    double clock = 0;
+    Profile profile([&clock] { return ++clock; });
+    const int64_t start = (int64_t{1} << 55) + 1;
+    const std::array<int64_t, 5> pts{start, start + 17003, start + 56000, start + 83001, start + 153008};
+    ReadyGyroFrame frame;
+    REQUIRE(stream.output_size().width == 97);
+    REQUIRE(stream.output_size().height == 55);
+    for (int64_t timestamp : pts)
+        stream.push_imu(std::array{ImuSample{(timestamp - start) / 1e6, 0, 0.2}});
+    REQUIRE(stream.imu_buffered() == pts.size());
+    for (size_t i = 0; i < 3; ++i)
+        REQUIRE(stream.push_frame(pts[i], 999));
+    REQUIRE(stream.full());
+    REQUIRE_FALSE(stream.push_frame(pts[3], 888));
+    REQUIRE(stream.buffered() == 3);
+    REQUIRE_THROWS_AS(stream.push_frame(pts[2], 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(stream.push_frame(pts[3], -1), std::invalid_argument);
+
+    token.stop = true;
+    REQUIRE_THROWS_AS(stream.push_imu({}), Cancelled);
+    REQUIRE_THROWS_AS(stream.push_frame(pts[3], 1), Cancelled);
+    REQUIRE_THROWS_AS(stream.take_ready(frame, &profile), Cancelled);
+    REQUIRE_THROWS_AS(stream.finish(), Cancelled);
+    token.stop = false;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (i == 3)
+            stream.finish(&profile);
+        REQUIRE(stream.take_ready(frame, &profile));
+        REQUIRE(frame.index == i);
+        REQUIRE(frame.pts_us == pts[i]);
+        REQUIRE(frame.duration_us == (i + 1 < pts.size() ? pts[i + 1] - pts[i] : 999));
+        REQUIRE(frame.lookahead_seconds == Catch::Approx((pts[std::min(i + 2, pts.size() - 1)] - pts[i]) / 1e6));
+        REQUIRE(frame.map.raw_orientation.y == Catch::Approx(std::sin((pts[i] - start) / 1e6 * 0.1)).margin(1e-10));
+        if (i + 3 < pts.size()) {
+            REQUIRE_FALSE(stream.take_ready(frame));
+            REQUIRE(stream.push_frame(pts[i + 3], 999));
+        }
+    }
+    REQUIRE(profile.stages().at("plan.gyro_stream").count == pts.size());
+    REQUIRE(profile.stages().at("plan.gyro_stream").total == pts.size());
+    REQUIRE_FALSE(stream.take_ready(frame));
+    REQUIRE(stream.buffered() == 0);
+    REQUIRE_THROWS_AS(stream.finish(), std::logic_error);
+    REQUIRE_THROWS_AS(stream.push_frame(pts.back() + 1, 0), std::logic_error);
+    REQUIRE_THROWS_AS(stream.push_imu({}), std::logic_error);
+}

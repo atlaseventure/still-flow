@@ -1,5 +1,6 @@
 #pragma once
 #include "stillflow/application/engine.hpp"
+#include "stillflow/domain/gyro.hpp"
 #include <atomic>
 #include <deque>
 #include <future>
@@ -66,5 +67,37 @@ class StreamAnalyzer {
     void settle_recovery(Profile& profile);
     void recover_pending(Profile& profile, bool flush);
     void consume_ready();
+};
+
+struct ReadyGyroFrame {
+    size_t index = 0;
+    int64_t pts_us = 0, duration_us = 0;
+    GyroFrameMap map;
+    double lookahead_seconds = 0;
+};
+
+class GyroStream {
+  public:
+    GyroStream(GyroSettings settings, LensProfile lens, StreamSettings stream, Size input_size,
+               ExecutionSettings execution = {});
+    void push_imu(std::span<const ImuSample> samples);
+    bool push_frame(int64_t pts_us, int64_t duration_us);
+    bool take_ready(ReadyGyroFrame& output, Profile* profile = nullptr);
+    void finish(Profile* profile = nullptr);
+    Size output_size() const { return planner_.output_size(); }
+    size_t buffered() const { return frames_.size(); }
+    bool full() const { return planner_.full(); }
+    size_t imu_buffered() const { return planner_.imu_buffered(); }
+
+  private:
+    struct Frame {
+        int64_t pts_us, duration_us;
+    };
+    GyroStreamPlanner planner_;
+    ExecutionSettings execution_;
+    std::deque<Frame> frames_;
+    int64_t origin_us_ = 0;
+    size_t emitted_ = 0;
+    bool finished_ = false;
 };
 } // namespace stillflow

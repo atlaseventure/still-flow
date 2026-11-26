@@ -177,26 +177,23 @@ Quaternion initial_tilt(std::span<const ImuSample> samples) {
     }
     return sum.norm() > 1e-8 ? level({}, sum.normalized(), 1) : Quaternion{};
 }
-} // namespace
-OrientationTrack integrate_imu(std::span<const ImuSample> samples, const GyroSettings& settings) {
-    validate_gyro_settings(settings);
-    OrientationTrack track;
-    const bool complementary = settings.integration_method == ImuIntegrationMethod::complementary;
-    for (size_t i = 0; i < samples.size(); ++i) {
-        const auto& s = samples[i];
-        if (!finite(s.time_s + settings.time_offset_s) || (i && s.time_s < samples[i - 1].time_s) || !finite(s.wx) ||
+void validate_samples(std::span<const ImuSample> samples, const GyroSettings& settings, const ImuSample* previous) {
+    for (const auto& s : samples) {
+        if (!finite(s.time_s + settings.time_offset_s) || (previous && s.time_s < previous->time_s) || !finite(s.wx) ||
             !finite(s.wy) || !finite(s.wz) ||
-            (complementary && s.has_accel && (!finite(s.ax) || !finite(s.ay) || !finite(s.az))))
+            (settings.integration_method == ImuIntegrationMethod::complementary && s.has_accel &&
+             (!finite(s.ax) || !finite(s.ay) || !finite(s.az))))
             throw std::invalid_argument("Invalid IMU sample");
+        previous = &s;
     }
-    Quaternion q = complementary ? initial_tilt(samples) : Quaternion{};
-    track.samples.reserve(samples.size());
-    for (size_t i = 0; i < samples.size(); ++i) {
-        const auto& s = samples[i];
-        if (i) {
-            const double dt = s.time_s - samples[i - 1].time_s;
-            q = normalize(multiply(q, gyro_step(samples[i - 1], s, dt)));
-            if (complementary) {
+}
+void append_imu(OrientationTrack& track, std::span<const ImuSample> samples, const GyroSettings& settings,
+                const ImuSample* previous, Quaternion q) {
+    for (const auto& s : samples) {
+        if (previous) {
+            const double dt = s.time_s - previous->time_s;
+            q = normalize(multiply(q, gyro_step(*previous, s, dt)));
+            if (settings.integration_method == ImuIntegrationMethod::complementary) {
                 const Vec up = up_measurement(s);
                 if (!up.isZero())
                     q = level(q, up, -std::expm1(-dt / 3));
@@ -207,8 +204,71 @@ OrientationTrack integrate_imu(std::span<const ImuSample> samples, const GyroSet
             track.samples.back().q = q;
         else
             track.samples.push_back({t, q});
+        previous = &s;
     }
+}
+} // namespace
+OrientationTrack integrate_imu(std::span<const ImuSample> samples, const GyroSettings& settings) {
+    validate_gyro_settings(settings);
+    validate_samples(samples, settings, nullptr);
+    OrientationTrack track;
+    track.samples.reserve(samples.size());
+    const auto tilt =
+        settings.integration_method == ImuIntegrationMethod::complementary ? initial_tilt(samples) : Quaternion{};
+    append_imu(track, samples, settings, nullptr, tilt);
     return track;
+}
+
+ImuIntegrator::ImuIntegrator(GyroSettings settings) : settings_(settings) { validate_gyro_settings(settings_); }
+void ImuIntegrator::push(std::span<const ImuSample> samples) {
+    if (samples.empty())
+        return;
+    validate_samples(samples, settings_, previous_ ? &*previous_ : nullptr);
+    if (settings_.integration_method == ImuIntegrationMethod::complementary &&
+        (!previous_ || !initial_samples_.empty())) {
+        const double start = initial_samples_.empty() ? samples.front().time_s : initial_samples_.front().time_s;
+        const auto end =
+            std::ranges::partition_point(samples, [start](const auto& s) { return s.time_s - start <= 0.1; });
+        if (end != samples.begin()) {
+            // Only the initial tilt depends on later measurements. Rebuild this
+            // short prefix before committing the new orientation history.
+            const auto old_count = initial_samples_.size();
+            initial_samples_.insert(initial_samples_.end(), samples.begin(), end);
+            OrientationTrack updated;
+            try {
+                append_imu(updated, initial_samples_, settings_, nullptr, initial_tilt(initial_samples_));
+                append_imu(updated, {end, samples.end()}, settings_, &initial_samples_.back(),
+                           updated.samples.back().q);
+            } catch (...) {
+                initial_samples_.resize(old_count);
+                throw;
+            }
+            if (end != samples.end())
+                initial_samples_.clear();
+            track_ = std::move(updated);
+            previous_ = samples.back();
+            return;
+        }
+    }
+    const auto old_count = size();
+    const auto q = previous_ ? track_.samples.back().q : Quaternion{};
+    try {
+        append_imu(track_, samples, settings_, previous_ ? &*previous_ : nullptr, q);
+    } catch (...) {
+        track_.samples.resize(old_count);
+        if (old_count)
+            track_.samples.back().q = q;
+        throw;
+    }
+    initial_samples_.clear();
+    previous_ = samples.back();
+}
+void ImuIntegrator::prune_before(double time_s) {
+    // Once a frame uses the initial tilt its history must stay fixed.
+    initial_samples_.clear();
+    const auto after = std::ranges::upper_bound(track_.samples, time_s, {}, &OrientationSample::time_s);
+    if (after != track_.samples.begin())
+        track_.samples.erase(track_.samples.begin(), std::prev(after));
 }
 namespace {
 double track_value(const OrientationTrack& raw, std::span<const double> values, double t) {
@@ -247,7 +307,7 @@ std::vector<Vec> angular_speeds(const OrientationTrack& raw, bool per_axis) {
     return speed;
 }
 OrientationTrack smooth_track(const OrientationTrack& raw, const GyroSettings& s, std::span<const double> local,
-                              double velocity_scale) {
+                              double velocity_scale, Vec* decayed_peak = nullptr) {
     validate_gyro_settings(s);
     const auto n = raw.samples.size();
     if (!local.empty() && (local.size() != n || !std::ranges::all_of(local, unit_interval)))
@@ -291,6 +351,10 @@ OrientationTrack smooth_track(const OrientationTrack& raw, const GyroSettings& s
                 const Eigen::Map<const Vec> angle(d.data());
                 adaptation[i] = s.per_axis ? Vec(angle.cwiseAbs()) : Vec::Constant(angle.norm());
                 peak = peak.cwiseMax(adaptation[i]);
+            }
+            if (decayed_peak) {
+                peak = peak.cwiseMax(*decayed_peak);
+                *decayed_peak = peak;
             }
             for (auto& distance : adaptation) {
                 distance = distance.cwiseQuotient(peak.cwiseMax(1e-12));
@@ -362,6 +426,7 @@ bool project(const GyroFrameMap& m, Point p, double margin, double min_z, Point&
 struct FrameGeometry {
     const OrientationTrack& raw;
     double time, base_fx, base_fy, signed_readout, identity_scale;
+    size_t row_knots = 64;
 
     void set_scale(GyroFrameMap& map, double scale) const {
         map.fov_scale = scale;
@@ -380,33 +445,66 @@ struct FrameGeometry {
             map.row_rotations.assign(1, rotation(map.raw_orientation));
             return;
         }
-        map.row_rotations.resize(64);
+        map.row_rotations.resize(row_knots);
         for (size_t i = 0; i < map.row_rotations.size(); ++i) {
             const double fraction = double(i) / (map.row_rotations.size() - 1);
             map.row_rotations[i] = rotation(raw.sample(time + (fraction - 0.5) * signed_readout));
         }
     }
-    bool fits(GyroFrameMap& map, double scale, bool full_perimeter = false) const {
+    bool fits(GyroFrameMap& map, double scale, bool full_perimeter = false, Point* limiting = nullptr) const {
         set_scale(map, scale);
-        Point src;
+        const auto inside = [&](Point p) {
+            Point src;
+            if (project(map, p, 0.5, 1e-4, src))
+                return true;
+            if (limiting)
+                *limiting = p;
+            return false;
+        };
         const double w = map.output_size.width - 1, h = map.output_size.height - 1;
+        const auto edges_fit = [&](double u) {
+            return inside({u * w, 0}) && inside({u * w, h}) && inside({0, u * h}) && inside({w, u * h});
+        };
+        if (!edges_fit(0) || !edges_fit(1))
+            return false;
+        // Probe the center and progressively bisect the edges to find a limiting ray early.
+        for (int divisions = 2; divisions <= 64; divisions *= 2)
+            for (int i = 1; i < divisions; i += 2)
+                if (!edges_fit(double(i) / divisions))
+                    return false;
         if (full_perimeter) {
             for (int x = 0; x < map.output_size.width; ++x)
-                for (double y : {0.0, h})
-                    if (!project(map, {double(x), y}, 0.5, 1e-4, src))
-                        return false;
+                if (!inside({double(x), 0}) || !inside({double(x), h}))
+                    return false;
             for (int y = 1; y < map.output_size.height - 1; ++y)
-                for (double x : {0.0, w})
-                    if (!project(map, {x, double(y)}, 0.5, 1e-4, src))
-                        return false;
-        }
-        for (int i = 0; i <= 64; ++i) {
-            const double u = i / 64.0;
-            for (Point p : {Point{u * w, 0}, Point{u * w, h}, Point{0, u * h}, Point{w, u * h}})
-                if (!project(map, p, 0.5, 1e-4, src))
+                if (!inside({0, double(y)}) || !inside({w, double(y)}))
                     return false;
         }
         return true;
+    }
+    // Bisect a failing ray first. Its limit bounds the whole perimeter, so most
+    // previews need only one complete scan to certify the resulting scale.
+    double preview_scale(GyroFrameMap& map, double ceiling, double floor = 0.05) const {
+        Point limiting, src;
+        constexpr int steps = 1 << 24;
+        const auto scale = [&](int index) { return std::lerp(floor, ceiling, double(index) / steps); };
+        int upper = steps;
+        while (!fits(map, scale(upper), false, &limiting)) {
+            set_scale(map, floor);
+            if (upper == 0 || !project(map, limiting, 0.5, 1e-4, src))
+                return 0;
+            int lo = 0, hi = upper;
+            while (hi - lo > 1) {
+                const int mid = std::midpoint(lo, hi);
+                set_scale(map, scale(mid));
+                if (project(map, limiting, 0.5, 1e-4, src))
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            upper = lo;
+        }
+        return scale(upper);
     }
     double largest_scale(GyroFrameMap& map, double ceiling, double floor = 0.05, bool full_perimeter = false) const {
         if (fits(map, ceiling, full_perimeter))
@@ -488,17 +586,31 @@ std::vector<double> zoom_curve(std::span<const double> times, const std::vector<
     }
     return result;
 }
-} // namespace
 
-bool project_output_to_input(const GyroFrameMap& map, Point output_px, Point& input_px) {
-    return project(map, output_px, 0, 1e-6, input_px);
+double retained_correction(const FrameGeometry& g, GyroFrameMap& map, double min_scale) {
+    const auto target = map.smooth_orientation;
+    g.set_orientation(map, map.raw_orientation);
+    if (!g.fits(map, min_scale))
+        throw std::domain_error("Sensor bounds require more than max_zoom");
+    double lo = 0, hi = 1;
+    for (int j = 0; j < 24; ++j) {
+        const double mid = std::midpoint(lo, hi);
+        g.set_orientation(map, slerp(map.raw_orientation, target, mid));
+        if (g.fits(map, min_scale))
+            lo = mid;
+        else
+            hi = mid;
+    }
+    g.set_orientation(map, target);
+    return lo;
 }
 
-std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const OrientationTrack& raw,
-                                           const LensProfile& lens, Size input_size, const GyroSettings& s) {
-    validate_gyro_settings(s);
-    if (!std::ranges::all_of(times, finite) || !std::ranges::is_sorted(times))
-        throw std::invalid_argument("Invalid frame times");
+struct ProjectionSetup {
+    GyroFrameMap identity;
+    double dim, readout, output_limit, identity_scale, min_scale, velocity_scale;
+};
+ProjectionSetup projection_setup(const LensProfile& lens, Size input_size, const GyroSettings& s) {
+    const OrientationTrack raw;
     const auto scaled = scale_lens_profile(lens, input_size);
     const Size output = default_size(s.output_size) ? input_size : s.output_size;
     const double dim = double(output.width) / input_size.width / s.fov;
@@ -529,6 +641,23 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
     // Reference velocity thresholds are specified at a 120 degree diagonal FOV.
     const double velocity_scale = 2 * std::atan(std::hypot(input_size.width, input_size.height) / (2 * scaled.fy)) /
                                   (120 * std::numbers::pi / 180);
+    return {std::move(identity), dim, readout, output_limit, identity_scale, min_scale, velocity_scale};
+}
+
+} // namespace
+
+bool project_output_to_input(const GyroFrameMap& map, Point output_px, Point& input_px) {
+    return project(map, output_px, 0, 1e-6, input_px);
+}
+
+std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const OrientationTrack& raw,
+                                           const LensProfile& lens, Size input_size, const GyroSettings& s) {
+    validate_gyro_settings(s);
+    if (!std::ranges::all_of(times, finite) || !std::ranges::is_sorted(times))
+        throw std::invalid_argument("Invalid frame times");
+    const auto [identity, dim, readout, output_limit, identity_scale, min_scale, velocity_scale] =
+        projection_setup(lens, input_size, s);
+    const auto& scaled = identity.lens;
     const double sigma = 0.5;
     const auto sample_times = raw.samples | std::views::transform(&OrientationSample::time_s);
     std::vector<double> local(raw.samples.size(), 1), scales(times.size());
@@ -571,20 +700,7 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
             scales[i] = min_scale;
             continue;
         }
-        const auto target = map.smooth_orientation;
-        g.set_orientation(map, map.raw_orientation);
-        if (!g.fits(map, min_scale))
-            throw std::domain_error("Sensor bounds require more than max_zoom");
-        double lo = 0, hi = 1;
-        for (int j = 0; j < 24; ++j) {
-            const double mid = std::midpoint(lo, hi);
-            g.set_orientation(map, slerp(map.raw_orientation, target, mid));
-            if (g.fits(map, min_scale))
-                lo = mid;
-            else
-                hi = mid;
-        }
-        g.set_orientation(map, target);
+        const double lo = retained_correction(g, map, min_scale);
         attenuate(times, retained, times[i], lo, sigma);
         retained[i] = std::min(retained[i], lo);
     }
@@ -608,5 +724,139 @@ std::vector<GyroFrameMap> plan_gyro_frames(std::span<const double> times, const 
         g.set_scale(maps[i], scale);
     }
     return maps;
+}
+
+GyroStreamPlanner::GyroStreamPlanner(GyroSettings settings, LensProfile lens, Size input_size, GyroStreamConfig stream)
+    : settings_(settings), stream_(stream), integrator_(settings) {
+    if (input_size.width < 2 || input_size.height < 2 || !finite(stream.lookahead_seconds) ||
+        stream.lookahead_seconds < 0 || stream.lookahead_seconds > 10 || stream.max_buffered_frames < 2 ||
+        stream.max_buffered_frames > 600)
+        throw std::invalid_argument("Invalid gyro streaming size, lookahead or buffer capacity");
+    auto setup = projection_setup(lens, input_size, settings);
+    identity_ = std::move(setup.identity);
+    dim_ = setup.dim;
+    readout_ = setup.readout;
+    output_limit_ = setup.output_limit;
+    identity_scale_ = setup.identity_scale;
+    min_scale_ = setup.min_scale;
+    velocity_scale_ = setup.velocity_scale;
+}
+
+void GyroStreamPlanner::push_imu(std::span<const ImuSample> samples) {
+    if (finished_)
+        throw std::logic_error("Stream is already finished");
+    integrator_.push(samples);
+}
+bool GyroStreamPlanner::push_frame(double time_s) {
+    if (finished_)
+        throw std::logic_error("Stream is already finished");
+    if (!finite(time_s) || (!pending_times_.empty() && time_s <= pending_times_.back()))
+        throw std::invalid_argument("Gyro frame times must increase");
+    if (full())
+        return false;
+    pending_times_.push_back(time_s);
+    return true;
+}
+void GyroStreamPlanner::finish() {
+    if (finished_)
+        throw std::logic_error("Stream is already finished");
+    finished_ = true;
+}
+
+bool GyroStreamPlanner::take_ready(GyroFrameMap& out, double* lookahead_seconds) {
+    if (pending_times_.empty())
+        return false;
+    const double time = pending_times_.front(), ahead = pending_times_.back() - time;
+    if (!finished_ && !full() && (buffered() < 2 || ahead + 2e-6 < stream_.lookahead_seconds))
+        return false;
+
+    const double dt = has_prev_ ? std::max(1e-6, time - prev_time_) : 0;
+    const double preview_end = std::min(pending_times_.back(), time + stream_.lookahead_seconds);
+    const double half_readout = 0.5 * std::abs(readout_);
+    const double past_support = std::max(4.0, 4 * settings_.max_smoothness) + 1;
+    const auto& samples = integrator_.track().samples;
+    const auto first = finished_ ? samples.begin()
+                                 : std::ranges::upper_bound(samples, time - past_support - half_readout, {},
+                                                            &OrientationSample::time_s);
+    const auto end =
+        finished_ ? samples.end()
+                  : std::ranges::upper_bound(samples, preview_end + half_readout, {}, &OrientationSample::time_s);
+    const OrientationTrack raw{{first == samples.begin() ? first : std::prev(first), end}};
+    Vec peak = Eigen::Map<const Vec>(running_peak_.data()) * std::exp(-dt / 2);
+    const auto smooth = smooth_track(raw, settings_, {}, velocity_scale_, &peak);
+
+    std::vector<double> times{time};
+    const double spacing = std::max(0.1, (preview_end - time) / 14);
+    const auto last = std::prev(std::ranges::upper_bound(pending_times_, preview_end));
+    for (auto it = std::next(pending_times_.begin()); it <= last; ++it)
+        if (it == last || *it - times.back() >= spacing - 1e-9)
+            times.push_back(*it);
+
+    const auto geometry = [&](size_t i) {
+        return FrameGeometry{raw,      times[i],        identity_.lens.fx * dim_,        identity_.lens.fy * dim_,
+                             readout_, identity_scale_, i == 0 ? size_t{64} : size_t{16}};
+    };
+    std::vector<double> scales(times.size()), retained(times.size(), 1);
+    GyroFrameMap current;
+    double current_limit = 1;
+    for (size_t i = 0; i < times.size(); ++i) {
+        auto map = identity_;
+        const auto g = geometry(i);
+        map.raw_orientation = raw.sample(times[i]);
+        g.set_orientation(map, smooth.sample(times[i]));
+        scales[i] = g.preview_scale(map, output_limit_);
+        if (scales[i] < min_scale_) {
+            if (!g.fits(map, min_scale_)) {
+                const double limit = retained_correction(g, map, min_scale_);
+                attenuate(times, retained, times[i], limit, 0.5);
+                retained[i] = std::min(retained[i], limit);
+                if (i == 0)
+                    current_limit = limit;
+            }
+            scales[i] = min_scale_;
+        }
+        if (i == 0)
+            current = std::move(map);
+    }
+    const auto g = geometry(0);
+    const double factor =
+        has_prev_ ? std::min(current_limit, std::lerp(retained.front(), prev_retained_, std::exp(-dt / 0.2)))
+                  : retained.front();
+    if (factor < 1) {
+        g.set_orientation(current, slerp(current.raw_orientation, current.smooth_orientation, factor));
+        current.smooth_factor = factor;
+        scales.front() = g.preview_scale(current, output_limit_, min_scale_);
+    }
+    const bool adaptive = settings_.adaptive_zoom && settings_.adaptive_zoom_window_s > 0;
+    const double tau = adaptive ? std::max(0.2, settings_.adaptive_zoom_window_s) : 0.2;
+    double anticipated = scales.back();
+    for (size_t i = times.size() - 1; i > 0; --i) {
+        const double weight = std::exp(-(times[i] - times[i - 1]) / tau);
+        anticipated = std::min(scales[i - 1], std::lerp(scales[i - 1], anticipated, weight));
+    }
+    double target = anticipated;
+    if (has_prev_) {
+        if (!adaptive)
+            target = std::min(prev_scale_, anticipated);
+        else if (anticipated > prev_scale_)
+            target = std::lerp(anticipated, prev_scale_, std::exp(-dt / tau));
+        else
+            target = std::min(scales.front(), std::lerp(anticipated, prev_scale_, std::exp(-dt / 0.2)));
+    }
+    const double scale = g.largest_scale(current, std::clamp(target, min_scale_, output_limit_), min_scale_, true);
+    if (scale == 0)
+        throw std::domain_error("Final rolling shutter map exceeds sensor bounds");
+    g.set_scale(current, scale);
+    out = std::move(current);
+    if (lookahead_seconds)
+        *lookahead_seconds = ahead;
+    prev_scale_ = scale;
+    prev_retained_ = factor;
+    prev_time_ = time;
+    has_prev_ = true;
+    Eigen::Map<Vec>{running_peak_.data()} = peak;
+    pending_times_.pop_front();
+    integrator_.prune_before(time - past_support - half_readout);
+    return true;
 }
 } // namespace stillflow
