@@ -252,42 +252,50 @@ void write_stream(Channel<EncodeItem>& queue, VideoWriter& writer, ImageProcessi
     ScopeTimer timer(profile, flush_stage);
     writer.finish();
 }
-RunSummary stabilize_stream(const Options& options, Services& services, Clock::time_point start) {
+struct StreamMedia {
+    std::unique_ptr<Renderer> renderer;
+    bool gpu;
+    std::unique_ptr<VideoReader> reader;
+
+    StreamMedia(const Options& options, Services& services) : renderer(services.renderers.create(options.backend)) {
+        const auto backend = renderer->report();
+        gpu = !backend.backends.empty() ? backend.backends.back().gpu : services.renderers.prefers_gpu(backend.backend);
+        services.progress.backend(backend);
+        reader = services.media.reader(options.input, options.threads, {options.decoder, gpu, true});
+    }
+};
+struct StreamDiagnostics {
+    std::vector<FrameMotion> frames;
+    std::vector<Warp> warps;
+    std::vector<GyroFrameMap> maps;
+    std::vector<double> invalid;
+};
+
+template <class Ready>
+RunSummary render_stream(const Options& options, Services& services, Clock::time_point start, StreamMedia& media,
+                         Size size, Size analysis_size, bool horizontal, auto& analyzer, auto push, auto finish,
+                         auto render_frame) {
     Profile profile(now_ms);
-    auto renderer = services.renderers.create(options.backend);
-    services.progress.backend(renderer->report());
-    const bool gpu = services.renderers.prefers_gpu(renderer->report().backend);
-    auto reader = services.media.reader(options.input, options.threads, {options.decoder, gpu, true});
-    const auto info = reader->info();
-    const Size size(info.width, info.height);
-    const double scale = std::min(1.0, double(options.analysis_width) / info.width);
-    const Size analysis_size{std::max(32, int(std::lround(info.width * scale))),
-                             std::max(32, int(std::lround(info.height * scale)))};
-    const bool horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
-    services.progress.analyzing(info, analysis_size, horizontal);
-    StreamAnalyzer analyzer(options, options.stream, analysis_size, info.fps, horizontal,
-                            services.images.stream_analyzer(options, horizontal), options.execution,
-                            services.images.analyzer(options, horizontal));
+    const auto info = media.reader->info();
     auto output = services.outputs.stage(options.output);
     std::unique_ptr<OutputFile> comparison;
     if (!options.compare.empty())
         comparison = services.outputs.stage(options.compare);
     std::unique_ptr<VideoWriter> writer, compare_writer;
     AudioPackets audio;
-    reader->set_audio_callback([&](const AudioPacket& packet) { audio.push_back(packet.retain()); });
+    media.reader->set_audio_callback([&](const AudioPacket& packet) { audio.push_back(packet.retain()); });
     struct Pending {
         VideoFrame frame;
         AudioPackets audio;
         double received_ms;
     };
     std::deque<Pending> delayed;
-    std::vector<FrameMotion> frames;
-    std::vector<Warp> warps;
+    StreamDiagnostics diagnostics;
     StreamStatistics statistics;
     size_t decoded = 0, planned = 0;
     struct RenderItem {
         Pending input;
-        ReadyWarp plan;
+        Ready plan;
     };
     Channel<RenderItem> render_queue(2);
     Profile render_profile(now_ms);
@@ -298,8 +306,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
             options.execution.check();
             auto& item = work->input;
             auto& ready = work->plan;
-            Image stabilized =
-                renderer->render(item.frame.image, ready.warp, analysis_size, options.crop, horizontal, render_profile);
+            Image stabilized = render_frame(item.frame.image, ready, diagnostics, render_profile);
             for (const auto& packet : item.audio) {
                 writer->audio(*packet);
                 if (compare_writer)
@@ -318,12 +325,10 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
             render_profile.add("stream.lookahead", ready.lookahead_seconds * 1000);
             if (ready.lookahead_seconds + 2e-6 < options.stream.lookahead_seconds)
                 ++statistics.shortened_lookahead_frames;
-            frames.push_back(std::move(ready.observation));
-            warps.push_back(std::move(ready.warp));
         }
     };
     const auto drain = [&] {
-        ReadyWarp ready;
+        Ready ready;
         for (;;) {
             const double plan_start = now_ms();
             if (!analyzer.take_ready(ready, &profile))
@@ -348,33 +353,23 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
             VideoFrame frame;
             {
                 ScopeTimer timer(profile, "stream.decode");
-                if (!reader->next(frame))
+                if (!media.reader->next(frame))
                     break;
             }
             if (!writer) {
                 const EncodingSettings encoding{options.threads, options.crf, options.preset, options.audio};
-                writer = services.media.writer(output->temporary(), size, info.fps, *reader, frame.pts_us, encoding,
-                                               {options.encoder, gpu});
+                writer = services.media.writer(output->temporary(), size, info.fps, *media.reader, frame.pts_us,
+                                               encoding, {options.encoder, media.gpu});
                 if (comparison)
                     compare_writer =
-                        services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps, *reader,
-                                              frame.pts_us, encoding, {options.encoder, gpu});
+                        services.media.writer(comparison->temporary(), {size.width * 2, size.height}, info.fps,
+                                              *media.reader, frame.pts_us, encoding, {options.encoder, media.gpu});
                 group.spawn(render);
             }
-            Image proxy;
-            {
-                ScopeTimer timer(profile, "stream.proxy");
-                proxy = services.images.gray_proxy(frame.analysis_image ? frame.analysis_image : frame.image,
-                                                   analysis_size);
-            }
-            {
-                ScopeTimer timer(profile, "stream.analyze");
-                if (!analyzer.push(proxy, frame.pts_us, frame.duration_us, profile))
-                    throw std::logic_error("Streaming queue was not drained");
-            }
+            if (!push(frame, decoded, profile))
+                throw std::logic_error("Streaming queue was not drained");
             frame.analysis_image.reset();
             delayed.push_back({std::move(frame), std::move(audio), work_start});
-            frame = {};
             audio.clear();
             ++decoded;
             statistics.peak_buffered_frames = std::max(statistics.peak_buffered_frames, delayed.size());
@@ -386,7 +381,7 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
         }
         if (!writer)
             throw std::runtime_error("Input contains no decoded video frames");
-        analyzer.finish(&profile);
+        finish(profile);
         drain();
         render_queue.close();
     } catch (...) {
@@ -402,10 +397,10 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     writer->finish();
     if (compare_writer)
         compare_writer->finish();
-    reader->set_audio_callback(nullptr);
-    if (!delayed.empty() || frames.size() != decoded)
+    media.reader->set_audio_callback(nullptr);
+    if (!delayed.empty() || diagnostics.frames.size() != decoded)
         throw std::logic_error("Streaming flush lost frames");
-    std::vector<std::pair<std::string, CodecReport>> codecs{{"stream_decoder", reader->codec()},
+    std::vector<std::pair<std::string, CodecReport>> codecs{{"stream_decoder", media.reader->codec()},
                                                             {"encoder", writer->codec()}};
     if (compare_writer)
         codecs.emplace_back("comparison_encoder", compare_writer->codec());
@@ -416,8 +411,9 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     const auto frames_path = frames_report_path(options);
     auto report_file = services.outputs.stage(options.report), csv_file = services.outputs.stage(frames_path);
     services.outputs.write_report(report_file->temporary(), csv_file->temporary(),
-                                  {options, frames_path, info, analysis_size, horizontal, frames, warps, profile,
-                                   renderer->report(), std::move(codecs), summary, 0, statistics});
+                                  {options, frames_path, info, analysis_size, horizontal, diagnostics.frames,
+                                   diagnostics.warps, profile, media.renderer->report(), std::move(codecs), summary, 0,
+                                   statistics, diagnostics.maps, diagnostics.invalid});
     options.execution.check();
     output->publish();
     if (comparison)
@@ -425,6 +421,87 @@ RunSummary stabilize_stream(const Options& options, Services& services, Clock::t
     csv_file->publish();
     report_file->publish();
     return summary;
+}
+RunSummary stabilize_stream(const Options& options, Services& services, Clock::time_point start) {
+    StreamMedia media(options, services);
+    const auto info = media.reader->info();
+    const Size size(info.width, info.height);
+    const double scale = std::min(1.0, double(options.analysis_width) / info.width);
+    const Size analysis_size{std::max(32, int(std::lround(info.width * scale))),
+                             std::max(32, int(std::lround(info.height * scale)))};
+    const bool horizontal = options.scan_axis == "x" || (options.scan_axis == "auto" && info.horizontal_scan);
+    services.progress.analyzing(info, analysis_size, horizontal);
+    StreamAnalyzer analyzer(options, options.stream, analysis_size, info.fps, horizontal,
+                            services.images.stream_analyzer(options, horizontal), options.execution,
+                            services.images.analyzer(options, horizontal));
+    return render_stream<ReadyWarp>(
+        options, services, start, media, size, analysis_size, horizontal, analyzer,
+        [&](const VideoFrame& frame, size_t, Profile& profile) {
+            Image proxy;
+            {
+                ScopeTimer timer(profile, "stream.proxy");
+                proxy = services.images.gray_proxy(frame.analysis_image ? frame.analysis_image : frame.image,
+                                                   analysis_size);
+            }
+            ScopeTimer timer(profile, "stream.analyze");
+            return analyzer.push(proxy, frame.pts_us, frame.duration_us, profile);
+        },
+        [&](Profile& profile) { analyzer.finish(&profile); },
+        [&](const Image& image, ReadyWarp& ready, StreamDiagnostics& diagnostics, Profile& profile) {
+            auto result = media.renderer->render(image, ready.warp, analysis_size, options.crop, horizontal, profile);
+            diagnostics.frames.push_back(std::move(ready.observation));
+            diagnostics.warps.push_back(std::move(ready.warp));
+            return result;
+        });
+}
+
+RunSummary stabilize_gyro_stream(const Options& options, const GyroInput& gyro, Services& services,
+                                 Clock::time_point start) {
+    StreamMedia media(options, services);
+    const auto info = media.reader->info();
+    const Size input_size{info.width, info.height};
+    GyroStream stream(gyro.settings, gyro.lens, options.stream, input_size, options.execution);
+    const Size output_size = stream.output_size();
+    if (!options.compare.empty() && (output_size.width != input_size.width || output_size.height != input_size.height))
+        throw std::invalid_argument("Comparison video requires matching input and output dimensions");
+    size_t imu_cursor = 0;
+    int64_t origin_us = 0;
+    const double readout_half_s = gyro.settings.readout_ms / 2000.0;
+    const auto samples = std::span(gyro.imu);
+    const auto seconds = [&](int64_t pts) {
+        return static_cast<double>((static_cast<long double>(pts) - origin_us) / 1e6L);
+    };
+    return render_stream<ReadyGyroFrame>(
+        options, services, start, media, output_size, input_size, false, stream,
+        [&](const VideoFrame& frame, size_t index, Profile&) {
+            if (index == 0)
+                origin_us = frame.pts_us;
+            const double horizon = seconds(frame.pts_us) + readout_half_s;
+            const size_t previous = imu_cursor;
+            while (imu_cursor < samples.size() && samples[imu_cursor].time_s + gyro.settings.time_offset_s <= horizon)
+                ++imu_cursor;
+            stream.push_imu(samples.subspan(previous, imu_cursor - previous));
+            return stream.push_frame(frame.pts_us, frame.duration_us);
+        },
+        [&](Profile& profile) {
+            if (imu_cursor < samples.size())
+                stream.push_imu(samples.subspan(imu_cursor));
+            stream.finish(&profile);
+        },
+        [&](const Image& image, ReadyGyroFrame& ready, StreamDiagnostics& diagnostics, Profile& profile) {
+            double invalid = 0;
+            auto result = media.renderer->render_gyro(image, ready.map, invalid, profile);
+            auto& frame = diagnostics.frames.emplace_back();
+            frame.seconds = seconds(ready.pts_us);
+            frame.duration = ready.duration_us / 1e6;
+            auto& warp = diagnostics.warps.emplace_back();
+            warp.invalid_fraction = invalid;
+            warp.strength = ready.map.smooth_factor;
+            warp.window.scale = ready.map.fov_scale;
+            diagnostics.invalid.push_back(invalid);
+            diagnostics.maps.push_back(std::move(ready.map));
+            return result;
+        });
 }
 RunSummary render_offline(const Options& options, Services& services, Clock::time_point start, Profile& profile,
                           const Analysis& analysis, Size size, Renderer& renderer, const std::vector<Warp>& warps,
@@ -641,7 +718,8 @@ RunSummary stabilize(const Options& request, Services services) {
         services.media.validate_output(options.compare);
     services.runtime.configure(options.threads);
     if (options.gyro)
-        return stabilize_gyro(options, *options.gyro, services, start);
+        return options.realtime ? stabilize_gyro_stream(options, *options.gyro, services, start)
+                                : stabilize_gyro(options, *options.gyro, services, start);
     if (options.realtime)
         return stabilize_stream(options, services, start);
     Profile profile(now_ms);

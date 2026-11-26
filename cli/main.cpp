@@ -29,7 +29,7 @@ Usage: stillflow INPUT OUTPUT [options]
   --crop FRACTION         Maximum equivalent per-edge crop, 0..0.25 (default 0.08)
   --crop-mode MODE        auto (shot-fixed), fixed or adaptive (default auto)
   --threads N             Threads per OpenCV/codec worker pool (default 12)
-  --gyro-config PATH      Offline gyro stabilization using stabilization.json or .gyroflow
+  --gyro-config PATH      Gyro stabilization using stabilization.json or .gyroflow
   --imu PATH              Override the camera-frame IMU CSV
   --output-size WxH       Gyro output dimensions
   --gyro-smooth N         Gyro smoothness, 0..1

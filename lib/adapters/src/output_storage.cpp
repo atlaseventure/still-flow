@@ -89,7 +89,10 @@ void write_gyro_diagnostics(nlohmann::json& report, const fs::path& csv_path, co
     const auto output = maps.front().output_size;
     report["video"]["output_width"] = output.width;
     report["video"]["output_height"] = output.height;
-    report["trajectory"] = {{"method", "gyro_quaternion_slerp"}};
+    report["trajectory"] = {
+        {"method", data.options.realtime ? "fixed_lag_gyro_quaternion_slerp" : "gyro_quaternion_slerp"}};
+    if (data.options.realtime)
+        report["streaming"].erase("crop_mode");
     std::ofstream csv(csv_path);
     csv.exceptions(std::ios::badbit | std::ios::failbit);
     csv << "frame,time_s,duration_s,fov_scale,zoom_ratio,smooth_factor,invalid_fraction\n" << std::setprecision(12);

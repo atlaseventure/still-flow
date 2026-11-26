@@ -7,8 +7,6 @@ namespace stillflow {
 namespace {
 void validate_options(const Options& o) {
     if (o.gyro) {
-        if (o.realtime)
-            throw NotImplementedError("Realtime streaming mode is not implemented for gyro stabilization");
         validate_gyro_settings(o.gyro->settings);
         if (o.gyro->imu.empty())
             throw std::invalid_argument("Gyro stabilization requires IMU samples");

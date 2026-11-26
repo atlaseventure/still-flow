@@ -5,7 +5,9 @@
 #include "stillflow/stillflow.h"
 #include <algorithm>
 #include <array>
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -146,6 +148,12 @@ struct GyroApi : Api {
     std::array<sf_frame_timestamp, 2> times{{{9007199254740993LL, 33333}, {9007199254774326LL, 0}}};
     std::array<sf_imu_sample, 2> imu{};
 
+    sf_stream_settings buffering = sf_stream_settings_default();
+    sf_gyro_stream* stream = nullptr;
+    ~GyroApi() { sf_gyro_stream_destroy(stream); }
+    sf_status create_stream(const sf_runtime* runtime = nullptr) {
+        return sf_gyro_stream_create(&gyro, &lens, &buffering, image.width, image.height, runtime, &stream, &error);
+    }
     GyroApi() {
         image.height = 48;
         lens.fx = 49;
@@ -258,6 +266,7 @@ TEST_CASE("Core C API owns rolling-shutter gyro maps and renders resized fisheye
 }
 
 TEST_CASE("Core C gyro renderer preserves packed channels and NV12 at integer pinhole coordinates", "[c-api][gyro]") {
+    const bool streaming = GENERATE(false, true);
     for (auto format : {SF_BGR8, SF_RGBA8, SF_GRAY8, SF_NV12}) {
         CAPTURE(format);
         GyroApi api;
@@ -267,8 +276,19 @@ TEST_CASE("Core C gyro renderer preserves packed channels and NV12 at integer pi
         api.gyro.output_height = 44;
         api.gyro.fov = 60.0 / 64;
         api.gyro.integration_method = SF_IMU_AUTO;
-        REQUIRE(api.plan_gyro() == SF_OK);
-        api.take_frame();
+        if (streaming) {
+            REQUIRE(api.create_stream() == SF_OK);
+            REQUIRE(sf_gyro_stream_push_imu(api.stream, api.imu.data(), api.imu.size(), nullptr) == SF_OK);
+            REQUIRE(sf_gyro_stream_push_frame(api.stream, api.times[0].pts_us, api.times[0].duration_us, nullptr) ==
+                    SF_OK);
+            REQUIRE(sf_gyro_stream_finish(api.stream, nullptr) == SF_OK);
+            REQUIRE(sf_gyro_stream_take_ready(api.stream, &api.frame_plan, nullptr) == SF_OK);
+            sf_gyro_stream_destroy(api.stream);
+            api.stream = nullptr;
+        } else {
+            REQUIRE(api.plan_gyro() == SF_OK);
+            api.take_frame();
+        }
         sf_gyro_map map{};
         REQUIRE(sf_frame_plan_get_gyro_map(api.frame_plan, &map, nullptr) == SF_OK);
         REQUIRE(map.row_count == 1);
@@ -311,6 +331,121 @@ TEST_CASE("Core C gyro renderer preserves packed channels and NV12 at integer pi
                 REQUIRE(std::memcmp(out.data + y * out.row_stride, expected, bytes) == 0);
             }
         }
+    }
+}
+
+TEST_CASE("Core C gyro stream retries unconsumed frames and drains exact VFR plans", "[c-api][gyro][stream]") {
+    GyroApi api;
+    api.gyro.output_width = 48;
+    api.gyro.output_height = 32;
+    api.buffering.max_buffered_frames = 2;
+    REQUIRE(api.create_stream() == SF_OK);
+    int32_t width = 0, height = 0;
+    REQUIRE(sf_gyro_stream_get_output_size(api.stream, &width, &height, nullptr) == SF_OK);
+    REQUIRE(width == 48);
+    REQUIRE(height == 32);
+    const auto start = api.times[0].pts_us;
+    const std::array<int64_t, 3> pts{start, start + 17003, start + 57009};
+    const std::array<int64_t, 3> duration{17003, 40006, 22001};
+    auto push_imu = [&](size_t i) {
+        sf_imu_sample sample{};
+        sample.time_s = (pts[i] - start) / 1e6;
+        sample.wy = 0.25;
+        REQUIRE(sf_gyro_stream_push_imu(api.stream, &sample, 1, nullptr) == SF_OK);
+    };
+    auto push = [&](size_t i) { return sf_gyro_stream_push_frame(api.stream, pts[i], 22001, nullptr); };
+    auto take = [&](sf_status expected) {
+        sf_frame_plan_destroy(api.frame_plan);
+        api.frame_plan = nullptr;
+        REQUIRE(sf_gyro_stream_take_ready(api.stream, &api.frame_plan, nullptr) == expected);
+        REQUIRE((api.frame_plan != nullptr) == (expected == SF_OK));
+    };
+    auto check = [&](size_t i, double ahead) {
+        sf_frame_info info{};
+        REQUIRE(sf_frame_plan_get_info(api.frame_plan, &info, nullptr) == SF_OK);
+        REQUIRE(info.index == i);
+        REQUIRE(info.pts_us == pts[i]);
+        REQUIRE(info.duration_us == duration[i]);
+        REQUIRE(info.lookahead_seconds == Catch::Approx(ahead));
+        REQUIRE(sf_frame_plan_get_output_size(api.frame_plan, &width, &height, nullptr) == SF_OK);
+        REQUIRE(width == 48);
+        REQUIRE(height == 32);
+        sf_gyro_map map{};
+        REQUIRE(sf_frame_plan_get_gyro_map(api.frame_plan, &map, nullptr) == SF_OK);
+        REQUIRE(map.input_width == api.image.width);
+        REQUIRE(map.output_height == height);
+    };
+    REQUIRE(sf_gyro_stream_push_imu(api.stream, nullptr, 0, nullptr) == SF_OK);
+    push_imu(0);
+    REQUIRE(push(0) == SF_OK);
+    take(SF_AGAIN);
+    push_imu(1);
+    REQUIRE(push(1) == SF_OK);
+    REQUIRE(push(2) == SF_AGAIN);
+    take(SF_OK);
+    check(0, duration[0] / 1e6);
+    take(SF_AGAIN);
+    push_imu(2);
+    REQUIRE(push(2) == SF_OK);
+    REQUIRE(sf_gyro_stream_finish(api.stream, nullptr) == SF_OK);
+    REQUIRE(sf_gyro_stream_finish(api.stream, nullptr) == SF_OK);
+    REQUIRE(push(2) == SF_INVALID_STATE);
+    REQUIRE(sf_gyro_stream_push_imu(api.stream, nullptr, 0, nullptr) == SF_INVALID_STATE);
+    take(SF_OK);
+    check(1, duration[1] / 1e6);
+    take(SF_OK);
+    check(2, 0);
+    take(SF_END);
+    uint64_t count = 0;
+    auto visitor = [](void* data, const sf_profile_entry* entry) {
+        if (std::string_view(entry->stage) == "plan.gyro_stream")
+            *static_cast<uint64_t*>(data) = entry->count;
+    };
+    REQUIRE(sf_gyro_stream_get_profile(api.stream, visitor, &count, nullptr) == SF_OK);
+    REQUIRE(count >= pts.size());
+}
+
+TEST_CASE("Core C gyro stream validates descriptors, timing and cancellation", "[c-api][gyro][stream]") {
+    GyroApi api;
+    bool stop = false;
+    sf_runtime runtime{&stop, [](void* data) -> int32_t { return *static_cast<bool*>(data); }, nullptr, nullptr};
+    SECTION("invalid creation") {
+        SECTION("lens") { api.lens.fx = 0; }
+        SECTION("gyro settings") { api.gyro.per_axis = 2; }
+        SECTION("buffer capacity") { api.buffering.max_buffered_frames = 1; }
+        SECTION("input size") { api.image.width = 1; }
+        REQUIRE(api.create_stream() == SF_INVALID_ARGUMENT);
+        REQUIRE(api.stream == nullptr);
+    }
+    SECTION("cancelled creation") {
+        stop = true;
+        REQUIRE(api.create_stream(&runtime) == SF_CANCELLED);
+        REQUIRE(api.stream == nullptr);
+    }
+    SECTION("invalid calls") {
+        REQUIRE(api.create_stream(&runtime) == SF_OK);
+        int32_t height = 0;
+        REQUIRE(sf_gyro_stream_get_output_size(api.stream, nullptr, &height, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_get_profile(api.stream, nullptr, nullptr, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_take_ready(api.stream, nullptr, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_push_imu(api.stream, nullptr, 1, nullptr) == SF_INVALID_ARGUMENT);
+        api.imu[1].has_accel = 2;
+        REQUIRE(sf_gyro_stream_push_imu(api.stream, api.imu.data(), 2, nullptr) == SF_INVALID_ARGUMENT);
+        api.imu[1].has_accel = 0;
+        REQUIRE(sf_gyro_stream_push_imu(api.stream, api.imu.data(), 2, nullptr) == SF_OK);
+        REQUIRE(sf_gyro_stream_push_frame(api.stream, 100, 1, nullptr) == SF_OK);
+        REQUIRE(sf_gyro_stream_push_frame(api.stream, 100, 1, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_push_frame(api.stream, 99, 1, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_push_frame(api.stream, 101, -1, nullptr) == SF_INVALID_ARGUMENT);
+        REQUIRE(sf_gyro_stream_push_frame(api.stream, 101, 1, nullptr) == SF_OK);
+    }
+    SECTION("cancelled processing") {
+        REQUIRE(api.create_stream(&runtime) == SF_OK);
+        stop = true;
+        SECTION("IMU") { REQUIRE(sf_gyro_stream_push_imu(api.stream, nullptr, 0, nullptr) == SF_CANCELLED); }
+        SECTION("frame") { REQUIRE(sf_gyro_stream_push_frame(api.stream, 0, 1, nullptr) == SF_CANCELLED); }
+        SECTION("finish") { REQUIRE(sf_gyro_stream_finish(api.stream, nullptr) == SF_CANCELLED); }
+        SECTION("drain") { REQUIRE(sf_gyro_stream_take_ready(api.stream, &api.frame_plan, nullptr) == SF_CANCELLED); }
     }
 }
 
@@ -385,7 +520,7 @@ TEST_CASE("Core C gyro map and output size accessors validate pointers", "[c-api
 }
 
 #ifdef STILLFLOW_TEST_DESKTOP
-TEST_CASE("Desktop C API rejects unsupported gyro requests before opening input files", "[c-api][gyro]") {
+TEST_CASE("Desktop C API accepts streaming gyro and rejects GLES before opening input files", "[c-api][gyro]") {
     auto options = sf_file_options_default();
     stillflow::test::TempDirectory temp;
     const auto missing = (temp.path / "stabilization.json").string();
@@ -400,7 +535,7 @@ TEST_CASE("Desktop C API rejects unsupported gyro requests before opening input 
     REQUIRE(std::string_view(error.message).find("Cannot open gyro configuration") != std::string_view::npos);
     options.backend = SF_BACKEND_AUTO;
     options.mode = SF_FILE_STREAM;
-    REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_UNSUPPORTED);
-    REQUIRE(std::string_view(error.message).find("Realtime") != std::string_view::npos);
+    REQUIRE(sf_stabilize_file(&options, nullptr, &summary, &error) == SF_INTERNAL_ERROR);
+    REQUIRE(std::string_view(error.message).find("Cannot open gyro configuration") != std::string_view::npos);
 }
 #endif

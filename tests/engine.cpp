@@ -11,6 +11,7 @@
 #include "stillflow/vision/portable.hpp"
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cmath>
 #include <numbers>
 
@@ -197,10 +198,13 @@ class TimestampWriter final : public VideoWriter {
 };
 class TimestampMedia final : public MediaFactory {
   public:
-    bool expect_gpu = false;
+    bool expect_gpu = false, expect_independent = false;
+    size_t readers = 0;
     void validate_output(const std::filesystem::path&) const override {}
     std::unique_ptr<VideoReader> reader(const std::filesystem::path&, int, const CodecRequest& request) override {
         REQUIRE(request.prefer_hardware == expect_gpu);
+        REQUIRE(request.independent_frames == expect_independent);
+        ++readers;
         return std::make_unique<TimestampReader>();
     }
     std::unique_ptr<VideoWriter> writer(const std::filesystem::path& path, Size size, double, VideoReader&,
@@ -243,7 +247,7 @@ struct GyroProgress final : Progress {
     void analyzed(size_t, bool) override {}
     void rendered(size_t, size_t, bool) override {}
 };
-TEST_CASE("Offline gyro processing publishes cropped frames with original VFR timing", "[engine][gyro]") {
+TEST_CASE("Gyro processing publishes cropped frames with original VFR timing", "[engine][gyro]") {
     test::TempDirectory temp;
     Options options;
     options.input = temp.path / "input";
@@ -260,10 +264,9 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     auto outputs = make_output_storage();
     auto host = make_runtime();
     GyroProgress progress;
-    Services cpu_services{media, *images, *cpu, *outputs, *host, progress};
-    options.realtime = true;
-    REQUIRE_THROWS_AS(stabilize(options, cpu_services), NotImplementedError);
-    options.realtime = false;
+    options.realtime = GENERATE(false, true);
+    options.stream.max_buffered_frames = 2;
+    media.expect_independent = options.realtime;
     GyroFactory gpu;
     RendererFactory* factory = cpu.get();
     SECTION("Explicit CPU") { options.backend = "cpu"; }
@@ -279,9 +282,12 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     REQUIRE(!std::filesystem::exists(options.output));
     options.compare.clear();
     progress.stages.clear();
+    media.readers = 0;
     REQUIRE(stabilize(options, services).frames == 3);
-    REQUIRE(progress.stages == std::vector{ProgressStage::analyze, ProgressStage::plan, ProgressStage::render,
-                                           ProgressStage::finalize, ProgressStage::complete});
+    REQUIRE(media.readers == (options.realtime ? 1 : 2));
+    if (!options.realtime)
+        REQUIRE(progress.stages == std::vector{ProgressStage::analyze, ProgressStage::plan, ProgressStage::render,
+                                               ProgressStage::finalize, ProgressStage::complete});
     std::ifstream video(options.output);
     for (const auto* expected : {"48 32 120001 30003", "48 32 150004 40006", "48 32 190010 33001"}) {
         std::string line;
@@ -293,7 +299,13 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     REQUIRE(report["video"]["output_width"] == 48);
     REQUIRE(report["video"]["output_height"] == 32);
     REQUIRE(report["gyro"]["invalid_frames"] == (media.expect_gpu ? 1 : 0));
-    REQUIRE(report["trajectory"]["method"] == "gyro_quaternion_slerp");
+    REQUIRE(report["trajectory"]["method"] ==
+            (options.realtime ? "fixed_lag_gyro_quaternion_slerp" : "gyro_quaternion_slerp"));
+    if (options.realtime) {
+        REQUIRE(report["streaming"]["peak_buffered_frames"] == 2);
+        REQUIRE(report["streaming"]["shortened_lookahead_frames"] == 3);
+        REQUIRE_FALSE(report["streaming"].contains("crop_mode"));
+    }
     std::ifstream csv(frames_report_path(options));
     std::string line;
     REQUIRE(std::getline(csv, line));
@@ -303,6 +315,9 @@ TEST_CASE("Offline gyro processing publishes cropped frames with original VFR ti
     REQUIRE(std::getline(csv, line));
     REQUIRE(line.starts_with("1,0.030003,0.040006,"));
     REQUIRE(line.ends_with(media.expect_gpu ? ",0.25" : ",0"));
+    REQUIRE(std::getline(csv, line));
+    REQUIRE(line.starts_with("2,0.070009,0.033001,"));
+    REQUIRE_FALSE(std::getline(csv, line));
 }
 } // namespace
 #endif

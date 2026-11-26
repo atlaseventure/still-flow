@@ -63,8 +63,6 @@ std::filesystem::path path(const char* text) {
     return text ? std::filesystem::path(reinterpret_cast<const char8_t*>(text)) : std::filesystem::path{};
 }
 stillflow::GyroInput gyro_options(const sf_file_options& options) {
-    if (options.mode == SF_FILE_STREAM)
-        throw stillflow::NotImplementedError("Realtime streaming mode is not implemented for gyro stabilization");
     const auto& value = options.gyro;
     auto gyro = stillflow::load_gyro_input(path(value.config), path(value.imu));
     auto& settings = gyro.settings;

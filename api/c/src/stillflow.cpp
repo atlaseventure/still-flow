@@ -63,9 +63,10 @@ struct sf_analyzer {
     Size source, analysis;
     explicit sf_analyzer(const sf_runtime* callbacks) : runtime(callbacks) {}
 };
-struct sf_stream {
+namespace {
+struct StreamState {
+    explicit StreamState(const sf_runtime* callbacks) : runtime(callbacks) {}
     c_api::Runtime runtime;
-    std::unique_ptr<StreamAnalyzer> analyzer;
     std::map<std::string, Profile::Statistics> profile;
     bool finished = false;
     Size source;
@@ -77,10 +78,18 @@ struct sf_stream {
             stats.merge(sample);
         }
     }
+};
+} // namespace
+struct sf_gyro_stream : StreamState {
+    using StreamState::StreamState;
+    std::unique_ptr<GyroStream> analyzer;
+};
+struct sf_stream : StreamState {
+    using StreamState::StreamState;
+    std::unique_ptr<StreamAnalyzer> analyzer;
     StabilizationSettings settings;
     Size size;
     bool horizontal = false;
-    explicit sf_stream(const sf_runtime* callbacks) : runtime(callbacks) {}
 };
 struct sf_plan {
     Plan plan;
@@ -136,6 +145,105 @@ void validate_image_size(const sf_image* image, Size source, Size analysis) {
           (image->format == SF_GRAY8 && image->width == analysis.width && image->height == analysis.height)))
         throw std::invalid_argument("Frame dimensions do not match the video or analysis proxy");
 }
+void validate_public_map(const GyroFrameMap& map) {
+    if (map.row_rotations.size() > SF_GYRO_MAX_ROW_ROTATIONS)
+        throw std::logic_error("Gyro map exceeds the public row capacity");
+}
+GyroSettings gyro_settings(const sf_gyro_settings* settings) {
+    c_api::require(settings);
+    const auto& s = *settings;
+    if ((s.output_width != 0 || s.output_height != 0) && (s.output_width < 2 || s.output_height < 2))
+        throw std::invalid_argument("Gyro output dimensions must both be zero or at least two");
+    c_api::boolean(s.per_axis);
+    c_api::boolean(s.readout_top_to_bottom);
+    c_api::boolean(s.adaptive_zoom);
+    c_api::boolean(s.zoom_envelope);
+    if (s.integration_method != SF_IMU_AUTO && s.integration_method != SF_IMU_GYRO &&
+        s.integration_method != SF_IMU_COMPLEMENTARY)
+        throw std::invalid_argument("Invalid IMU integration method");
+    return {.smoothness = s.smoothness,
+            .per_axis = s.per_axis != 0,
+            .smoothness_pitch = s.smoothness_pitch,
+            .smoothness_yaw = s.smoothness_yaw,
+            .smoothness_roll = s.smoothness_roll,
+            .max_smoothness = s.max_smoothness,
+            .alpha_0_1s = s.alpha_0_1s,
+            .readout_ms = s.readout_ms,
+            .readout_top_to_bottom = s.readout_top_to_bottom != 0,
+            .fov = s.fov,
+            .max_zoom = s.max_zoom,
+            .max_zoom_iterations = s.max_zoom_iterations,
+            .adaptive_zoom_window_s = s.adaptive_zoom_window_s,
+            .adaptive_zoom = s.adaptive_zoom != 0,
+            .time_offset_s = s.time_offset_s,
+            .integration_method = s.integration_method == SF_IMU_COMPLEMENTARY ? ImuIntegrationMethod::complementary
+                                                                               : ImuIntegrationMethod::gyro_only,
+            .output_size = {s.output_width, s.output_height},
+            .zoom_envelope = s.zoom_envelope != 0};
+}
+
+LensProfile lens_profile(const sf_lens_profile* lens) {
+    c_api::require(lens);
+    if (lens->model != SF_LENS_NONE && lens->model != SF_LENS_OPENCV_FISHEYE)
+        throw std::invalid_argument("Invalid lens model");
+    return {static_cast<LensModel>(lens->model),
+            {lens->calib_width, lens->calib_height},
+            lens->fx,
+            lens->fy,
+            lens->cx,
+            lens->cy,
+            std::to_array(lens->k),
+            lens->lens_correction_amount};
+}
+
+std::vector<ImuSample> import_imu(const sf_imu_sample* imu_samples, size_t imu_count) {
+    if (imu_count)
+        c_api::require(imu_samples);
+    std::vector<ImuSample> samples;
+    samples.reserve(imu_count);
+    for (const auto& sample : std::span(imu_samples, imu_count)) {
+        c_api::boolean(sample.has_accel);
+        samples.push_back(
+            {sample.time_s, sample.wx, sample.wy, sample.wz, sample.ax, sample.ay, sample.az, sample.has_accel != 0});
+    }
+    return samples;
+}
+
+StreamSettings stream_settings(const sf_stream_settings* stream) {
+    c_api::require(stream);
+    c_api::boolean(stream->adaptive_tracking);
+    return StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames,
+#ifdef __ANDROID__
+                          true,
+#else
+                          false,
+#endif
+                          stream->adaptive_tracking != 0};
+}
+sf_status stream_profile(const StreamState* stream, sf_profile_visitor visitor, void* data, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        if (!stream || !visitor)
+            throw std::invalid_argument("Missing stream or profile visitor");
+        for (const auto& [stage, stats] : stream->profile) {
+            const sf_profile_entry entry{stage.c_str(),          stats.count,           stats.total,
+                                         stats.minimum,          stats.maximum,         stats.percentile(0.50),
+                                         stats.percentile(0.95), stats.percentile(0.99)};
+            visitor(data, &entry);
+        }
+    });
+}
+template <class Stream> sf_status finish_stream(Stream* stream, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(stream);
+        stream->runtime.settings().check();
+        if (!stream->finished) {
+            Profile call{profile_now};
+            stream->analyzer->finish(&call);
+            stream->record(call);
+            stream->finished = true;
+        }
+    });
+}
 } // namespace
 extern "C" {
 sf_status sf_opencv_set_threads(int32_t threads, sf_error* error) {
@@ -187,52 +295,12 @@ sf_status sf_gyro_plan_create(const sf_gyro_settings* settings, const sf_lens_pr
         *out = nullptr;
     return c_api::boundary(error, [&] {
         c_api::require(out);
-        c_api::require(settings);
-        c_api::require(lens);
         c_api::require(frames);
         c_api::require(imu_samples);
         if (input_width < 2 || input_height < 2 || frame_count == 0 || imu_count == 0)
             throw std::invalid_argument("Gyro planning requires valid input dimensions, frames and IMU samples");
-        if (lens->model != SF_LENS_NONE && lens->model != SF_LENS_OPENCV_FISHEYE)
-            throw std::invalid_argument("Invalid lens model");
-        const auto& s = *settings;
-        if ((s.output_width != 0 || s.output_height != 0) && (s.output_width < 2 || s.output_height < 2))
-            throw std::invalid_argument("Gyro output dimensions must both be zero or at least two");
-        c_api::boolean(s.per_axis);
-        c_api::boolean(s.readout_top_to_bottom);
-        c_api::boolean(s.adaptive_zoom);
-        c_api::boolean(s.zoom_envelope);
-        if (s.integration_method != SF_IMU_AUTO && s.integration_method != SF_IMU_GYRO &&
-            s.integration_method != SF_IMU_COMPLEMENTARY)
-            throw std::invalid_argument("Invalid IMU integration method");
-        const GyroSettings config{.smoothness = s.smoothness,
-                                  .per_axis = s.per_axis != 0,
-                                  .smoothness_pitch = s.smoothness_pitch,
-                                  .smoothness_yaw = s.smoothness_yaw,
-                                  .smoothness_roll = s.smoothness_roll,
-                                  .max_smoothness = s.max_smoothness,
-                                  .alpha_0_1s = s.alpha_0_1s,
-                                  .readout_ms = s.readout_ms,
-                                  .readout_top_to_bottom = s.readout_top_to_bottom != 0,
-                                  .fov = s.fov,
-                                  .max_zoom = s.max_zoom,
-                                  .max_zoom_iterations = s.max_zoom_iterations,
-                                  .adaptive_zoom_window_s = s.adaptive_zoom_window_s,
-                                  .adaptive_zoom = s.adaptive_zoom != 0,
-                                  .time_offset_s = s.time_offset_s,
-                                  .integration_method = s.integration_method == SF_IMU_COMPLEMENTARY
-                                                            ? ImuIntegrationMethod::complementary
-                                                            : ImuIntegrationMethod::gyro_only,
-                                  .output_size = {s.output_width, s.output_height},
-                                  .zoom_envelope = s.zoom_envelope != 0};
-        const LensProfile profile{static_cast<LensModel>(lens->model),
-                                  {lens->calib_width, lens->calib_height},
-                                  lens->fx,
-                                  lens->fy,
-                                  lens->cx,
-                                  lens->cy,
-                                  std::to_array(lens->k),
-                                  lens->lens_correction_amount};
+        const auto config = gyro_settings(settings);
+        const auto profile = lens_profile(lens);
         c_api::Runtime runtime(callbacks);
         runtime.settings().check();
         runtime.log("Planning gyro stabilization");
@@ -251,20 +319,12 @@ sf_status sf_gyro_plan_create(const sf_gyro_settings* settings, const sf_lens_pr
             times.push_back((static_cast<uint64_t>(pts) - static_cast<uint64_t>(plan->origin_us)) / 1e6);
             plan->gyro_infos.push_back({i, pts, duration, 0});
         }
-        std::vector<ImuSample> samples;
-        samples.reserve(imu_count);
-        for (const auto& sample : std::span(imu_samples, imu_count)) {
-            c_api::boolean(sample.has_accel);
-            samples.push_back({sample.time_s, sample.wx, sample.wy, sample.wz, sample.ax, sample.ay, sample.az,
-                               sample.has_accel != 0});
-        }
+        const auto samples = import_imu(imu_samples, imu_count);
         const auto track = integrate_imu(samples, config);
         runtime.settings().check();
         plan->gyro_maps = plan_gyro_frames(times, track, profile, plan->source, config);
         runtime.settings().check();
-        for (const auto& map : plan->gyro_maps)
-            if (map.row_rotations.size() > SF_GYRO_MAX_ROW_ROTATIONS)
-                throw std::logic_error("Gyro map exceeds the public row capacity");
+        std::ranges::for_each(plan->gyro_maps, validate_public_map);
         plan->output = plan->gyro_maps.front().output_size;
         *out = plan.release();
     });
@@ -492,8 +552,7 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
     return c_api::boundary(error, [&] {
         if (!out)
             throw std::invalid_argument("Missing stream output");
-        c_api::require(stream);
-        c_api::boolean(stream->adaptive_tracking);
+        const auto buffering = stream_settings(stream);
         auto settings = c_api::settings(value);
         const auto size = analysis_size(video, settings);
         std::unique_ptr<MotionAnalyzer> motion;
@@ -511,15 +570,7 @@ sf_status sf_stream_create(const sf_settings* value, const sf_stream_settings* s
         result->size = size;
         result->horizontal = video->horizontal_scan != 0;
         result->analyzer = std::make_unique<StreamAnalyzer>(
-            settings,
-            StreamSettings{stream->lookahead_seconds, stream->max_buffered_frames,
-#ifdef __ANDROID__
-                           true,
-#else
-                           false,
-#endif
-                           stream->adaptive_tracking != 0},
-            size, video->fps, result->horizontal, std::move(motion), result->runtime.settings(),
+            settings, buffering, size, video->fps, result->horizontal, std::move(motion), result->runtime.settings(),
 #ifdef STILLFLOW_C_OPENCV
             value->motion_estimator == SF_MOTION_OPENCV ? make_opencv_analyzer(settings, result->horizontal) :
 #endif
@@ -544,18 +595,7 @@ sf_status sf_stream_push(sf_stream* stream, const sf_image* image, int64_t pts, 
         return accepted ? SF_OK : SF_AGAIN;
     });
 }
-sf_status sf_stream_finish(sf_stream* stream, sf_error* error) {
-    return c_api::boundary(error, [&] {
-        c_api::require(stream);
-        stream->runtime.settings().check();
-        if (!stream->finished) {
-            Profile call{profile_now};
-            stream->analyzer->finish(&call);
-            stream->record(call);
-            stream->finished = true;
-        }
-    });
-}
+sf_status sf_stream_finish(sf_stream* stream, sf_error* error) { return finish_stream(stream, error); }
 sf_status sf_stream_take_ready(sf_stream* stream, sf_frame_plan** out, sf_error* error) {
     if (out)
         *out = nullptr;
@@ -585,18 +625,79 @@ sf_status sf_stream_take_ready(sf_stream* stream, sf_frame_plan** out, sf_error*
     });
 }
 sf_status sf_stream_get_profile(const sf_stream* stream, sf_profile_visitor visitor, void* data, sf_error* error) {
-    return c_api::boundary(error, [&] {
-        if (!stream || !visitor)
-            throw std::invalid_argument("Missing stream or profile visitor");
-        for (const auto& [stage, stats] : stream->profile) {
-            const sf_profile_entry entry{stage.c_str(),          stats.count,           stats.total,
-                                         stats.minimum,          stats.maximum,         stats.percentile(0.50),
-                                         stats.percentile(0.95), stats.percentile(0.99)};
-            visitor(data, &entry);
-        }
-    });
+    return stream_profile(stream, visitor, data, error);
 }
 void sf_stream_destroy(sf_stream* stream) { delete stream; }
+sf_status sf_gyro_stream_create(const sf_gyro_settings* settings, const sf_lens_profile* lens,
+                                const sf_stream_settings* stream, int32_t input_width, int32_t input_height,
+                                const sf_runtime* callbacks, sf_gyro_stream** out, sf_error* error) {
+    if (out)
+        *out = nullptr;
+    return c_api::boundary(error, [&] {
+        c_api::require(out);
+        auto result = std::make_unique<sf_gyro_stream>(callbacks);
+        result->runtime.settings().check();
+        result->source = {input_width, input_height};
+        result->analyzer =
+            std::make_unique<GyroStream>(gyro_settings(settings), lens_profile(lens), stream_settings(stream),
+                                         result->source, result->runtime.settings());
+        *out = result.release();
+    });
+}
+sf_status sf_gyro_stream_push_imu(sf_gyro_stream* stream, const sf_imu_sample* samples, size_t count, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(stream);
+        stream->runtime.settings().check();
+        if (stream->finished)
+            throw std::logic_error("Stream input is sealed");
+        stream->analyzer->push_imu(import_imu(samples, count));
+    });
+}
+sf_status sf_gyro_stream_push_frame(sf_gyro_stream* stream, int64_t pts, int64_t duration, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(stream);
+        return stream->analyzer->push_frame(pts, duration) ? SF_OK : SF_AGAIN;
+    });
+}
+sf_status sf_gyro_stream_finish(sf_gyro_stream* stream, sf_error* error) { return finish_stream(stream, error); }
+sf_status sf_gyro_stream_take_ready(sf_gyro_stream* stream, sf_frame_plan** out, sf_error* error) {
+    if (out)
+        *out = nullptr;
+    return c_api::boundary(error, [&]() -> sf_status {
+        c_api::require(stream);
+        c_api::require(out);
+        auto plan = std::make_unique<sf_frame_plan>();
+        ReadyGyroFrame ready;
+        Profile call{profile_now};
+        const bool available = stream->analyzer->take_ready(ready, &call);
+        stream->record(call);
+        if (!available)
+            return stream->finished ? SF_END : SF_AGAIN;
+        plan->gyro = true;
+        plan->source = stream->source;
+        validate_public_map(ready.map);
+        plan->gyro_map = std::move(ready.map);
+        plan->info = {ready.index, ready.pts_us, ready.duration_us, ready.lookahead_seconds};
+        *out = plan.release();
+        return SF_OK;
+    });
+}
+sf_status sf_gyro_stream_get_output_size(const sf_gyro_stream* stream, int32_t* width, int32_t* height,
+                                         sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(stream);
+        c_api::require(width);
+        c_api::require(height);
+        const auto size = stream->analyzer->output_size();
+        *width = size.width;
+        *height = size.height;
+    });
+}
+sf_status sf_gyro_stream_get_profile(const sf_gyro_stream* stream, sf_profile_visitor visitor, void* data,
+                                     sf_error* error) {
+    return stream_profile(stream, visitor, data, error);
+}
+void sf_gyro_stream_destroy(sf_gyro_stream* stream) { delete stream; }
 sf_status sf_renderer_create(sf_backend backend, const sf_runtime* callbacks, sf_renderer** out, sf_error* error) {
     if (out)
         *out = nullptr;

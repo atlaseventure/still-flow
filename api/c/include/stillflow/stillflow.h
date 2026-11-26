@@ -92,6 +92,7 @@ typedef struct sf_analyzer sf_analyzer;
 typedef struct sf_plan sf_plan;
 typedef struct sf_frame_plan sf_frame_plan;
 typedef struct sf_stream sf_stream;
+typedef struct sf_gyro_stream sf_gyro_stream;
 typedef struct sf_renderer sf_renderer;
 typedef struct sf_frame sf_frame;
 typedef struct sf_error {
@@ -224,6 +225,22 @@ typedef void (*sf_profile_visitor)(void* user_data, const sf_profile_entry* entr
    stage count. The visitor must not reenter the stream. */
 SF_API sf_status sf_stream_get_profile(const sf_stream*, sf_profile_visitor, void* user_data, sf_error*);
 SF_API void sf_stream_destroy(sf_stream*);
+/* Feed timestamped IMU samples in chronological batches. A zero count is a no-op.
+   Frame pushes and draining follow the sf_stream backpressure and ownership contract. */
+SF_API sf_status sf_gyro_stream_create(const sf_gyro_settings* settings, const sf_lens_profile* lens,
+                                       const sf_stream_settings* stream, int32_t input_width, int32_t input_height,
+                                       const sf_runtime* runtime, sf_gyro_stream** out, sf_error* error);
+SF_API sf_status sf_gyro_stream_push_imu(sf_gyro_stream* stream, const sf_imu_sample* samples, size_t count,
+                                         sf_error* error);
+SF_API sf_status sf_gyro_stream_push_frame(sf_gyro_stream* stream, int64_t pts_us, int64_t duration_us,
+                                           sf_error* error);
+SF_API sf_status sf_gyro_stream_finish(sf_gyro_stream* stream, sf_error* error);
+SF_API sf_status sf_gyro_stream_take_ready(sf_gyro_stream* stream, sf_frame_plan** out, sf_error* error);
+SF_API sf_status sf_gyro_stream_get_output_size(const sf_gyro_stream* stream, int32_t* width, int32_t* height,
+                                                sf_error* error);
+SF_API sf_status sf_gyro_stream_get_profile(const sf_gyro_stream* stream, sf_profile_visitor visitor, void* user_data,
+                                            sf_error* error);
+SF_API void sf_gyro_stream_destroy(sf_gyro_stream* stream);
 /* Process-wide; call before starting analysis workers. */
 SF_API sf_status sf_opencv_set_threads(int32_t threads, sf_error*);
 
