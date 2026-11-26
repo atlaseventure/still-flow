@@ -36,6 +36,58 @@ enum { SF_MOTION_TRANSLATION = 0, SF_MOTION_OPENCV = 1 };
 typedef int32_t sf_backend;
 enum { SF_BACKEND_AUTO = 0, SF_BACKEND_CPU = 1, SF_BACKEND_GLES = 2, SF_BACKEND_CUDA = 3 };
 
+typedef int32_t sf_imu_integration;
+enum { SF_IMU_AUTO = 0, SF_IMU_GYRO = 1, SF_IMU_COMPLEMENTARY = 2 };
+typedef int32_t sf_lens_model;
+enum { SF_LENS_NONE = 0, SF_LENS_OPENCV_FISHEYE = 1 };
+
+typedef struct sf_lens_profile {
+    sf_lens_model model;
+    int32_t calib_width, calib_height;
+    double fx, fy, cx, cy;
+    double k[4];
+    double lens_correction_amount;
+} sf_lens_profile;
+typedef struct sf_imu_sample {
+    double time_s;     /* Seconds relative to the first video PTS, before time_offset_s. */
+    double wx, wy, wz; /* Camera-frame angular velocity in rad/s. */
+    double ax, ay, az; /* Proper acceleration in m/s^2. */
+    int32_t has_accel; /* Boolean: 0 or 1. */
+} sf_imu_sample;
+typedef struct sf_gyro_settings {
+    double smoothness;
+    int32_t per_axis;
+    double smoothness_pitch, smoothness_yaw, smoothness_roll;
+    double max_smoothness, alpha_0_1s;
+    double readout_ms;
+    int32_t readout_top_to_bottom;
+    double fov, max_zoom;
+    int32_t max_zoom_iterations;
+    double adaptive_zoom_window_s;
+    int32_t adaptive_zoom;
+    double time_offset_s;
+    sf_imu_integration integration_method;
+    int32_t output_width, output_height;
+    int32_t zoom_envelope;
+} sf_gyro_settings;
+typedef struct sf_frame_timestamp {
+    int64_t pts_us, duration_us;
+} sf_frame_timestamp;
+#define SF_GYRO_MAX_ROW_ROTATIONS 64
+typedef struct sf_gyro_map {
+    int32_t input_width, input_height;
+    int32_t output_width, output_height;
+    sf_lens_model lens_model;
+    double in_fx, in_fy, in_cx, in_cy;
+    double k[4];
+    double lens_correction_amount;
+    double out_fx, out_fy, out_cx, out_cy;
+    double fov_scale, zoom_ratio, smooth_factor;
+    int32_t row_count;
+    int32_t sensor_rows;
+    double row_rotations[9 * SF_GYRO_MAX_ROW_ROTATIONS]; /* Nine row-major values per rotation. */
+} sf_gyro_map;
+
 typedef struct sf_analyzer sf_analyzer;
 typedef struct sf_plan sf_plan;
 typedef struct sf_frame_plan sf_frame_plan;
@@ -106,6 +158,12 @@ typedef struct sf_recovery_frame {
 } sf_recovery_frame;
 
 SF_API sf_settings sf_settings_default(void);
+SF_API sf_lens_profile sf_lens_profile_default(void);
+SF_API sf_gyro_settings sf_gyro_settings_default(void);
+SF_API sf_status sf_gyro_plan_create(const sf_gyro_settings* settings, const sf_lens_profile* lens, int32_t input_width,
+                                     int32_t input_height, const sf_frame_timestamp* frames, size_t frame_count,
+                                     const sf_imu_sample* imu_samples, size_t imu_count, const sf_runtime* runtime,
+                                     sf_plan** out, sf_error* error);
 SF_API sf_image sf_image_default(void);
 SF_API const char* sf_build_description(void);
 SF_API sf_status sf_analyzer_create(const sf_settings*, const sf_video*, const sf_runtime*, sf_analyzer**, sf_error*);
@@ -133,6 +191,9 @@ typedef struct sf_map {
     double offsets[2 * SF_MAP_MAX_VERTICES];
 } sf_map;
 SF_API sf_status sf_frame_plan_get_map(const sf_frame_plan*, int32_t width, int32_t height, sf_map*, sf_error*);
+SF_API sf_status sf_frame_plan_get_gyro_map(const sf_frame_plan* plan, sf_gyro_map* out, sf_error* error);
+SF_API sf_status sf_frame_plan_get_output_size(const sf_frame_plan* plan, int32_t* width, int32_t* height,
+                                               sf_error* error);
 SF_API void sf_frame_plan_destroy(sf_frame_plan*);
 
 typedef struct sf_stream_settings {
@@ -175,7 +236,7 @@ typedef struct sf_renderer_info {
     int32_t gpu;
 } sf_renderer_info;
 SF_API sf_status sf_renderer_get_info(const sf_renderer*, sf_renderer_info*, sf_error*);
-/* Input dimensions match sf_video. Output retains the input format and frame
+/* Input dimensions match the source dimensions of the plan. Output retains the input format and frame
    plan timing. CPU supports gray8/BGR8/RGBA8 and NV12/NV21/I420 planes. */
 SF_API sf_status sf_renderer_render(sf_renderer*, const sf_frame_plan*, const sf_image*, sf_frame**, sf_error*);
 SF_API void sf_renderer_destroy(sf_renderer*);

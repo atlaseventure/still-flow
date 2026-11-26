@@ -3,6 +3,7 @@
 #include <GLES3/gl31.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 
@@ -88,23 +89,19 @@ class Current {
     EGLSurface draw_, read_;
 };
 
-constexpr const char* shader_body = R"glsl(
+constexpr const char* shader_common = R"glsl(
 precision highp float;
 precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 0) readonly buffer Input { uint inputPixels[]; };
 layout(std430, binding = 1) writeonly buffer Output { uint outputPixels[]; };
-layout(std430, binding = 2) readonly buffer Mesh { vec2 offsets[]; };
 layout(std430, binding = 3) buffer Counts { uint invalidCount; uint badCoordinate; };
-uniform ivec2 dimensions;
+uniform ivec2 inputDimensions;
 uniform uint stride;
 uniform uint channels;
-uniform ivec2 meshSize;
-uniform vec2 gridScale;
-uniform vec4 viewport;
 
 uvec4 samplePixel(ivec2 p) {
-    p = clamp(p, ivec2(0), dimensions - 1);
+    p = clamp(p, ivec2(0), inputDimensions - 1);
     uint base = uint(p.y) * stride + uint(p.x) * channels;
     uvec4 result = uvec4(0);
     for (uint c = 0u; c < channels; ++c) {
@@ -113,13 +110,20 @@ uvec4 samplePixel(ivec2 p) {
     }
     return result;
 }
+)glsl";
+constexpr const char* shader_body = R"glsl(
+layout(std430, binding = 2) readonly buffer Mesh { vec2 offsets[]; };
+uniform ivec2 meshSize;
+uniform vec2 gridScale;
+uniform vec4 viewport;
+
 vec4 weights(float t) {
     float t2=t*t, t3=t2*t;
     return vec4(-0.5*t+t2-0.5*t3, 1.0-2.5*t2+1.5*t3, 0.5*t+2.0*t2-1.5*t3, -0.5*t2+0.5*t3);
 }
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(at, dimensions))) return;
+    if (any(greaterThanEqual(at, inputDimensions))) return;
     vec2 target = viewport.xy + vec2(at) * viewport.zw;
     vec2 p = target;
     for (int iteration = 0; iteration < INVERSE_ITERATIONS; ++iteration) {
@@ -136,9 +140,9 @@ void main() {
         atomicOr(badCoordinate, 1u);
         return;
     }
-    if (any(lessThan(p, vec2(0))) || any(greaterThan(p, vec2(dimensions - 1))))
+    if (any(lessThan(p, vec2(0))) || any(greaterThan(p, vec2(inputDimensions - 1))))
         atomicAdd(invalidCount, 1u);
-    p = clamp(p, vec2(0), vec2(dimensions - 1));
+    p = clamp(p, vec2(0), vec2(inputDimensions - 1));
     ivec2 lo = ivec2(floor(p));
     vec4 wx = weights(p.x-float(lo.x)), wy = weights(p.y-float(lo.y));
     vec4 sum = vec4(0);
@@ -146,9 +150,145 @@ void main() {
         for (int x=0; x<4; ++x)
             sum += vec4(samplePixel(lo+ivec2(x-1,y-1))) * wx[x] * wy[y];
     uvec4 value = uvec4(roundEven(clamp(sum, 0.0, 255.0)));
-    outputPixels[at.y * dimensions.x + at.x] = value.x | (value.y << 8u) | (value.z << 16u) | (value.w << 24u);
+    outputPixels[at.y * inputDimensions.x + at.x] = value.x | (value.y << 8u) | (value.z << 16u) | (value.w << 24u);
 }
 )glsl";
+
+constexpr const char* gyro_shader_body = R"glsl(
+layout(std430, binding = 2) readonly buffer Rotations { float rowMatrices[]; };
+uniform ivec2 outputDimensions;
+uniform int lensModel, rowCount, sensorRows;
+uniform vec4 inIntrinsics, outIntrinsics, distortion;
+uniform float lensCorrectionAmount;
+
+bool gyro_project(vec2 pixel, float fraction, out vec2 p) {
+    vec2 n = (pixel - outIntrinsics.zw) / outIntrinsics.xy;
+    float row = clamp(fraction, 0.0, 1.0) * float(rowCount - 1);
+    int lo = min(int(row), rowCount - 1);
+    int hi = min(lo + 1, rowCount - 1);
+    vec3 ray;
+    for (int j = 0; j < 3; ++j) {
+        int a = lo * 9 + j * 3, b = hi * 9 + j * 3;
+        float first = rowMatrices[a] * n.x + rowMatrices[a+1] * n.y + rowMatrices[a+2];
+        float second = rowMatrices[b] * n.x + rowMatrices[b+1] * n.y + rowMatrices[b+2];
+        ray[j] = first + (row - float(lo)) * (second - first);
+    }
+    if (!(ray.z > 1e-6) || isnan(ray.z) || isinf(ray.z)) return false;
+    vec2 xy = ray.xy / ray.z;
+    if (lensModel == 1 && lensCorrectionAmount > 0.0) {
+        float r = length(xy);
+        if (r > 0.0) {
+            float theta = atan(r), u = theta * theta;
+            float theta_d = theta * (1.0 + u * (distortion.x + u * (distortion.y + u * (distortion.z + u * distortion.w))));
+            xy *= (r + (theta_d - r) * lensCorrectionAmount) / r;
+        }
+    }
+    p.x = xy.x == n.x && inIntrinsics.x == outIntrinsics.x && inIntrinsics.z == outIntrinsics.z
+        ? pixel.x : xy.x * inIntrinsics.x + inIntrinsics.z;
+    p.y = xy.y == n.y && inIntrinsics.y == outIntrinsics.y && inIntrinsics.w == outIntrinsics.w
+        ? pixel.y : xy.y * inIntrinsics.y + inIntrinsics.w;
+    return !any(isnan(p)) && !any(isinf(p));
+}
+
+bool gyro_source_position(vec2 pixel, out vec2 p) {
+    float fraction = pixel.y / float(outputDimensions.y - 1);
+    for (int i = 0; i < (sensorRows != 0 ? 3 : 1); ++i) {
+        if (!gyro_project(pixel, fraction, p)) return false;
+        fraction = p.y / float(inputDimensions.y - 1);
+    }
+    return all(greaterThanEqual(p, vec2(0))) && all(lessThanEqual(p, vec2(inputDimensions - 1)));
+}
+
+void lanczos_weights(float t, out float weights[8]) {
+    bool reverse = t > 0.5;
+    t = reverse ? 1.0 - t : t;
+    if (t < 1e-7) {
+        for (int i = 0; i < 8; ++i) weights[i] = float(i == (reverse ? 4 : 3));
+        return;
+    }
+    float angle = t * 0.7853981633974483;
+    float s = sin(angle), c = cos(angle);
+    const float diagonal = 0.7071067811865475;
+    vec4 phases = vec4(s, -(s+c)*diagonal, c, (s-c)*diagonal);
+    float sum = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        int shift = 3 - i;
+        float d = t + float(shift);
+        float w = phases[(shift + 4) % 4] * (shift < 0 ? -1.0 : 1.0) / (d*d);
+        weights[reverse ? 7-i : i] = w;
+        sum += w;
+    }
+    for (int i = 0; i < 8; ++i) weights[i] /= sum;
+}
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, outputDimensions))) return;
+    int index = at.y * outputDimensions.x + at.x;
+    vec2 p;
+    if (!gyro_source_position(vec2(at), p)) {
+        atomicAdd(invalidCount, 1u);
+        outputPixels[index] = 0u;
+        return;
+    }
+    ivec2 lo = ivec2(floor(p));
+    float wx[8], wy[8];
+    lanczos_weights(p.x - float(lo.x), wx);
+    lanczos_weights(p.y - float(lo.y), wy);
+    vec4 sum = vec4(0);
+    for (int y = 0; y < 8; ++y) {
+        vec4 line = vec4(0);
+        for (int x = 0; x < 8; ++x)
+            line += wx[x] * vec4(samplePixel(lo + ivec2(x-3, y-3)));
+        sum += wy[y] * line;
+    }
+    uvec4 v = uvec4(roundEven(clamp(sum, 0.0, 255.0)));
+    outputPixels[index] = v.x | (v.y << 8u) | (v.z << 16u) | (v.w << 24u);
+}
+)glsl";
+
+void validate_gyro_map(const GyroFrameMap& map, Size uploaded) {
+    const auto finite = [](double v) { return std::isfinite(static_cast<float>(v)); };
+    const auto focal = [&](double v) { return finite(v) && static_cast<float>(v) > 0; };
+    const auto& lens = map.lens;
+    if (uploaded.width < 2 || uploaded.height < 2 || map.input_size.width != uploaded.width ||
+        map.input_size.height != uploaded.height || map.output_size.width < 2 || map.output_size.height < 2 ||
+        map.row_rotations.empty() || map.row_rotations.size() > std::numeric_limits<int>::max() / 9 ||
+        !std::ranges::all_of(
+            map.row_rotations, [&](const Matrix3& m) { return std::ranges::all_of(m.values, finite); }) ||
+        !focal(map.out_fx) || !focal(map.out_fy) || !focal(lens.fx) || !focal(lens.fy) || !finite(map.out_cx) ||
+        !finite(map.out_cy) || !finite(lens.cx) || !finite(lens.cy) || !std::ranges::all_of(lens.k, finite) ||
+        !(lens.lens_correction_amount >= 0 && lens.lens_correction_amount <= 1) ||
+        (lens.model != LensModel::none && lens.model != LensModel::opencv_fisheye))
+        throw std::invalid_argument("Invalid GLES gyro map");
+}
+
+GLuint compile_program(const std::string& source) {
+    const char* text = source.c_str();
+    const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, &text, nullptr);
+    glCompileShader(shader);
+    GLint success = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        std::array<char, 4096> log{};
+        glGetShaderInfoLog(shader, log.size(), nullptr, log.data());
+        glDeleteShader(shader);
+        throw BackendError(std::string("GLES shader compilation failed: ") + log.data());
+    }
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glDeleteShader(shader);
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        std::array<char, 4096> log{};
+        glGetProgramInfoLog(program, log.size(), nullptr, log.data());
+        glDeleteProgram(program);
+        throw BackendError(std::string("GLES program link failed: ") + log.data());
+    }
+    return program;
+}
 
 class GlesBackend final : public RenderBackend {
   public:
@@ -163,29 +303,9 @@ class GlesBackend final : public RenderBackend {
         name_ = renderer ? reinterpret_cast<const char*>(renderer) : "OpenGL ES";
         glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_buffer_);
         const std::string source = "#version 310 es\n#define INVERSE_ITERATIONS " +
-                                   std::to_string(mesh_inverse_iterations) + "\n" + shader_body;
-        const char* text = source.c_str();
-        const GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-        glShaderSource(shader, 1, &text, nullptr);
-        glCompileShader(shader);
-        GLint success = 0;
-        glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-        if (!success) {
-            std::array<char, 4096> log{};
-            glGetShaderInfoLog(shader, log.size(), nullptr, log.data());
-            glDeleteShader(shader);
-            throw BackendError(std::string("GLES shader compilation failed: ") + log.data());
-        }
-        program_ = glCreateProgram();
-        glAttachShader(program_, shader);
-        glLinkProgram(program_);
-        glDeleteShader(shader);
-        glGetProgramiv(program_, GL_LINK_STATUS, &success);
-        if (!success) {
-            std::array<char, 4096> log{};
-            glGetProgramInfoLog(program_, log.size(), nullptr, log.data());
-            throw BackendError(std::string("GLES program link failed: ") + log.data());
-        }
+                                   std::to_string(mesh_inverse_iterations) + "\n" + shader_common;
+        program_ = compile_program(source + shader_body);
+        gyro_program_ = compile_program(source + gyro_shader_body);
         glGenBuffers(buffers_.size(), buffers_.data());
         check_gl("Initialize GLES compute");
     }
@@ -194,6 +314,8 @@ class GlesBackend final : public RenderBackend {
         try {
             Current current(context_);
             glDeleteBuffers(buffers_.size(), buffers_.data());
+            if (gyro_program_)
+                glDeleteProgram(gyro_program_);
             if (program_)
                 glDeleteProgram(program_);
         } catch (...) {
@@ -206,7 +328,7 @@ class GlesBackend final : public RenderBackend {
         return {"gles",
                 name_,
                 {{PixelFormat::gray8, PixelFormat::bgr8, PixelFormat::rgba8}, {"host"}},
-                {{"sampler", "catmull-rom"}, {"api", "OpenGL ES 3.1 compute"}}};
+                {{"sampler", "visual catmull-rom, gyro lanczos4"}, {"api", "OpenGL ES 3.1 compute"}}};
     }
 
     void upload(const Image& input) override {
@@ -233,8 +355,35 @@ class GlesBackend final : public RenderBackend {
         rendered_ = false;
     }
 
-    double warp_gyro(const GyroFrameMap&) override {
-        throw NotImplementedError("Gyro stabilization rendering is not implemented for GLES backend");
+    double warp_gyro(const GyroFrameMap& map) override {
+        if (!uploaded_)
+            throw std::invalid_argument("No uploaded GLES gyro input");
+        validate_gyro_map(map, size_);
+        const auto size = map.output_size;
+        const auto output_bytes = static_cast<size_t>(size.width) * size.height * 4;
+        const auto row_bytes = map.row_rotations.size() * 9 * sizeof(float);
+        if (output_bytes > static_cast<uint64_t>(max_buffer_) || row_bytes > static_cast<uint64_t>(max_buffer_))
+            throw BackendError("Frame exceeds GLES storage limits");
+        std::vector<float> rows;
+        rows.reserve(map.row_rotations.size() * 9);
+        for (const auto& rotation : map.row_rotations)
+            rows.insert(rows.end(), rotation.values.begin(), rotation.values.end());
+        Current current(context_);
+        reserve(1, output_bytes);
+        reserve(2, row_bytes);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, row_bytes, rows.data());
+        bind_warp(gyro_program_);
+        const auto uniform = [&](const char* name) { return glGetUniformLocation(gyro_program_, name); };
+        const auto& lens = map.lens;
+        glUniform2i(uniform("outputDimensions"), size.width, size.height);
+        glUniform1i(uniform("lensModel"), static_cast<int>(lens.model));
+        glUniform1i(uniform("rowCount"), static_cast<int>(map.row_rotations.size()));
+        glUniform1i(uniform("sensorRows"), map.sensor_rows);
+        glUniform4f(uniform("inIntrinsics"), lens.fx, lens.fy, lens.cx, lens.cy);
+        glUniform4f(uniform("outIntrinsics"), map.out_fx, map.out_fy, map.out_cx, map.out_cy);
+        glUniform4f(uniform("distortion"), lens.k[0], lens.k[1], lens.k[2], lens.k[3]);
+        glUniform1f(uniform("lensCorrectionAmount"), lens.lens_correction_amount);
+        return dispatch(size);
     }
     double warp(const MapParameters& map) override {
         if (!uploaded_)
@@ -250,38 +399,17 @@ class GlesBackend final : public RenderBackend {
         }
         reserve(2, sizeof(offsets));
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(offsets), offsets.data());
-        std::array<GLuint, 2> counts{};
-        reserve(3, sizeof(counts));
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counts), counts.data());
-        for (GLuint i = 0; i < buffers_.size(); ++i)
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, buffers_[i]);
-        glUseProgram(program_);
-        glUniform2i(location("dimensions"), size_.width, size_.height);
-        glUniform1ui(location("stride"), stride_);
-        glUniform1ui(location("channels"), channels_);
+        bind_warp(program_);
         glUniform2i(location("meshSize"), map.columns, map.rows);
         glUniform2f(location("gridScale"), map.grid_x, map.grid_y);
         glUniform4f(location("viewport"), map.origin_x, map.origin_y, map.step_x, map.step_y);
-        glDispatchCompute((size_.width + 15) / 16, (size_.height + 15) / 16, 1);
-        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
-        check_gl("Dispatch GLES warp");
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[3]);
-        const void* readback = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counts), GL_MAP_READ_BIT);
-        if (!readback)
-            throw BackendError("Cannot read GLES boundary counts");
-        std::memcpy(counts.data(), readback, sizeof(counts));
-        if (!glUnmapBuffer(GL_SHADER_STORAGE_BUFFER))
-            throw BackendError("GLES boundary buffer was lost");
-        if (counts[1])
-            throw std::invalid_argument("Invalid sample coordinate");
-        rendered_ = true;
-        return double(counts[0]) / (static_cast<double>(size_.width) * size_.height);
+        return dispatch(size_);
     }
 
     Image download() override {
         if (!rendered_)
             throw std::logic_error("No rendered image");
-        const size_t count = static_cast<size_t>(size_.width) * size_.height;
+        const size_t count = static_cast<size_t>(output_size_.width) * output_size_.height;
         std::vector<uint8_t> pixels(count * channels_);
         Current current(context_);
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
@@ -297,12 +425,41 @@ class GlesBackend final : public RenderBackend {
         if (!glUnmapBuffer(GL_SHADER_STORAGE_BUFFER))
             throw BackendError("GLES output buffer was lost");
         check_gl("Download GLES frame");
-        auto result = map_host_image(make_host_image(size_, format_, std::move(pixels)));
+        auto result = map_host_image(make_host_image(output_size_, format_, std::move(pixels)));
         result.color = color_;
         return borrow_host_image(std::move(result));
     }
 
   private:
+    void bind_warp(GLuint program) {
+        std::array<GLuint, 2> counts{};
+        reserve(3, sizeof(counts));
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counts), counts.data());
+        for (GLuint i = 0; i < buffers_.size(); ++i)
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, buffers_[i]);
+        glUseProgram(program);
+        glUniform2i(glGetUniformLocation(program, "inputDimensions"), size_.width, size_.height);
+        glUniform1ui(glGetUniformLocation(program, "stride"), stride_);
+        glUniform1ui(glGetUniformLocation(program, "channels"), channels_);
+    }
+    double dispatch(Size size) {
+        std::array<GLuint, 2> counts{};
+        glDispatchCompute((size.width + 15) / 16, (size.height + 15) / 16, 1);
+        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        check_gl("Dispatch GLES warp");
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[3]);
+        const void* readback = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(counts), GL_MAP_READ_BIT);
+        if (!readback)
+            throw BackendError("Cannot read GLES boundary counts");
+        std::memcpy(counts.data(), readback, sizeof(counts));
+        if (!glUnmapBuffer(GL_SHADER_STORAGE_BUFFER))
+            throw BackendError("GLES boundary buffer was lost");
+        if (counts[1])
+            throw std::invalid_argument("Invalid sample coordinate");
+        output_size_ = size;
+        rendered_ = true;
+        return double(counts[0]) / (static_cast<double>(size.width) * size.height);
+    }
     void reserve(size_t index, size_t bytes) {
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[index]);
         if (capacities_[index] < bytes) {
@@ -314,11 +471,11 @@ class GlesBackend final : public RenderBackend {
     GLint location(const char* name) const { return glGetUniformLocation(program_, name); }
     Context context_;
     std::string name_;
-    GLuint program_ = 0;
+    GLuint program_ = 0, gyro_program_ = 0;
     std::array<GLuint, 4> buffers_{};
     std::array<size_t, 4> capacities_{};
     GLint64 max_buffer_ = 0;
-    Size size_{};
+    Size size_{}, output_size_{};
     PixelFormat format_{};
     ColorInfo color_{};
     GLuint stride_ = 0, channels_ = 0;

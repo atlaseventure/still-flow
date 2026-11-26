@@ -84,9 +84,15 @@ struct sf_stream {
 };
 struct sf_plan {
     Plan plan;
-    Size source;
+    Size source, output;
+    bool gyro = false;
+    int64_t origin_us = 0;
+    std::vector<sf_frame_info> gyro_infos;
+    std::vector<GyroFrameMap> gyro_maps;
 };
 struct sf_frame_plan {
+    bool gyro = false;
+    GyroFrameMap gyro_map;
     StabilizationSettings settings;
     Size analysis, source;
     bool horizontal = false;
@@ -144,6 +150,124 @@ sf_status sf_opencv_set_threads(int32_t threads, sf_error* error) {
 }
 sf_settings sf_settings_default(void) {
     return {960, 1200, 12, SF_CROP_AUTO, 1, SF_MOTION_TRANSLATION, 0.45, 0.30, 0.08, 1.0};
+}
+sf_lens_profile sf_lens_profile_default(void) {
+    sf_lens_profile lens{};
+    lens.model = SF_LENS_NONE;
+    lens.lens_correction_amount = 1;
+    return lens;
+}
+sf_gyro_settings sf_gyro_settings_default(void) {
+    const GyroSettings s;
+    return {s.smoothness,
+            s.per_axis,
+            s.smoothness_pitch,
+            s.smoothness_yaw,
+            s.smoothness_roll,
+            s.max_smoothness,
+            s.alpha_0_1s,
+            s.readout_ms,
+            s.readout_top_to_bottom,
+            s.fov,
+            s.max_zoom,
+            s.max_zoom_iterations,
+            s.adaptive_zoom_window_s,
+            s.adaptive_zoom,
+            s.time_offset_s,
+            SF_IMU_GYRO,
+            s.output_size.width,
+            s.output_size.height,
+            s.zoom_envelope};
+}
+sf_status sf_gyro_plan_create(const sf_gyro_settings* settings, const sf_lens_profile* lens, int32_t input_width,
+                              int32_t input_height, const sf_frame_timestamp* frames, size_t frame_count,
+                              const sf_imu_sample* imu_samples, size_t imu_count, const sf_runtime* callbacks,
+                              sf_plan** out, sf_error* error) {
+    if (out)
+        *out = nullptr;
+    return c_api::boundary(error, [&] {
+        c_api::require(out);
+        c_api::require(settings);
+        c_api::require(lens);
+        c_api::require(frames);
+        c_api::require(imu_samples);
+        if (input_width < 2 || input_height < 2 || frame_count == 0 || imu_count == 0)
+            throw std::invalid_argument("Gyro planning requires valid input dimensions, frames and IMU samples");
+        if (lens->model != SF_LENS_NONE && lens->model != SF_LENS_OPENCV_FISHEYE)
+            throw std::invalid_argument("Invalid lens model");
+        const auto& s = *settings;
+        if ((s.output_width != 0 || s.output_height != 0) && (s.output_width < 2 || s.output_height < 2))
+            throw std::invalid_argument("Gyro output dimensions must both be zero or at least two");
+        c_api::boolean(s.per_axis);
+        c_api::boolean(s.readout_top_to_bottom);
+        c_api::boolean(s.adaptive_zoom);
+        c_api::boolean(s.zoom_envelope);
+        if (s.integration_method != SF_IMU_AUTO && s.integration_method != SF_IMU_GYRO &&
+            s.integration_method != SF_IMU_COMPLEMENTARY)
+            throw std::invalid_argument("Invalid IMU integration method");
+        const GyroSettings config{.smoothness = s.smoothness,
+                                  .per_axis = s.per_axis != 0,
+                                  .smoothness_pitch = s.smoothness_pitch,
+                                  .smoothness_yaw = s.smoothness_yaw,
+                                  .smoothness_roll = s.smoothness_roll,
+                                  .max_smoothness = s.max_smoothness,
+                                  .alpha_0_1s = s.alpha_0_1s,
+                                  .readout_ms = s.readout_ms,
+                                  .readout_top_to_bottom = s.readout_top_to_bottom != 0,
+                                  .fov = s.fov,
+                                  .max_zoom = s.max_zoom,
+                                  .max_zoom_iterations = s.max_zoom_iterations,
+                                  .adaptive_zoom_window_s = s.adaptive_zoom_window_s,
+                                  .adaptive_zoom = s.adaptive_zoom != 0,
+                                  .time_offset_s = s.time_offset_s,
+                                  .integration_method = s.integration_method == SF_IMU_COMPLEMENTARY
+                                                            ? ImuIntegrationMethod::complementary
+                                                            : ImuIntegrationMethod::gyro_only,
+                                  .output_size = {s.output_width, s.output_height},
+                                  .zoom_envelope = s.zoom_envelope != 0};
+        const LensProfile profile{static_cast<LensModel>(lens->model),
+                                  {lens->calib_width, lens->calib_height},
+                                  lens->fx,
+                                  lens->fy,
+                                  lens->cx,
+                                  lens->cy,
+                                  std::to_array(lens->k),
+                                  lens->lens_correction_amount};
+        c_api::Runtime runtime(callbacks);
+        runtime.settings().check();
+        runtime.log("Planning gyro stabilization");
+        auto plan = std::make_unique<sf_plan>();
+        plan->gyro = true;
+        plan->source = {input_width, input_height};
+        plan->origin_us = frames[0].pts_us;
+        plan->gyro_infos.reserve(frame_count);
+        std::vector<double> times;
+        times.reserve(frame_count);
+        for (size_t i = 0; i < frame_count; ++i) {
+            const auto [pts, duration] = frames[i];
+            if (duration < 0 || (i && pts <= frames[i - 1].pts_us))
+                throw std::invalid_argument("Invalid gyro frame timestamp");
+            // Unsigned subtraction covers the entire distance between two ordered int64 timestamps.
+            times.push_back((static_cast<uint64_t>(pts) - static_cast<uint64_t>(plan->origin_us)) / 1e6);
+            plan->gyro_infos.push_back({i, pts, duration, 0});
+        }
+        std::vector<ImuSample> samples;
+        samples.reserve(imu_count);
+        for (const auto& sample : std::span(imu_samples, imu_count)) {
+            c_api::boolean(sample.has_accel);
+            samples.push_back({sample.time_s, sample.wx, sample.wy, sample.wz, sample.ax, sample.ay, sample.az,
+                               sample.has_accel != 0});
+        }
+        const auto track = integrate_imu(samples, config);
+        runtime.settings().check();
+        plan->gyro_maps = plan_gyro_frames(times, track, profile, plan->source, config);
+        runtime.settings().check();
+        for (const auto& map : plan->gyro_maps)
+            if (map.row_rotations.size() > SF_GYRO_MAX_ROW_ROTATIONS)
+                throw std::logic_error("Gyro map exceeds the public row capacity");
+        plan->output = plan->gyro_maps.front().output_size;
+        *out = plan.release();
+    });
 }
 sf_image sf_image_default(void) {
     sf_image image{};
@@ -233,6 +357,10 @@ sf_status sf_plan_get_info(const sf_plan* plan, sf_plan_info* info, sf_error* er
         if (!plan)
             throw std::invalid_argument("Missing plan");
         c_api::require(info);
+        if (plan->gyro) {
+            *info = {plan->gyro_maps.size(), plan->output.width, plan->output.height, plan->origin_us};
+            return;
+        }
         info->frames = plan->plan.warps.size();
         info->analysis_width = plan->plan.analysis.size.width;
         info->analysis_height = plan->plan.analysis.size.height;
@@ -245,11 +373,18 @@ sf_status sf_plan_get_frame(const sf_plan* plan, size_t index, sf_frame_plan** o
     return c_api::boundary(error, [&] {
         c_api::require(plan);
         c_api::require(out);
+        auto frame = std::make_unique<sf_frame_plan>();
+        frame->source = plan->source;
+        if (plan->gyro) {
+            frame->gyro = true;
+            frame->gyro_map = plan->gyro_maps.at(index);
+            frame->info = plan->gyro_infos.at(index);
+            *out = frame.release();
+            return;
+        }
         const auto& p = plan->plan;
         const auto& observation = p.analysis.frames.at(index);
-        auto frame = std::make_unique<sf_frame_plan>();
         frame->settings = p.settings;
-        frame->source = plan->source;
         frame->analysis = p.analysis.size;
         frame->horizontal = p.analysis.horizontal;
         frame->warp = p.warps.at(index);
@@ -273,7 +408,10 @@ sf_status sf_frame_plan_get_map(const sf_frame_plan* plan, int32_t width, int32_
         *out = {};
     return c_api::boundary(error, [&] {
         c_api::require(out);
-        if (!plan || width < 2 || height < 2)
+        c_api::require(plan);
+        if (plan->gyro)
+            throw std::logic_error("Gyro frame plan has no visual displacement mesh");
+        if (width < 2 || height < 2)
             throw std::invalid_argument("Invalid map geometry");
         const auto map =
             prepare_map(plan->warp, plan->analysis, {width, height}, plan->settings.crop, plan->horizontal);
@@ -291,6 +429,49 @@ sf_status sf_frame_plan_get_map(const sf_frame_plan* plan, int32_t width, int32_
             out->offsets[2 * i] = map.offset_x[i];
             out->offsets[2 * i + 1] = map.offset_y[i];
         }
+    });
+}
+sf_status sf_frame_plan_get_gyro_map(const sf_frame_plan* plan, sf_gyro_map* out, sf_error* error) {
+    if (out)
+        *out = {};
+    return c_api::boundary(error, [&] {
+        c_api::require(plan);
+        c_api::require(out);
+        if (!plan->gyro)
+            throw std::logic_error("Visual frame plan has no gyro map");
+        const auto& m = plan->gyro_map;
+        out->input_width = m.input_size.width;
+        out->input_height = m.input_size.height;
+        out->output_width = m.output_size.width;
+        out->output_height = m.output_size.height;
+        out->lens_model = static_cast<sf_lens_model>(m.lens.model);
+        out->in_fx = m.lens.fx;
+        out->in_fy = m.lens.fy;
+        out->in_cx = m.lens.cx;
+        out->in_cy = m.lens.cy;
+        std::ranges::copy(m.lens.k, out->k);
+        out->lens_correction_amount = m.lens.lens_correction_amount;
+        out->out_fx = m.out_fx;
+        out->out_fy = m.out_fy;
+        out->out_cx = m.out_cx;
+        out->out_cy = m.out_cy;
+        out->fov_scale = m.fov_scale;
+        out->zoom_ratio = m.zoom_ratio;
+        out->smooth_factor = m.smooth_factor;
+        out->row_count = static_cast<int32_t>(m.row_rotations.size());
+        out->sensor_rows = m.sensor_rows;
+        for (size_t i = 0; i < m.row_rotations.size(); ++i)
+            std::ranges::copy(m.row_rotations[i].values, out->row_rotations + 9 * i);
+    });
+}
+sf_status sf_frame_plan_get_output_size(const sf_frame_plan* plan, int32_t* width, int32_t* height, sf_error* error) {
+    return c_api::boundary(error, [&] {
+        c_api::require(plan);
+        c_api::require(width);
+        c_api::require(height);
+        const auto size = plan->gyro ? plan->gyro_map.output_size : plan->source;
+        *width = size.width;
+        *height = size.height;
     });
 }
 void sf_frame_plan_destroy(sf_frame_plan* plan) { delete plan; }
@@ -455,13 +636,21 @@ sf_status sf_renderer_render(sf_renderer* renderer, const sf_frame_plan* plan, c
     return c_api::boundary(error, [&] {
         if (!renderer || !plan || !out)
             throw std::invalid_argument("Missing render argument");
-        validate_image_size(image, plan->source, plan->source);
+        c_api::require(image);
+        if (image->width != plan->source.width || image->height != plan->source.height)
+            throw std::invalid_argument("Render input dimensions do not match the plan");
         renderer->runtime.settings().check();
         Profile profile;
-        auto warp = plan->warp;
         auto frame = std::make_unique<sf_frame>();
-        frame->image = renderer->renderer->render(import_image(image), warp, plan->analysis, plan->settings.crop,
-                                                  plan->horizontal, profile);
+        if (plan->gyro) {
+            double invalid_fraction = 0;
+            frame->image =
+                renderer->renderer->render_gyro(import_image(image), plan->gyro_map, invalid_fraction, profile);
+        } else {
+            auto warp = plan->warp;
+            frame->image = renderer->renderer->render(import_image(image), warp, plan->analysis, plan->settings.crop,
+                                                      plan->horizontal, profile);
+        }
         renderer->runtime.settings().check();
         frame->view = map_host_image(frame->image);
         frame->info = plan->info;

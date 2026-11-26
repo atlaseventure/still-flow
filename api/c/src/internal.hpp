@@ -41,6 +41,9 @@ template <class F> sf_status boundary(sf_error* error, F work) noexcept {
     } catch (const std::out_of_range& e) {
         message(error, e.what());
         return SF_INVALID_ARGUMENT;
+    } catch (const std::domain_error& e) {
+        message(error, e.what());
+        return SF_INVALID_ARGUMENT;
     } catch (const std::logic_error& e) {
         message(error, e.what());
         return SF_INVALID_STATE;

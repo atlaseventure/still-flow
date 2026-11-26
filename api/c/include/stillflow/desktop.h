@@ -21,8 +21,6 @@ typedef int32_t sf_decoder;
 enum { SF_DECODER_AUTO = 0, SF_DECODER_CPU = 1, SF_DECODER_NVDEC = 2 };
 typedef int32_t sf_encoder;
 enum { SF_ENCODER_AUTO = 0, SF_ENCODER_OPENH264 = 1, SF_ENCODER_NVENC = 2 };
-typedef int32_t sf_imu_integration;
-enum { SF_IMU_AUTO = 0, SF_IMU_GYRO = 1, SF_IMU_COMPLEMENTARY = 2 };
 typedef struct sf_gyro_options {
     const char* config;                  /* stabilization.json or .gyroflow. Null selects visual stabilization. */
     const char* imu;                     /* Optional camera-frame IMU CSV override. */
