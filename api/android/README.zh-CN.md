@@ -59,6 +59,33 @@ plan.use {
 
 调用 `finish()` 前，使用原始像素和时间戳补送全部请求的恢复帧。处理视频文件时可按需重新解码，避免将整个视频保存在内存中。
 
+## 陀螺仪防抖
+
+`StillFlow.planGyro` 接收输入尺寸、以微秒为单位的逐帧时间戳和时长、相机坐标系 IMU 样本、镜头配置和陀螺仪设置，返回标准离线计划 `StillFlow.Plan`。
+
+在 API 29 及以上版本，使用 `FramePlan.gyroMap()` 和 `GpuFrames` 将解码图像零拷贝渲染到编码器 Surface。编码器和 `GpuFrames` 使用计划的输出宽高，可独立于解码尺寸设置。示例中的 `nextDecodedImage()` 按显示顺序提供解码图像，`bt709` 和 `fullRange` 描述输入的色彩矩阵与范围。
+
+```kotlin
+val settings = StillFlow.GyroSettings().apply {
+    outputWidth = 2704
+    outputHeight = 1520
+}
+StillFlow.planGyro(width, height, timestampsUs, durationsUs, imuSamples, lens, settings).use { plan ->
+    GpuFrames(width, height, 2, encoderSurface,
+        outputWidth = settings.outputWidth, outputHeight = settings.outputHeight).use { gpu ->
+        timestampsUs.forEachIndexed { index, ptsUs ->
+            plan.frame(index.toLong()).use { frame ->
+                nextDecodedImage().use { image ->
+                    gpu.render(image, frame.gyroMap(), ptsUs - timestampsUs[0], bt709, fullRange)
+                }
+            }
+        }
+    }
+}
+```
+
+对于紧凑排列的像素帧，`StillFlow.Renderer` 支持使用 `StillFlow.Backend.GLES`（计算着色器）或 `StillFlow.Backend.CPU` 渲染陀螺仪帧计划。按帧计划的 `outputWidth × outputHeight` 和输入像素格式分配直接缓冲区，返回的 `StillFlow.Frame` 使用该输出尺寸。
+
 ## 流式处理
 
 使用独立的 `StreamSettings` 创建 `StillFlow.Stream(video, settings, streaming)`，默认前视 1.35 秒。通过 `tryPush()` 推帧，按索引保留全分辨率帧，再调用 `poll()`。`Ready` 持有独立的 `FramePlan`，渲染或提取不可变 `WarpMap` 后关闭；`Pending` 表示需要更多输入。结束时调用 `finish()`，持续取出结果直到 `End`。被拒绝的输入未被消费，可先处理就绪结果再重试，或丢弃新到达的直播帧。

@@ -25,6 +25,19 @@ uv run --locked --group video python scripts/android.py --help
 
 每次运行将视频和报告保存在 `.local/android-runs/` 下，使用 `--output` 指定新目录。运行器会构建并安装应用；处理完成后清理设备临时文件，保留已安装的应用。
 
+## 陀螺仪防抖
+
+离线导出根据帧时间戳和 IMU 样本生成计划，随后只解码一次视频并渲染到编码器 Surface。输出宽高可独立于输入尺寸设置。
+
+```sh
+uv run --locked --group video python scripts/android.py input.mp4 --gyro-config camera.gyroflow --output-size 2704x1520 --verify-backends
+```
+
+- `--gyro-config PATH` 读取防抖配置 JSON 或 Gyroflow 项目。使用 `--imu PATH` 指定相机坐标系 IMU CSV，`--gyro-offset MS` 调整 IMU 时间偏移，`--imu-integration auto|gyro|complementary` 选择积分方式。
+- `--output-size WxH` 设置偶数输出宽高。`--fov FACTOR` 调整视场，`--max-zoom RATIO` 设置变焦上限，`--zoom-window SECONDS` 设置自适应变焦窗口（0 为固定缩放）。
+- `--gyro-smooth` 和 `--lens-correction` 分别设置平滑强度和镜头校正量，取值均为 0 到 1。`--readout-ms MS` 设置滚动快门读出时间。
+- `--verify-backends` 在设备上用恒等变换和模拟相机运动的合成帧检查 CPU 与 GLES 计算渲染结果。
+
 ## 结果对比
 
 `--reference` 比较帧时间和图像几何，对比预览左侧为参考视频，右侧为设备输出。`--max-displacement` 要求每帧具有足够的跟踪特征，且位移的第 95 百分位不超过指定像素阈值；失败时返回非零退出状态。省略阈值时仅报告测量结果。

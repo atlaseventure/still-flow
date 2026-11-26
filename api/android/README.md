@@ -59,6 +59,33 @@ plan.use {
 
 Replay all requested recovery frames with their original pixels and timestamps before calling `finish()`. For video files, decode frames again as needed instead of keeping the entire video in memory.
 
+## Gyroscope stabilization
+
+`StillFlow.planGyro` takes input dimensions, frame timestamps and durations in microseconds, camera-frame IMU samples, a lens profile and gyro settings. It returns a standard offline `StillFlow.Plan`.
+
+On API 29+, use `FramePlan.gyroMap()` with `GpuFrames` for zero-copy rendering to an encoder Surface. Set the encoder and `GpuFrames` to the plan's output dimensions, independently of the decoder size. Here `nextDecodedImage()` supplies the next decoder image in presentation order, and `bt709` and `fullRange` describe the input color format.
+
+```kotlin
+val settings = StillFlow.GyroSettings().apply {
+    outputWidth = 2704
+    outputHeight = 1520
+}
+StillFlow.planGyro(width, height, timestampsUs, durationsUs, imuSamples, lens, settings).use { plan ->
+    GpuFrames(width, height, 2, encoderSurface,
+        outputWidth = settings.outputWidth, outputHeight = settings.outputHeight).use { gpu ->
+        timestampsUs.forEachIndexed { index, ptsUs ->
+            plan.frame(index.toLong()).use { frame ->
+                nextDecodedImage().use { image ->
+                    gpu.render(image, frame.gyroMap(), ptsUs - timestampsUs[0], bt709, fullRange)
+                }
+            }
+        }
+    }
+}
+```
+
+For packed frames, `StillFlow.Renderer` accepts gyro frame plans with `StillFlow.Backend.GLES` (compute) or `StillFlow.Backend.CPU`. Size the direct destination buffer for the frame plan's `outputWidth × outputHeight` and the input pixel format. The returned `StillFlow.Frame` has those output dimensions.
+
 ## Streaming
 
 Create `StillFlow.Stream(video, settings, streaming)` with separate `StreamSettings`; lookahead defaults to 1.35 seconds. Push with `tryPush()`, retain full frames by index, and call `poll()`. A `Ready` result owns a `FramePlan`; close it after rendering or extracting an immutable `WarpMap`. `Pending` means more input is needed. End with `finish()` and drain until `End`. Rejected pushes consume nothing: drain and retry, or drop the incoming live frame.

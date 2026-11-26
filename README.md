@@ -25,17 +25,22 @@ Input must be progressive 8-bit SDR with square pixels and even dimensions.
 - Rolling shutter correction is enabled by default; `--rs off` disables it.
 - Output preserves frame timestamps. `--audio auto` copies compatible tracks and converts others to AAC; `--audio none` omits audio.
 
-### Gyroscope stabilization (Host CUDA)
+### Gyroscope stabilization
 
-Offline processing accepts a stabilization JSON or a Gyroflow project with its companion `<stem>.imu_camera.csv`. CPU, GLES and realtime gyro processing return `SF_UNSUPPORTED`.
+Offline gyro stabilization runs on desktop CUDA or CPU and on Android with GLES Surface rendering, GLES compute or CPU. Realtime streaming gyro requests return `SF_UNSUPPORTED`.
+
+Supply a stabilization JSON or a Gyroflow project with its companion `<stem>.imu_camera.csv`. On desktop, `--backend auto` prefers CUDA with CPU fallback.
 
 ```sh
-./build/linux-gcc/stillflow input.mp4 output.mp4 --gyro-config camera.gyroflow --backend cuda
+./build/linux-gcc/stillflow input.mp4 auto.mp4 --gyro-config camera.gyroflow --backend auto
+./build/linux-gcc/stillflow input.mp4 cpu.mp4 --gyro-config camera.gyroflow --backend cpu --decoder cpu --encoder openh264
 ```
 
 - Override the camera-frame CSV with `--imu PATH`, shift IMU time with `--gyro-offset MS`, and select `--imu-integration auto|gyro|complementary`.
 - Set framing with `--output-size WxH`, `--fov FACTOR`, `--max-zoom RATIO` and `--zoom-window SECONDS` (0 for static zoom).
 - Adjust `--gyro-smooth` and `--lens-correction` from 0 to 1. Set rolling shutter readout with `--readout-ms MS`.
+
+In the Core C API, create an offline plan with `sf_gyro_plan_create` and read each frame's map with `sf_frame_plan_get_gyro_map`. The Android AAR provides `StillFlow.planGyro` and `GpuFrames.render`.
 
 ## Core SDK
 
