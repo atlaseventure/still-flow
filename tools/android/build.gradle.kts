@@ -1,4 +1,4 @@
-plugins { id("com.android.application") version "9.5.1" }
+plugins { id("com.android.application") version "9.5.3" }
 
 android {
     namespace = "io.stillflow.runner"

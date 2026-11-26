@@ -46,12 +46,12 @@ def probe(path):
     return {"stream": stream, "timestamps": timestamps}
 
 
-def matching_timeline(left, right, tolerance=1e-5):
+def matching_timeline(left, right, tolerance=1e-5, check_dimensions=True):
     a, b = left["timestamps"], right["timestamps"]
     if len(a) != len(b):
         raise ValueError(f"Frame count mismatch: {len(a)} versus {len(b)}")
     for key in ("width", "height"):
-        if left["stream"][key] != right["stream"][key]:
+        if check_dimensions and left["stream"][key] != right["stream"][key]:
             raise ValueError(f"Video {key} mismatch")
     difference = max(abs((x - a[0]) - (y - b[0])) for x, y in zip(a, b, strict=True))
     if difference > tolerance:

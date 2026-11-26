@@ -11,6 +11,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from android_gyro import load_gyro
 from video_tools import android_input, digest, matching_timeline, probe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,7 @@ class Device:
         result = subprocess.run(
             self.command + list(arguments),
             check=True,
+            stdin=subprocess.DEVNULL,
             stdout=stdout or subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
@@ -70,7 +72,7 @@ class Device:
     def clean(self, directory, app=False):
         prefix = ["run-as", PACKAGE] if app else []
         names = self.shell(*prefix, "ls", directory).decode().split()
-        allowed = {"input.mp4", "config.json", "output.mp4", "result.json"}
+        allowed = {"input.mp4", "config.json", "output.mp4", "result.json", "imu.csv"}
         if not set(names) <= allowed:
             raise RuntimeError(f"Unexpected files in owned run directory: {directory}")
         if names:
@@ -90,6 +92,7 @@ def run(args):
     config = android_input(media)
     config.update(
         realtime=args.realtime,
+        verifyBackends=args.verify_backends,
         paced=args.paced,
         bitrate=args.bitrate,
         horizontalScan=args.horizontal_scan,
@@ -135,6 +138,11 @@ def run(args):
     app_directory = f"files/{run_id}"
     remote_created = app_created = installed = False
     try:
+        if args.gyro_config:
+            try:
+                config["gyro"] = load_gyro(args, output / "imu.csv")
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise ValueError(f"Invalid gyro input for {args.gyro_config}: {error}") from error
         wrapper = str(ROOT / "api/android/gradlew")
         aar = (
             args.aar.resolve(strict=True) if args.aar else ROOT / "api/android/build/outputs/aar/stillflow-release.aar"
@@ -185,7 +193,10 @@ def run(args):
         app_created = True
         config_path = output / "config.json"
         config_path.write_text(json.dumps(config, indent=2) + "\n")
-        for path, name in ((source, "input.mp4"), (config_path, "config.json")):
+        inputs = [(source, "input.mp4"), (config_path, "config.json")]
+        if args.gyro_config:
+            inputs.append((output / "imu.csv", "imu.csv"))
+        for path, name in inputs:
             device.push(path, f"{temporary}/{name}")
             device.shell("run-as", PACKAGE, "cp", f"{temporary}/{name}", f"{app_directory}/{name}")
         remote_hash = device.shell("run-as", PACKAGE, "sha256sum", f"{app_directory}/input.mp4").decode().split()[0]
@@ -217,7 +228,18 @@ def run(args):
         expected = device.shell("run-as", PACKAGE, "sha256sum", f"{app_directory}/output.mp4").decode().split()[0]
         if digest(output / "output.mp4") != expected:
             raise RuntimeError("Output transfer checksum mismatch")
-        pts_error = matching_timeline(media, probe(output / "output.mp4"))
+        out_media = probe(output / "output.mp4")
+        pts_error = matching_timeline(media, out_media, check_dimensions=not args.gyro_config)
+        if args.gyro_config:
+            size = (out_media["stream"]["width"], out_media["stream"]["height"])
+            settings = config["gyro"]["settings"]
+            requested = (settings.get("outputWidth", 0), settings.get("outputHeight", 0))
+            if size != (result["output_width"], result["output_height"]) or (requested != (0, 0) and size != requested):
+                raise RuntimeError(f"Gyro output dimensions mismatch: {size}")
+            if result["mode"] != "offline_gyro" or result["decode_passes"] != 1:
+                raise RuntimeError("Expected single-pass gyro rendering")
+        if args.verify_backends and result.get("backend_verification", {}).get("status") != "passed":
+            raise RuntimeError("Missing successful CPU/GLES backend verification")
         if result["frames"] != len(media["timestamps"]):
             raise RuntimeError("Reported frame count mismatch")
         if not result["gpu"] or result["backend"] != "gles" or not result.get("gpu_surface"):
@@ -271,6 +293,18 @@ def main():
     parser.add_argument("--timeout", type=int, default=1800, help="Per-stage timeout in seconds")
     parser.add_argument("--bitrate", type=int, default=12_000_000)
     parser.add_argument("--realtime", action="store_true")
+    parser.add_argument("--gyro-config", type=Path)
+    parser.add_argument("--imu", type=Path)
+    parser.add_argument("--output-size", metavar="WxH")
+    parser.add_argument("--gyro-smooth", type=float)
+    parser.add_argument("--max-zoom", type=float)
+    parser.add_argument("--zoom-window", type=float)
+    parser.add_argument("--fov", type=float)
+    parser.add_argument("--lens-correction", type=float)
+    parser.add_argument("--readout-ms", type=float)
+    parser.add_argument("--gyro-offset", type=float, help="Additional IMU time offset in milliseconds")
+    parser.add_argument("--imu-integration", choices=("auto", "gyro", "complementary"))
+    parser.add_argument("--verify-backends", action="store_true")
     parser.add_argument("--paced", action="store_true", help="Pace streaming input by source PTS")
     parser.add_argument("--lookahead", type=float, help="Streaming lookahead in seconds, 0..10")
     parser.add_argument("--motion-estimator", choices=("opencv", "translation"))
@@ -293,6 +327,41 @@ def main():
     )
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
+    if args.realtime and args.gyro_config:
+        parser.error("--gyro-config requires offline mode")
+    for name in (
+        "imu",
+        "output_size",
+        "gyro_smooth",
+        "max_zoom",
+        "zoom_window",
+        "fov",
+        "lens_correction",
+        "readout_ms",
+        "gyro_offset",
+        "imu_integration",
+    ):
+        value = getattr(args, name)
+        if value is not None and not args.gyro_config:
+            parser.error(f"--{name.replace('_', '-')} requires --gyro-config")
+        if isinstance(value, float) and not math.isfinite(value):
+            parser.error(f"{name} must be finite")
+    if args.output_size is not None:
+        try:
+            width, height = map(int, args.output_size.split("x"))
+        except ValueError:
+            parser.error("--output-size requires WIDTHxHEIGHT")
+        if min(width, height) < 2 or width % 2 or height % 2:
+            parser.error("--output-size requires positive even dimensions")
+        args.output_size = (width, height)
+    if any(v is not None and not 0 <= v <= 1 for v in (args.gyro_smooth, args.lens_correction)):
+        parser.error("gyro-smooth and lens-correction must be between 0 and 1")
+    if any(v is not None and v < 0 for v in (args.readout_ms, args.zoom_window)):
+        parser.error("readout-ms and zoom-window must be nonnegative")
+    if args.fov is not None and args.fov <= 0:
+        parser.error("fov must be positive")
+    if args.max_zoom is not None and (args.max_zoom < 1 or 10 < args.max_zoom < 100):
+        parser.error("max-zoom must be at least 1x or 100 percent")
     if args.lookahead is not None and (not math.isfinite(args.lookahead) or not 0 <= args.lookahead <= 10):
         parser.error("lookahead must be finite and between 0 and 10")
     if min(args.jobs, args.timeout, args.bitrate) <= 0:

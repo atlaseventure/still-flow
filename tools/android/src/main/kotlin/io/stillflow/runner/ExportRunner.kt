@@ -18,6 +18,9 @@ import android.hardware.HardwareBuffer
 import io.stillflow.HardwareCodecs
 import io.stillflow.StillFlow
 import java.io.File
+import java.nio.ByteBuffer
+import kotlin.math.abs
+import kotlin.math.sin
 import org.json.JSONObject
 
 /** Headless consumer of the packaged AAR, invoked by scripts/android.py. */
@@ -36,7 +39,14 @@ class ExportRunner : Instrumentation() {
             require(runId.matches(Regex("[a-f0-9]{32}"))) { "Invalid run ID" }
             val directory = File(targetContext.filesDir, runId)
             val config = JSONObject(File(directory, "config.json").readText())
-            if (config.optBoolean("realtime")) exportStream(directory, config) else exportOffline(directory, config)
+            val realtime = config.optBoolean("realtime")
+            require(!(realtime && config.has("gyro"))) { "Gyroscope export requires offline mode" }
+            if (config.optBoolean("verifyBackends")) report.put("backend_verification", verifyGyroBackends())
+            when {
+                config.has("gyro") -> exportGyro(directory, config)
+                realtime -> exportStream(directory, config)
+                else -> exportOffline(directory, config)
+            }
             report.put("status", "passed").put("run", runId)
                 .put("sdk", StillFlow.buildDescription()).put("model", Build.MODEL)
                 .put("manufacturer", Build.MANUFACTURER).put("api", Build.VERSION.SDK_INT)
@@ -161,6 +171,167 @@ class ExportRunner : Instrumentation() {
         }
     }
 
+    private fun verifyGyroBackends(): JSONObject {
+        val width = 160
+        val height = 120
+        val times = LongArray(7) { it * 33333L }
+        val durations = LongArray(times.size) { 33333L }
+        var maxDelta = 0
+        val verification = JSONObject()
+        StillFlow.Renderer(StillFlow.Backend.CPU).use { cpu ->
+            StillFlow.Renderer(StillFlow.Backend.GLES).use { gles ->
+                for (moving in listOf(false, true)) {
+                    val lens = StillFlow.LensProfile().apply {
+                        fx = 70.2
+                        fy = 70.2
+                        cx = (width - 1) / 2.0
+                        cy = (height - 1) / 2.0
+                        if (moving) {
+                            model = StillFlow.LensModel.OPENCV_FISHEYE
+                            k = doubleArrayOf(0.04440465777694087, 0.01946789951179939, -0.004476697539343917, -0.002042912877740792)
+                        }
+                    }
+                    val settings = StillFlow.GyroSettings().apply {
+                        // An integer crop retains the planner's sensor margin with unit pixel scale.
+                        outputWidth = if (moving) width else width - 4
+                        outputHeight = if (moving) 90 else height - 4
+                        fov = outputWidth.toDouble() / width
+                        readoutMs = if (moving) 11.0 else 0.0
+                    }
+                    val imu = (0..60).map { i ->
+                        val t = i * 0.005
+                        if (moving) StillFlow.ImuSample(t, 0.22 * sin(80 * t), 0.4, 0.11 * sin(120 * t))
+                        else StillFlow.ImuSample(t, 0.0, 0.0, 0.0)
+                    }
+                    StillFlow.planGyro(width, height, times, durations, imu, lens, settings).use { plan ->
+                        plan.frame(3).use { step ->
+                            val map = step.gyroMap()
+                            if (moving) check(map.sensorRows && map.rowCount > 1) else {
+                                check(map.outFx == map.inFx && map.outFy == map.inFy && map.fovScale == 1.0)
+                                check(map.rowRotation(0).contentEquals(doubleArrayOf(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)))
+                            }
+                            for (format in StillFlow.PixelFormat.entries) {
+                                val channels = format.bytesPerPixel
+                                val pixels = ByteBuffer.allocateDirect(width * height * channels)
+                                for (y in 0 until height) for (x in 0 until width) for (c in 0 until channels) {
+                                    pixels.put(((x * 7 + y * 13 + c * 37) % 256).toByte())
+                                }
+                                pixels.flip()
+                                val frame = StillFlow.Frame(width, height, format, width * channels, pixels)
+                                fun render(renderer: StillFlow.Renderer): ByteBuffer {
+                                    val destination = ByteBuffer.allocateDirect(settings.outputWidth * settings.outputHeight * channels)
+                                    val output = renderer.render(step, frame, destination)
+                                    check(output.width == settings.outputWidth && output.height == settings.outputHeight && output.format == format)
+                                    return output.pixels
+                                }
+                                val a = render(cpu)
+                                val b = render(gles)
+                                for (i in 0 until a.remaining()) {
+                                    if (!moving) {
+                                        val stride = settings.outputWidth * channels
+                                        val expected = pixels[((i / stride + 2) * width + 2) * channels + i % stride]
+                                        check(a[i] == expected && b[i] == expected) { "Identity mismatch at $format byte $i" }
+                                    }
+                                    val delta = abs((a[i].toInt() and 255) - (b[i].toInt() and 255))
+                                    check(delta <= 1) { "CPU/GLES mismatch at $format byte $i: $delta" }
+                                    maxDelta = maxOf(maxDelta, delta)
+                                }
+                            }
+                        }
+                    }
+                }
+                check(cpu.info.backend == StillFlow.Backend.CPU && gles.info.backend == StillFlow.Backend.GLES && gles.info.gpu)
+                verification.put("gles_device", gles.info.device)
+            }
+        }
+        return verification.put("status", "passed").put("max_channel_delta", maxDelta).put("identity_max_channel_delta", 0)
+            .put("formats", org.json.JSONArray(StillFlow.PixelFormat.entries.map { it.name }))
+    }
+
+    private fun exportGyro(directory: File, config: JSONObject) {
+        val began = System.nanoTime()
+        val stages = linkedMapOf<String, TimingStatistics>()
+        val gyro = config.getJSONObject("gyro")
+        val calibration = gyro.getJSONObject("lens")
+        val lens = StillFlow.LensProfile().apply {
+            model = StillFlow.LensModel.valueOf(calibration.getString("model"))
+            calibWidth = calibration.getInt("calibWidth")
+            calibHeight = calibration.getInt("calibHeight")
+            fx = calibration.getDouble("fx")
+            fy = calibration.getDouble("fy")
+            cx = calibration.getDouble("cx")
+            cy = calibration.getDouble("cy")
+            k = calibration.getJSONArray("k").let { values -> DoubleArray(values.length()) { values.getDouble(it) } }
+            lensCorrectionAmount = calibration.optDouble("lensCorrectionAmount", lensCorrectionAmount)
+        }
+        val options = gyro.getJSONObject("settings")
+        val settings = StillFlow.GyroSettings().apply {
+            smoothness = options.optDouble("smoothness", smoothness)
+            smoothnessPitch = options.optDouble("smoothnessPitch", smoothnessPitch)
+            smoothnessYaw = options.optDouble("smoothnessYaw", smoothnessYaw)
+            smoothnessRoll = options.optDouble("smoothnessRoll", smoothnessRoll)
+            maxSmoothness = options.optDouble("maxSmoothness", maxSmoothness)
+            alpha01s = options.optDouble("alpha01s", alpha01s)
+            readoutMs = options.optDouble("readoutMs", readoutMs)
+            fov = options.optDouble("fov", fov)
+            maxZoom = options.optDouble("maxZoom", maxZoom)
+            adaptiveZoomWindowS = options.optDouble("adaptiveZoomWindowS", adaptiveZoomWindowS)
+            timeOffsetS = options.optDouble("timeOffsetS", timeOffsetS)
+            perAxis = options.optBoolean("perAxis", perAxis)
+            readoutTopToBottom = options.optBoolean("readoutTopToBottom", readoutTopToBottom)
+            adaptiveZoom = options.optBoolean("adaptiveZoom", adaptiveZoom)
+            zoomEnvelope = options.optBoolean("zoomEnvelope", zoomEnvelope)
+            outputWidth = options.optInt("outputWidth", outputWidth)
+            outputHeight = options.optInt("outputHeight", outputHeight)
+            maxZoomIterations = options.optInt("maxZoomIterations", maxZoomIterations)
+            integrationMethod = StillFlow.ImuIntegration.valueOf(options.optString("integrationMethod", integrationMethod.name))
+        }
+        val samples = File(directory, "imu.csv").bufferedReader().use { reader ->
+            val header = reader.readLine()
+            val accel = header == "t_video_s,wx,wy,wz,ax,ay,az"
+            require(accel || header == "t_video_s,wx,wy,wz") { "Invalid IMU header" }
+            reader.lineSequence().map { line ->
+                val v = line.split(',').map { it.toDouble() }
+                require(v.size == if (accel) 7 else 4)
+                if (accel) StillFlow.ImuSample(v[0], v[1], v[2], v[3], v[4], v[5], v[6], true)
+                else StillFlow.ImuSample(v[0], v[1], v[2], v[3])
+            }.toList()
+        }
+        val input = File(directory, "input.mp4")
+        val timestamps = timed(stages, "analysis.timestamps") {
+            val ex = extractor(input)
+            try {
+                buildList {
+                    while (ex.sampleTime >= 0) {
+                        add(ex.sampleTime)
+                        ex.advance()
+                    }
+                }.sorted().toLongArray()
+            } finally { ex.release() }
+        }
+        val durations = LongArray(timestamps.size) { i ->
+            if (i == timestamps.lastIndex) Math.round(1_000_000 / config.getDouble("fps")) else timestamps[i + 1] - timestamps[i]
+        }
+        val width = config.getInt("width")
+        val height = config.getInt("height")
+        timed(stages, "plan.gyro") { StillFlow.planGyro(width, height, timestamps, durations, samples, lens, settings) }.use { plan ->
+            val (outWidth, outHeight) = plan.frame(0).use { it.outputWidth to it.outputHeight }
+            var minZoom = Double.POSITIVE_INFINITY
+            var maxZoom = 0.0
+            var sumZoom = 0.0
+            renderOfflineSurface(input, File(directory, "output.mp4"), config, plan, timestamps.asList(), stages,
+                outWidth, outHeight, { frame -> frame.gyroMap().also {
+                    minZoom = minOf(minZoom, it.zoomRatio)
+                    maxZoom = maxOf(maxZoom, it.zoomRatio)
+                    sumZoom += it.zoomRatio
+                } }) { image, map, pts, bt709, fullRange -> render(image, map, pts, bt709, fullRange) }
+            gyro.put("zoom_ratio", JSONObject().put("min", minZoom).put("mean", sumZoom / timestamps.size).put("max", maxZoom))
+            report.put("gyro", gyro).put("output_width", outWidth).put("output_height", outHeight)
+        }
+        report.put("mode", "offline_gyro").put("decode_passes", 1).put("stages", timingJson(stages))
+            .put("profiling", profilingJson()).put("total_seconds", (System.nanoTime() - began) / 1e9)
+    }
+
     private fun exportOffline(directory: File, config: JSONObject) {
         val input = File(directory, "input.mp4")
         val output = File(directory, "output.mp4")
@@ -227,20 +398,24 @@ class ExportRunner : Instrumentation() {
                 check(frames > 0 && plan.info.frameCount == frames.toLong()) { "Analysis frame count mismatch" }
                 report.put("analysis_seconds", (System.nanoTime() - began) / 1e9)
                 report.put("mode", "offline").put("decode_passes", if (recoveryFrames > 0) 3 else 2)
-                renderOfflineSurface(input, output, config, plan, timestamps, stages)
+                renderOfflineSurface(input, output, config, plan, timestamps, stages, width, height, { it.map(width, height) }) {
+                    image, map, pts, bt709, fullRange -> render(image, map, pts, bt709, fullRange)
+                }
             }
             report.put("stages", timingJson(stages)).put("profiling", profilingJson())
                 .put("total_seconds", (System.nanoTime() - began) / 1e9)
         }
     }
 
-    private fun renderOfflineSurface(
+    private fun <M> renderOfflineSurface(
         input: File, output: File, config: JSONObject, plan: StillFlow.Plan,
-        timestamps: List<Long>, stages: MutableMap<String, TimingStatistics>,
+        timestamps: List<Long>, stages: MutableMap<String, TimingStatistics>, outWidth: Int, outHeight: Int,
+        frameMap: (StillFlow.FramePlan) -> M,
+        renderMap: GpuFrames.(Image, M, Long, Boolean, Boolean) -> Unit,
     ) {
         val width = config.getInt("width")
         val height = config.getInt("height")
-        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+        val format = MediaFormat.createVideoFormat("video/avc", outWidth, outHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, config.getInt("bitrate"))
             setFloat(MediaFormat.KEY_FRAME_RATE, config.getDouble("fps").toFloat())
@@ -258,16 +433,16 @@ class ExportRunner : Instrumentation() {
                 try {
                     val sink = EncoderSink(encoder, writer)
                     encoder.start()
-                    GpuFrames(width, height, 2, surface).use { gpu ->
+                    GpuFrames(width, height, 2, surface, outputWidth = outWidth, outputHeight = outHeight).use { gpu ->
                         ImageReader.newInstance(width, height, ImageFormat.PRIVATE, 2, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE).use { images ->
                             var index = 0
                             val renderStart = System.nanoTime()
                             val rendered = decode(input, images = images) { image, pts, _ ->
                                 check(index < timestamps.size && pts == timestamps[index]) { "Decode timestamp mismatch" }
-                                val map = timed(stages, "render.map") { plan.frame(index.toLong()).use { it.map(width, height) } }
+                                val map = timed(stages, "render.map") { plan.frame(index.toLong()).use(frameMap) }
                                 timed(stages, "render.surface") {
                                     sink.drain(0)
-                                    gpu.render(image, map, pts - timestamps[0], config.getBoolean("bt709"), config.getBoolean("fullRange"))
+                                    gpu.renderMap(image, map, pts - timestamps[0], config.getBoolean("bt709"), config.getBoolean("fullRange"))
                                     sink.drain(0)
                                 }
                                 index++

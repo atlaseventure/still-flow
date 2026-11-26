@@ -17,13 +17,22 @@ import java.util.concurrent.ConcurrentLinkedQueue
 
 /** Thread-confined GLES context. Frames own textures independently of decoder buffers. */
 @RequiresApi(29)
-class GpuFrames @JvmOverloads constructor(
+class GpuFrames(
     private val width: Int,
     private val height: Int,
     private val capacity: Int,
     encoderSurface: Surface,
     preferComputeReadback: Boolean = true,
+    private val outputWidth: Int = width,
+    private val outputHeight: Int = height,
 ) : AutoCloseable {
+    // Retain the original JVM default-argument constructor for compiled Kotlin consumers.
+    @JvmOverloads constructor(width: Int, height: Int, capacity: Int, encoderSurface: Surface, preferComputeReadback: Boolean = true)
+        : this(width, height, capacity, encoderSurface, preferComputeReadback, width, height)
+
+    constructor(width: Int, height: Int, capacity: Int, encoderSurface: Surface, preferComputeReadback: Boolean, outputWidth: Int)
+        : this(width, height, capacity, encoderSurface, preferComputeReadback, outputWidth, height)
+
     internal class Readback(val id: Int) {
         var bytes = 0
         var bufferBytes = 0
@@ -67,6 +76,8 @@ class GpuFrames @JvmOverloads constructor(
     private var computeCapture = false
     private var pixelCapture = false
     private var warpProgram = 0
+    private var gyroWarpProgram = 0
+    private var externalGyroWarpProgram = 0
     private var externalWarpProgram = 0
     private var proxyWidth = 0
     private var proxyHeight = 0
@@ -97,7 +108,7 @@ class GpuFrames @JvmOverloads constructor(
 
     init {
         try {
-        require(width > 0 && height > 0 && capacity >= 2)
+        require(width > 0 && height > 0 && outputWidth > 0 && outputHeight > 0 && capacity >= 2)
         check(EGL14.eglInitialize(display, version, 0, version, 1))
         val attributes = intArrayOf(EGL14.EGL_RENDERABLE_TYPE, 0x40, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
             EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
@@ -131,8 +142,10 @@ class GpuFrames @JvmOverloads constructor(
             directCompute = compute(COMPUTE_HEADER + AREA_LUMA + COMPUTE_DIRECT)
             verticalCompute = compute(COMPUTE_HEADER.replace("sampler2D", "usampler2D") + VERTICAL_LUMA + COMPUTE_VERTICAL)
         }
-        warpProgram = program(WARP_HEADER + PLANAR_SOURCE + WARP)
-        externalWarpProgram = program(YUV_HEADER.replace("out vec4 color;", "") + WARP_HEADER.substringAfter("precision highp float;") + EXTERNAL_SOURCE + WARP)
+        warpProgram = program(PLANAR_HEADER + WARP_COMMON + PLANAR_SOURCE + WARP)
+        externalWarpProgram = program(YUV_HEADER + WARP_COMMON + EXTERNAL_SOURCE + WARP)
+        gyroWarpProgram = program(PLANAR_HEADER + WARP_COMMON + PLANAR_SOURCE + GYRO_WARP)
+        externalGyroWarpProgram = program(YUV_HEADER + WARP_COMMON + EXTERNAL_SOURCE + GYRO_WARP)
         } catch (error: Throwable) {
             close()
             throw error
@@ -332,10 +345,20 @@ class GpuFrames @JvmOverloads constructor(
 
     /** The map must match this renderer’s output dimensions. */
     fun render(frame: Frame, map: StillFlow.WarpMap, ptsUs: Long) {
+        validate(map, ptsUs)
+        renderFrame(frame, warpProgram, ptsUs) { visualUniforms(warpProgram, map) }
+    }
+
+    fun render(frame: Frame, map: StillFlow.GyroMap, ptsUs: Long) {
+        validate(map, ptsUs)
+        renderFrame(frame, gyroWarpProgram, ptsUs) { gyroUniforms(gyroWarpProgram, map) }
+    }
+
+    private inline fun renderFrame(frame: Frame, program: Int, ptsUs: Long, uniforms: () -> Unit) {
         checkThread()
         require(frame.owner === this && !frame.rendered) { "Frame is foreign or already consumed" }
         readLuma(frame, true)
-        renderTexture(frame.texture, map, ptsUs, frame.bt709, frame.fullRange)
+        renderTexture(frame.texture, program, ptsUs, frame.bt709, frame.fullRange, uniforms)
         frame.rendered = true
         free.add(frame.texture)
         proxies.add(checkNotNull(frame.buffer))
@@ -343,6 +366,25 @@ class GpuFrames @JvmOverloads constructor(
 
     /** Render one decoded Image with an offline map; the caller may close the Image on return. */
     fun render(image: Image, map: StillFlow.WarpMap, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
+        validate(map, ptsUs)
+        renderImage(image, externalWarpProgram, ptsUs, bt709, fullRange) { visualUniforms(externalWarpProgram, map) }
+    }
+
+    fun render(image: Image, map: StillFlow.GyroMap, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
+        validate(map, ptsUs)
+        renderImage(image, externalGyroWarpProgram, ptsUs, bt709, fullRange) { gyroUniforms(externalGyroWarpProgram, map) }
+    }
+
+    private fun validate(map: StillFlow.WarpMap, ptsUs: Long) {
+        require(outputWidth == width && outputHeight == height && map.width == width && map.height == height && ptsUs >= 0)
+    }
+
+    private fun validate(map: StillFlow.GyroMap, ptsUs: Long) {
+        require(map.inputWidth == width && map.inputHeight == height && map.outputWidth == outputWidth &&
+            map.outputHeight == outputHeight && map.rowCount in 1..64 && ptsUs >= 0)
+    }
+
+    private inline fun renderImage(image: Image, program: Int, ptsUs: Long, bt709: Boolean, fullRange: Boolean, uniforms: () -> Unit) {
         checkThread()
         val crop = image.cropRect
         require(crop.width() == width && crop.height() == height)
@@ -354,8 +396,8 @@ class GpuFrames @JvmOverloads constructor(
             try {
                 GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
                 GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
-                source(externalWarpProgram, buffer, crop)
-                renderTexture(null, map, ptsUs, bt709, fullRange)
+                source(program, buffer, crop)
+                renderTexture(null, program, ptsUs, bt709, fullRange, uniforms)
             } finally {
                 // Complete source reads before the decoder recycles this Image, including on failure.
                 GLES30.glFinish()
@@ -373,13 +415,31 @@ class GpuFrames @JvmOverloads constructor(
         GLES30.glUniform4f(GLES30.glGetUniformLocation(program, "crop"), crop.left.toFloat(), crop.top.toFloat(), width.toFloat(), height.toFloat())
     }
 
-    private fun renderTexture(texture: Texture?, warp: StillFlow.WarpMap, ptsUs: Long, bt709: Boolean, fullRange: Boolean) {
-        val began = System.nanoTime()
-        require(warp.width == width && warp.height == height && ptsUs >= 0) { "Map dimensions or output timestamp are invalid" }
+    private fun visualUniforms(program: Int, warp: StillFlow.WarpMap) {
         val map = warp.packed
+        GLES30.glUniform2i(GLES30.glGetUniformLocation(program, "meshSize"), map[0].toInt(), map[1].toInt())
+        GLES30.glUniform4fv(GLES30.glGetUniformLocation(program, "viewport"), 1, map, 2)
+        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "gridScale"), 1, map, 6)
+        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "offsets"), (map.size - 8) / 2, map, 8)
+    }
+
+    private fun gyroUniforms(program: Int, map: StillFlow.GyroMap) {
+        fun location(name: String) = GLES30.glGetUniformLocation(program, name)
+        GLES30.glUniform2f(location("outputDimensions"), outputWidth.toFloat(), outputHeight.toFloat())
+        GLES30.glUniform1i(location("lensModel"), map.lensModel.nativeValue)
+        GLES30.glUniform1i(location("rowCount"), map.rowCount)
+        GLES30.glUniform1i(location("sensorRows"), if (map.sensorRows) 1 else 0)
+        GLES30.glUniform4f(location("inIntrinsics"), map.inFx.toFloat(), map.inFy.toFloat(), map.inCx.toFloat(), map.inCy.toFloat())
+        GLES30.glUniform4f(location("outIntrinsics"), map.outFx.toFloat(), map.outFy.toFloat(), map.outCx.toFloat(), map.outCy.toFloat())
+        GLES30.glUniform4fv(location("distortion"), 1, map.distortionFloat, 0)
+        GLES30.glUniform1f(location("lensCorrectionAmount"), map.lensCorrectionAmount.toFloat())
+        GLES30.glUniform3fv(location("rowRotations"), map.rowCount * 3, map.rowRotationsFloat, 0)
+    }
+
+    private inline fun renderTexture(texture: Texture?, program: Int, ptsUs: Long, bt709: Boolean, fullRange: Boolean, uniforms: () -> Unit) {
+        val began = System.nanoTime()
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-        GLES30.glViewport(0, 0, width, height)
-        val program = if (texture == null) externalWarpProgram else warpProgram
+        GLES30.glViewport(0, 0, outputWidth, outputHeight)
         GLES30.glUseProgram(program)
         if (texture != null) {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -392,11 +452,8 @@ class GpuFrames @JvmOverloads constructor(
         }
         GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "coefficients"), if (bt709) 0.2126f else 0.299f, if (bt709) 0.0722f else 0.114f)
         GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "fullRange"), if (fullRange) 1 else 0)
-        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "dimensions"), width.toFloat(), height.toFloat())
-        GLES30.glUniform2i(GLES30.glGetUniformLocation(program, "meshSize"), map[0].toInt(), map[1].toInt())
-        GLES30.glUniform4fv(GLES30.glGetUniformLocation(program, "viewport"), 1, map, 2)
-        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "gridScale"), 1, map, 6)
-        GLES30.glUniform2fv(GLES30.glGetUniformLocation(program, "offsets"), (map.size - 8) / 2, map, 8)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "inputDimensions"), width.toFloat(), height.toFloat())
+        uniforms()
         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
         checkGl()
         check(EGLExt.eglPresentationTimeANDROID(display, window, Math.multiplyExact(ptsUs, 1000)))
@@ -428,6 +485,8 @@ class GpuFrames @JvmOverloads constructor(
         GLES30.glDeleteProgram(verticalProgram)
         GLES30.glDeleteProgram(directCompute)
         GLES30.glDeleteProgram(verticalCompute)
+        GLES30.glDeleteProgram(gyroWarpProgram)
+        GLES30.glDeleteProgram(externalGyroWarpProgram)
         GLES30.glDeleteProgram(warpProgram)
         GLES30.glDeleteProgram(externalWarpProgram)
         val textures = owned.flatMap { listOf(it.y, it.uv) }.toIntArray()
@@ -603,37 +662,47 @@ class GpuFrames @JvmOverloads constructor(
                 storeLuma(at,verticalLuma(at));
             }
         """.trimIndent()
-        private val WARP_HEADER = """#version 300 es
+        private val PLANAR_HEADER = """#version 300 es
             precision highp float;
-            uniform vec2 dimensions;
-            uniform ivec2 meshSize;
-            uniform vec2 gridScale;
-            uniform vec4 viewport;
-            uniform vec2 offsets[288];
             out vec4 color;
+        """.trimIndent() + "\n"
+        private val WARP_COMMON = """
+            uniform vec2 inputDimensions;
             uniform vec2 coefficients;
             uniform int fullRange;
         """.trimIndent() + "\n"
         private val PLANAR_SOURCE = """
             uniform sampler2D source;
             uniform sampler2D chromaSource;
-            float sourceLuma(vec2 p) { return texture(source,(p+0.5)/dimensions).r; }
+            float sourceLuma(vec2 p) { return texture(source,(p+0.5)/inputDimensions).r; }
             vec2 sourceChroma(vec2 p) {
-                vec2 size=ceil(dimensions*0.5);
+                vec2 size=ceil(inputDimensions*0.5);
                 return texture(chromaSource,((p-vec2(0.0,0.5))*0.5+0.5)/size).rg;
             }
         """.trimIndent() + "\n"
         private val EXTERNAL_SOURCE = """
-            float sourceLuma(vec2 p) { return sampleYuv(clamp(p,vec2(0),dimensions-1.0)+0.5).x; }
-            vec2 sourceChroma(vec2 p) { return sampleYuv(clamp(p,vec2(0),dimensions-1.0)+0.5).yz; }
+            float sourceLuma(vec2 p) { return sampleYuv(clamp(p,vec2(0),inputDimensions-1.0)+0.5).x; }
+            vec2 sourceChroma(vec2 p) { return sampleYuv(clamp(p,vec2(0),inputDimensions-1.0)+0.5).yz; }
         """.trimIndent() + "\n"
-        private val WARP = """
+        private val YUV_TO_RGB = """
+            vec4 toRgb(float y, vec2 p) {
+                y=fullRange!=0 ? y : (y-16.0/255.0)*255.0/219.0;
+                vec2 uv=(sourceChroma(p)-vec2(128.0/255.0))*(fullRange!=0 ? 1.0 : 255.0/224.0);
+                float kr=coefficients.x,kb=coefficients.y,kg=1.0-kr-kb;
+                return clamp(vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,1.0),0.0,1.0);
+            }
+        """.trimIndent() + "\n"
+        private val WARP = YUV_TO_RGB + """
+            uniform ivec2 meshSize;
+            uniform vec2 gridScale;
+            uniform vec4 viewport;
+            uniform vec2 offsets[288];
             vec4 weights(float t) {
                 float t2=t*t,t3=t2*t;
                 return vec4(-0.5*t+t2-0.5*t3,1.0-2.5*t2+1.5*t3,0.5*t+2.0*t2-1.5*t3,-0.5*t2+0.5*t3);
             }
             float reconstruct(vec2 p) {
-                p=clamp(p,vec2(0),dimensions-1.0);
+                p=clamp(p,vec2(0),inputDimensions-1.0);
                 vec2 lo=floor(p),f=p-lo;
                 vec4 wx=weights(f.x),wy=weights(f.y);
                 // Combine the two positive center taps with hardware linear
@@ -648,7 +717,7 @@ class GpuFrames @JvmOverloads constructor(
                 return clamp(value,0.0,1.0);
             }
             void main() {
-                vec2 at=vec2(gl_FragCoord.x-0.5,dimensions.y-gl_FragCoord.y-0.5);
+                vec2 at=vec2(gl_FragCoord.x-0.5,inputDimensions.y-gl_FragCoord.y-0.5);
                 vec2 target=viewport.xy+at*viewport.zw;
                 vec2 p=target;
                 for(int iteration=0;iteration<8;++iteration) {
@@ -658,11 +727,94 @@ class GpuFrames @JvmOverloads constructor(
                     int a=cell.y*meshSize.x+cell.x,b=a+meshSize.x;
                     p=target-mix(mix(offsets[a],offsets[a+1],f.x),mix(offsets[b],offsets[b+1],f.x),f.y);
                 }
-                float y=reconstruct(p);
-                y=fullRange!=0 ? y : (y-16.0/255.0)*255.0/219.0;
-                vec2 uv=(sourceChroma(p)-vec2(128.0/255.0))*(fullRange!=0 ? 1.0 : 255.0/224.0);
-                float kr=coefficients.x,kb=coefficients.y,kg=1.0-kr-kb;
-                color=vec4(y+2.0*(1.0-kr)*uv.y,y-2.0*kb*(1.0-kb)/kg*uv.x-2.0*kr*(1.0-kr)/kg*uv.y,y+2.0*(1.0-kb)*uv.x,1.0);
+                color=toRgb(reconstruct(p), p);
+            }
+        """.trimIndent()
+        private val GYRO_WARP = YUV_TO_RGB + """
+            uniform vec2 outputDimensions;
+            uniform vec3 rowRotations[192];
+            uniform int lensModel, rowCount, sensorRows;
+            uniform vec4 inIntrinsics, outIntrinsics, distortion;
+            uniform float lensCorrectionAmount;
+
+            bool gyro_project(vec2 pixel, float fraction, out vec2 p) {
+                vec2 n = (pixel - outIntrinsics.zw) / outIntrinsics.xy;
+                float row = clamp(fraction, 0.0, 1.0) * float(rowCount - 1);
+                int lo = min(int(row), rowCount - 1);
+                int hi = min(lo + 1, rowCount - 1);
+                vec3 ray;
+                for (int j = 0; j < 3; ++j) {
+                    float first = dot(rowRotations[lo * 3 + j], vec3(n, 1.0));
+                    float second = dot(rowRotations[hi * 3 + j], vec3(n, 1.0));
+                    ray[j] = first + (row - float(lo)) * (second - first);
+                }
+                if (!(ray.z > 1e-6) || isnan(ray.z) || isinf(ray.z)) return false;
+                vec2 xy = ray.xy / ray.z;
+                if (lensModel == 1 && lensCorrectionAmount > 0.0) {
+                    float r = length(xy);
+                    if (r > 0.0) {
+                        float theta = atan(r), u = theta * theta;
+                        float theta_d = theta * (1.0 + u * (distortion.x + u * (distortion.y + u * (distortion.z + u * distortion.w))));
+                        xy *= (r + (theta_d - r) * lensCorrectionAmount) / r;
+                    }
+                }
+                p.x = xy.x == n.x && inIntrinsics.x == outIntrinsics.x && inIntrinsics.z == outIntrinsics.z
+                    ? pixel.x : xy.x * inIntrinsics.x + inIntrinsics.z;
+                p.y = xy.y == n.y && inIntrinsics.y == outIntrinsics.y && inIntrinsics.w == outIntrinsics.w
+                    ? pixel.y : xy.y * inIntrinsics.y + inIntrinsics.w;
+                return !any(isnan(p)) && !any(isinf(p));
+            }
+
+            bool gyro_source_position(vec2 pixel, out vec2 p) {
+                float fraction = pixel.y / float(outputDimensions.y - 1.0);
+                for (int i = 0; i < (sensorRows != 0 ? 3 : 1); ++i) {
+                    if (!gyro_project(pixel, fraction, p)) return false;
+                    fraction = p.y / float(inputDimensions.y - 1.0);
+                }
+                return all(greaterThanEqual(p, vec2(0))) && all(lessThanEqual(p, vec2(inputDimensions - 1.0)));
+            }
+
+            void lanczos_weights(float t, out float weights[8]) {
+                bool reverse = t > 0.5;
+                t = reverse ? 1.0 - t : t;
+                if (t < 1e-7) {
+                    for (int i = 0; i < 8; ++i) weights[i] = float(i == (reverse ? 4 : 3));
+                    return;
+                }
+                float angle = t * 0.7853981633974483;
+                float s = sin(angle), c = cos(angle);
+                const float diagonal = 0.7071067811865475;
+                vec4 phases = vec4(s, -(s+c)*diagonal, c, (s-c)*diagonal);
+                float sum = 0.0;
+                for (int i = 0; i < 8; ++i) {
+                    int shift = 3 - i;
+                    float d = t + float(shift);
+                    float w = phases[(shift + 4) % 4] * (shift < 0 ? -1.0 : 1.0) / (d*d);
+                    weights[reverse ? 7-i : i] = w;
+                    sum += w;
+                }
+                for (int i = 0; i < 8; ++i) weights[i] /= sum;
+            }
+
+            void main() {
+                vec2 at = vec2(gl_FragCoord.x - 0.5, outputDimensions.y - gl_FragCoord.y - 0.5);
+                vec2 p;
+                if (!gyro_source_position(at, p)) {
+                    color = vec4(0.0, 0.0, 0.0, 1.0);
+                    return;
+                }
+                vec2 lo = floor(p);
+                float wx[8], wy[8];
+                lanczos_weights(p.x - lo.x, wx);
+                lanczos_weights(p.y - lo.y, wy);
+                float luma = 0.0;
+                for (int j = 0; j < 8; ++j) {
+                    float line = 0.0;
+                    for (int i = 0; i < 8; ++i)
+                        line += wx[i] * sourceLuma(clamp(lo + vec2(i - 3, j - 3), vec2(0), inputDimensions - 1.0));
+                    luma += wy[j] * line;
+                }
+                color = toRgb(clamp(luma, 0.0, 1.0), p);
             }
         """.trimIndent()
     }

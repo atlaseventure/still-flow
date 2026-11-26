@@ -22,6 +22,114 @@ object StillFlow {
     enum class Backend { AUTO, CPU, GLES }
     enum class MotionEstimator { TRANSLATION, OPENCV }
 
+    enum class LensModel(internal val nativeValue: Int) { NONE(0), OPENCV_FISHEYE(1) }
+    enum class ImuIntegration(internal val nativeValue: Int) { AUTO(0), GYRO(1), COMPLEMENTARY(2) }
+
+    private val gyroDefaults = nativeGyroDefaults()
+
+    class LensProfile {
+        @JvmField var model = LensModel.entries[gyroDefaults[19].toInt()]
+        @JvmField var calibWidth = gyroDefaults[20].toInt()
+        @JvmField var calibHeight = gyroDefaults[21].toInt()
+        @JvmField var fx = gyroDefaults[22]
+        @JvmField var fy = gyroDefaults[23]
+        @JvmField var cx = gyroDefaults[24]
+        @JvmField var cy = gyroDefaults[25]
+        @JvmField var k = gyroDefaults.copyOfRange(26, 30)
+        @JvmField var lensCorrectionAmount = gyroDefaults[30]
+    }
+
+    class GyroSettings {
+        @JvmField var smoothness = gyroDefaults[0]
+        @JvmField var perAxis = gyroDefaults[1] != 0.0
+        @JvmField var smoothnessPitch = gyroDefaults[2]
+        @JvmField var smoothnessYaw = gyroDefaults[3]
+        @JvmField var smoothnessRoll = gyroDefaults[4]
+        @JvmField var maxSmoothness = gyroDefaults[5]
+        @JvmField var alpha01s = gyroDefaults[6]
+        @JvmField var readoutMs = gyroDefaults[7]
+        @JvmField var readoutTopToBottom = gyroDefaults[8] != 0.0
+        @JvmField var fov = gyroDefaults[9]
+        @JvmField var maxZoom = gyroDefaults[10]
+        @JvmField var maxZoomIterations = gyroDefaults[11].toInt()
+        @JvmField var adaptiveZoomWindowS = gyroDefaults[12]
+        @JvmField var adaptiveZoom = gyroDefaults[13] != 0.0
+        @JvmField var timeOffsetS = gyroDefaults[14]
+        @JvmField var integrationMethod = ImuIntegration.entries[gyroDefaults[15].toInt()]
+        @JvmField var outputWidth = gyroDefaults[16].toInt()
+        @JvmField var outputHeight = gyroDefaults[17].toInt()
+        @JvmField var zoomEnvelope = gyroDefaults[18] != 0.0
+    }
+
+    class ImuSample @JvmOverloads constructor(
+        @JvmField val timeSeconds: Double,
+        @JvmField val wx: Double,
+        @JvmField val wy: Double,
+        @JvmField val wz: Double,
+        @JvmField val ax: Double = 0.0,
+        @JvmField val ay: Double = 0.0,
+        @JvmField val az: Double = 0.0,
+        @JvmField val hasAccel: Boolean = false,
+    )
+
+    class GyroMap private constructor(private val packed: DoubleArray) {
+        companion object {
+            @JvmSynthetic internal fun own(packed: DoubleArray) = GyroMap(packed)
+        }
+        @JvmField val inputWidth = packed[0].toInt()
+        @JvmField val inputHeight = packed[1].toInt()
+        @JvmField val outputWidth = packed[2].toInt()
+        @JvmField val outputHeight = packed[3].toInt()
+        @JvmField val lensModel = LensModel.entries[packed[4].toInt()]
+        @JvmField val inFx = packed[5]
+        @JvmField val inFy = packed[6]
+        @JvmField val inCx = packed[7]
+        @JvmField val inCy = packed[8]
+        @JvmField val lensCorrectionAmount = packed[13]
+        @JvmField val outFx = packed[14]
+        @JvmField val outFy = packed[15]
+        @JvmField val outCx = packed[16]
+        @JvmField val outCy = packed[17]
+        @JvmField val fovScale = packed[18]
+        @JvmField val zoomRatio = packed[19]
+        @JvmField val smoothFactor = packed[20]
+        @JvmField val rowCount = packed[21].toInt()
+        @JvmField val sensorRows = packed[22] != 0.0
+        fun distortionCoeffs(): DoubleArray = packed.copyOfRange(9, 13)
+        fun rowRotation(index: Int): DoubleArray {
+            require(index in 0 until rowCount)
+            return packed.copyOfRange(23 + 9 * index, 23 + 9 * (index + 1))
+        }
+        @get:JvmSynthetic internal val rowRotationsFloat = FloatArray(rowCount * 9) { packed[23 + it].toFloat() }
+        @get:JvmSynthetic internal val distortionFloat = FloatArray(4) { packed[9 + it].toFloat() }
+    }
+
+    @JvmStatic @JvmOverloads fun planGyro(
+        inputWidth: Int, inputHeight: Int, timestampsUs: LongArray, durationsUs: LongArray,
+        imuSamples: List<ImuSample>, lens: LensProfile, settings: GyroSettings = GyroSettings(),
+    ): Plan {
+        val data = DoubleArray(Math.multiplyExact(imuSamples.size, 7))
+        val accel = BooleanArray(imuSamples.size)
+        imuSamples.forEachIndexed { i, sample ->
+            data[i * 7] = sample.timeSeconds
+            data[i * 7 + 1] = sample.wx
+            data[i * 7 + 2] = sample.wy
+            data[i * 7 + 3] = sample.wz
+            data[i * 7 + 4] = sample.ax
+            data[i * 7 + 5] = sample.ay
+            data[i * 7 + 6] = sample.az
+            accel[i] = sample.hasAccel
+        }
+        return Plan.own(nativeGyroPlanCreate(
+            inputWidth, inputHeight, timestampsUs, durationsUs, data, accel,
+            lens.model.nativeValue, lens.calibWidth, lens.calibHeight, lens.fx, lens.fy, lens.cx, lens.cy, lens.k, lens.lensCorrectionAmount,
+            settings.smoothness, settings.perAxis, settings.smoothnessPitch, settings.smoothnessYaw, settings.smoothnessRoll,
+            settings.maxSmoothness, settings.alpha01s, settings.readoutMs, settings.readoutTopToBottom, settings.fov,
+            settings.maxZoom, settings.maxZoomIterations, settings.adaptiveZoomWindowS, settings.adaptiveZoom, settings.timeOffsetS,
+            settings.integrationMethod.nativeValue, settings.outputWidth, settings.outputHeight, settings.zoomEnvelope,
+        ))
+    }
+
     /** Settings are copied when an analyzer or stream is created. Public fields also support Java callers. */
     class Settings {
         @JvmField var motionEstimator = MotionEstimator.OPENCV
@@ -180,6 +288,10 @@ object StillFlow {
         }
         private val resource = Resource(handle, 2)
         val info: FrameInfo get() = resource.access { FrameInfo(nativeFrameInfo(it)) }
+        @JvmSynthetic internal fun outputSize(): IntArray = resource.access { nativeFrameOutputSize(it) }
+        val outputWidth: Int get() = outputSize()[0]
+        val outputHeight: Int get() = outputSize()[1]
+        fun gyroMap(): GyroMap = resource.access { GyroMap.own(nativeFrameGyroMap(it)) }
         fun map(width: Int, height: Int): WarpMap = resource.access {
             require(width > 0 && height > 0)
             WarpMap.own(width, height, nativeFrameMap(it, width, height))
@@ -224,8 +336,9 @@ object StillFlow {
         val info: RendererInfo get() = resource.access { RendererInfo(nativeRendererInfo(it)) }
         /** Writes packed output into caller-owned storage, preserving its position and limit. */
         fun render(plan: FramePlan, frame: Frame, destination: ByteBuffer): Frame = resource.access { renderer ->
-            val rowBytes = frame.width.toLong() * frame.format.bytesPerPixel
-            val size = rowBytes * frame.height
+            val (outWidth, outHeight) = plan.outputSize()
+            val rowBytes = outWidth.toLong() * frame.format.bytesPerPixel
+            val size = rowBytes * outHeight
             require(destination.isDirect && !destination.isReadOnly && rowBytes <= Int.MAX_VALUE && size <= destination.remaining()) {
                 "Invalid writable direct destination extent"
             }
@@ -233,7 +346,7 @@ object StillFlow {
             plan.access {
                 nativeRender(renderer, it, frame.width, frame.height, frame.format.nativeValue, frame.rowStride, frame.pixels, output)
             }
-            Frame(frame.width, frame.height, frame.format, rowBytes.toInt(), output)
+            Frame(outWidth, outHeight, frame.format, rowBytes.toInt(), output)
         }
         override fun close() = resource.close()
     }
@@ -251,6 +364,18 @@ object StillFlow {
     @JvmStatic fun buildDescription(): String = nativeBuildDescription()
     @JvmStatic private external fun nativeThreads(threads: Int)
     @JvmStatic private external fun nativeProfile(handle: Long): String
+    @JvmStatic private external fun nativeGyroDefaults(): DoubleArray
+    @JvmStatic private external fun nativeGyroPlanCreate(
+        width: Int, height: Int, ptsUs: LongArray, durationsUs: LongArray, imuData: DoubleArray, imuHasAccel: BooleanArray,
+        lensModel: Int, calibWidth: Int, calibHeight: Int, fx: Double, fy: Double, cx: Double, cy: Double,
+        distortion: DoubleArray, lensCorrectionAmount: Double, smoothness: Double, perAxis: Boolean,
+        smoothnessPitch: Double, smoothnessYaw: Double, smoothnessRoll: Double, maxSmoothness: Double, alpha01s: Double,
+        readoutMs: Double, readoutTopToBottom: Boolean, fov: Double, maxZoom: Double, maxZoomIterations: Int,
+        adaptiveZoomWindowS: Double, adaptiveZoom: Boolean, timeOffsetS: Double, integrationMethod: Int,
+        outputWidth: Int, outputHeight: Int, zoomEnvelope: Boolean,
+    ): Long
+    @JvmStatic private external fun nativeFrameOutputSize(handle: Long): IntArray
+    @JvmStatic private external fun nativeFrameGyroMap(handle: Long): DoubleArray
     @JvmStatic private external fun nativeDefaults(): DoubleArray
     @JvmStatic private external fun nativeStreamDefaults(): DoubleArray
     @JvmStatic private external fun nativeCreate(
